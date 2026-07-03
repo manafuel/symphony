@@ -298,7 +298,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        run_local_shell_command(command, workspace)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -328,6 +328,19 @@ defmodule SymphonyElixir.Workspace do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp run_local_shell_command(command, workspace) do
+    case :os.type() do
+      {:win32, _} ->
+        System.cmd("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+          cd: workspace,
+          stderr_to_stdout: true
+        )
+
+      _ ->
+        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
     end
   end
 

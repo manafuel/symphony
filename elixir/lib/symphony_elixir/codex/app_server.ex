@@ -187,25 +187,25 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    executable = System.find_executable("bash")
+    case local_port_command() do
+      {:ok, executable, args} ->
+        port =
+          Port.open(
+            {:spawn_executable, String.to_charlist(executable)},
+            [
+              :binary,
+              :exit_status,
+              :stderr_to_stdout,
+              args: Enum.map(args, &String.to_charlist/1),
+              cd: String.to_charlist(workspace),
+              line: @port_line_bytes
+            ]
+          )
 
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
+        {:ok, port}
 
-      {:ok, port}
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -220,6 +220,48 @@ defmodule SymphonyElixir.Codex.AppServer do
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp local_port_command do
+    command = Config.settings!().codex.command
+
+    case :os.type() do
+      {:win32, _} -> windows_port_command(command)
+      _ -> bash_port_command(command)
+    end
+  end
+
+  defp bash_port_command(command) do
+    case System.find_executable("bash") do
+      nil -> {:error, :bash_not_found}
+      executable -> {:ok, executable, ["-lc", command]}
+    end
+  end
+
+  defp windows_port_command(command) do
+    case command_tokens(command) do
+      [] ->
+        {:error, :empty_codex_command}
+
+      [executable | args] ->
+        case resolve_windows_executable(executable) do
+          nil -> {:error, {:windows_executable_not_found, executable}}
+          resolved -> {:ok, resolved, args}
+        end
+    end
+  end
+
+  defp resolve_windows_executable(executable) do
+    cond do
+      File.exists?(executable) ->
+        executable
+
+      String.match?(executable, ~r{^[A-Za-z]:[\\/]}) ->
+        nil
+
+      true ->
+        System.find_executable(executable)
+    end
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -1029,6 +1071,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp command_tokens(command) when is_binary(command) do
+    ~r/"([^"]*)"|'([^']*)'|(\S+)/
+    |> Regex.scan(String.trim(command), capture: :all_but_first)
+    |> Enum.map(fn captures ->
+      Enum.find(captures, "", &(&1 != ""))
+    end)
   end
 
   defp default_on_message(_message), do: :ok

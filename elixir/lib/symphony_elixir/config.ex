@@ -128,6 +128,10 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
+      settings.tracker.kind == "linear" and settings.tracker.poll_scope == "team" and
+          not is_binary(settings.tracker.team_key) ->
+        {:error, :missing_linear_team_key}
+
       true ->
         :ok
     end

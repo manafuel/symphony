@@ -441,6 +441,101 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client polls project scope by default" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project-slug",
+      tracker_active_states: ["Ready for Codex"]
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:poll_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-project",
+                 "identifier" => "MAN-P",
+                 "title" => "Project visible",
+                 "state" => %{"name" => "Ready for Codex"},
+                 "labels" => %{"nodes" => [%{"name" => "codex-agent-ready"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [issue]} = Client.fetch_issues_by_states_for_test(["Ready for Codex"], graphql_fun)
+    assert issue.identifier == "MAN-P"
+
+    assert_receive {:poll_page, query,
+                    %{
+                      projectSlug: "project-slug",
+                      stateNames: ["Ready for Codex"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearPoll"
+    assert query =~ "project: {slugId: {eq: $projectSlug}}"
+    refute query =~ "team: {key: {eq: $teamKey}}"
+  end
+
+  test "linear client polls team scope when configured" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project-slug",
+      tracker_team_key: "MAN",
+      tracker_poll_scope: "team",
+      tracker_auto_project_admission: true,
+      tracker_active_states: ["Ready for Codex"]
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:poll_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-team",
+                 "identifier" => "MAN-90",
+                 "title" => "Team visible",
+                 "state" => %{"name" => "Ready for Codex"},
+                 "labels" => %{"nodes" => [%{"name" => "codex-agent-ready"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [issue]} = Client.fetch_issues_by_states_for_test(["Ready for Codex"], graphql_fun)
+    assert issue.identifier == "MAN-90"
+
+    assert_receive {:poll_page, query,
+                    %{
+                      teamKey: "MAN",
+                      stateNames: ["Ready for Codex"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearTeamPoll"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "project: {slugId: {eq: $projectSlug}}"
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->

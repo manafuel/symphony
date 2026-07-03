@@ -15,6 +15,9 @@ defmodule SymphonyElixir.CoreTest do
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert config.tracker.poll_scope == "project"
+    assert config.tracker.team_key == nil
+    assert config.tracker.auto_project_admission == false
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
 
@@ -47,6 +50,27 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     assert {:error, :missing_linear_project_slug} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: "project",
+      tracker_poll_scope: "TEAM",
+      tracker_team_key: nil
+    )
+
+    assert Config.settings!().tracker.poll_scope == "team"
+    assert {:error, :missing_linear_team_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      tracker_poll_scope: "team",
+      tracker_team_key: "MAN",
+      tracker_auto_project_admission: true
+    )
+
+    assert Config.settings!().tracker.team_key == "MAN"
+    assert Config.settings!().tracker.auto_project_admission
+    assert :ok = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -934,6 +958,23 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket MT-697"
     assert prompt =~ "created=2026-02-26T18:06:48Z"
     assert prompt =~ "updated=2026-02-26T18:07:03Z"
+  end
+
+  test "prompt builder exposes empty issue comments by default" do
+    workflow_prompt = "Ticket {{ issue.identifier }} comments={% for comment in issue.comments %}{{ comment.body }}{% else %}none{% endfor %}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MT-698",
+      title: "Render comments",
+      description: "Prompt should expose comments as an empty list",
+      state: "Todo",
+      url: "https://example.org/issues/MT-698",
+      labels: []
+    }
+
+    assert PromptBuilder.build_prompt(issue) == "Ticket MT-698 comments=none"
   end
 
   test "prompt builder normalizes nested date-like values, maps, and structs in issue fields" do

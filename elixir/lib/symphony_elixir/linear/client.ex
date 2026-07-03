@@ -9,9 +9,54 @@ defmodule SymphonyElixir.Linear.Client do
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
 
-  @query """
+  @project_poll_query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @team_poll_query """
+  query SymphonyLinearTeamPoll($teamKey: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
       nodes {
         id
         identifier
@@ -106,18 +151,15 @@ defmodule SymphonyElixir.Linear.Client do
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
-    project_slug = tracker.project_slug
 
     cond do
       is_nil(tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      is_nil(project_slug) ->
-        {:error, :missing_linear_project_slug}
-
       true ->
-        with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+        with {:ok, poll_target} <- poll_target(tracker),
+             {:ok, assignee_filter} <- routing_assignee_filter() do
+          do_fetch_by_states(poll_target, tracker.active_states, assignee_filter)
         end
     end
   end
@@ -130,17 +172,15 @@ defmodule SymphonyElixir.Linear.Client do
       {:ok, []}
     else
       tracker = Config.settings!().tracker
-      project_slug = tracker.project_slug
 
       cond do
         is_nil(tracker.api_key) ->
           {:error, :missing_linear_api_token}
 
-        is_nil(project_slug) ->
-          {:error, :missing_linear_project_slug}
-
         true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+          with {:ok, poll_target} <- poll_target(tracker) do
+            do_fetch_by_states(poll_target, normalized_states, nil)
+          end
       end
     end
   end
@@ -236,25 +276,60 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  @doc false
+  @spec fetch_issues_by_states_for_test([String.t()], (String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states_for_test(state_names, graphql_fun)
+      when is_list(state_names) and is_function(graphql_fun, 2) do
+    normalized_states = Enum.map(state_names, &to_string/1) |> Enum.uniq()
+
+    if normalized_states == [] do
+      {:ok, []}
+    else
+      with {:ok, poll_target} <- poll_target(Config.settings!().tracker) do
+        do_fetch_by_states(poll_target, normalized_states, nil, graphql_fun)
+      end
+    end
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp poll_target(tracker) do
+    case tracker.poll_scope do
+      "team" ->
+        case trim_string(tracker.team_key) do
+          nil -> {:error, :missing_linear_team_key}
+          team_key -> {:ok, {:team, team_key}}
+        end
+
+      _ ->
+        case trim_string(tracker.project_slug) do
+          nil -> {:error, :missing_linear_project_slug}
+          project_slug -> {:ok, {:project, project_slug}}
+        end
+    end
+  end
+
+  defp trim_string(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp trim_string(_value), do: nil
+
+  defp do_fetch_by_states(poll_target, state_names, assignee_filter, graphql_fun \\ &graphql/2) do
+    do_fetch_by_states_page(poll_target, state_names, assignee_filter, nil, [], graphql_fun)
+  end
+
+  defp do_fetch_by_states_page(poll_target, state_names, assignee_filter, after_cursor, acc_issues, graphql_fun) do
     with {:ok, body} <-
-           graphql(@query, %{
-             projectSlug: project_slug,
-             stateNames: state_names,
-             first: @issue_page_size,
-             relationFirst: @issue_page_size,
-             after: after_cursor
-           }),
+           fetch_poll_page(poll_target, state_names, after_cursor, graphql_fun),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(poll_target, state_names, assignee_filter, next_cursor, updated_acc, graphql_fun)
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -263,6 +338,26 @@ defmodule SymphonyElixir.Linear.Client do
           {:error, reason}
       end
     end
+  end
+
+  defp fetch_poll_page({:project, project_slug}, state_names, after_cursor, graphql_fun) do
+    graphql_fun.(@project_poll_query, %{
+      projectSlug: project_slug,
+      stateNames: state_names,
+      first: @issue_page_size,
+      relationFirst: @issue_page_size,
+      after: after_cursor
+    })
+  end
+
+  defp fetch_poll_page({:team, team_key}, state_names, after_cursor, graphql_fun) do
+    graphql_fun.(@team_poll_query, %{
+      teamKey: team_key,
+      stateNames: state_names,
+      first: @issue_page_size,
+      relationFirst: @issue_page_size,
+      after: after_cursor
+    })
   end
 
   defp prepend_page_issues(issues, acc_issues) when is_list(issues) and is_list(acc_issues) do
