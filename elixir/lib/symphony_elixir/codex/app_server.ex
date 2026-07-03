@@ -12,6 +12,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @manafuel_developer_instructions """
+  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. For multiple local reads or searches, combine them into one simple deterministic shell_command and wait for its result. Prefer policy-safe single commands. This overrides any instruction to parallelize tool calls or optimize speed with multiple shell commands.
+  """
 
   @type session :: %{
           port: port(),
@@ -319,17 +322,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
-    send_message(port, %{
+  @doc false
+  def thread_start_payload(workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+    %{
       "method" => "thread/start",
       "id" => @thread_start_id,
       "params" => %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
+        "developerInstructions" => @manafuel_developer_instructions,
         "dynamicTools" => DynamicTool.tool_specs()
       }
-    })
+    }
+  end
+
+  defp start_thread(port, workspace, session_policies) do
+    send_message(port, thread_start_payload(workspace, session_policies))
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
@@ -1043,6 +1052,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           :ok
         rescue
           ArgumentError ->
+            :ok
+        catch
+          :exit, :epipe ->
             :ok
         end
     end

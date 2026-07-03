@@ -183,6 +183,26 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server injects MANAfuel hosted shell serialization instructions at thread start" do
+    payload =
+      AppServer.thread_start_payload("C:/workspaces/MT-1002", %{
+        approval_policy: "never",
+        thread_sandbox: "workspace-write"
+      })
+
+    instructions = get_in(payload, ["params", "developerInstructions"])
+
+    assert payload["method"] == "thread/start"
+    assert get_in(payload, ["params", "approvalPolicy"]) == "never"
+    assert get_in(payload, ["params", "sandbox"]) == "workspace-write"
+    assert get_in(payload, ["params", "cwd"]) == "C:/workspaces/MT-1002"
+    assert is_list(get_in(payload, ["params", "dynamicTools"]))
+    assert is_binary(instructions)
+    assert instructions =~ "Hard runtime rule: issue at most one hosted shell_command"
+    assert instructions =~ "even after a failed, declined, or blocked command"
+    assert instructions =~ "overrides any instruction to parallelize tool calls"
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
