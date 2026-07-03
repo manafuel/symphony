@@ -200,7 +200,9 @@ defmodule SymphonyElixir.AppServerTest do
     assert is_binary(instructions)
     assert instructions =~ "Hard runtime rule: issue at most one hosted shell_command"
     assert instructions =~ "even after a failed, declined, or blocked command"
-    assert instructions =~ "overrides any instruction to parallelize tool calls"
+    assert instructions =~ "A shell_command must be simple"
+    assert instructions =~ "Use apply_patch for file edits"
+    assert instructions =~ "bulk-generate files through shell_command"
   end
 
   test "app server marks request-for-input events as a hard failure" do

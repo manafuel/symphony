@@ -13,7 +13,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @manafuel_developer_instructions """
-  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. For multiple local reads or searches, combine them into one simple deterministic shell_command and wait for its result. Prefer policy-safe single commands. This overrides any instruction to parallelize tool calls or optimize speed with multiple shell commands.
+  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item file generation, or multi-step orchestration through shell_command. Use apply_patch for file edits. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
   """
 
   @type session :: %{
