@@ -16,6 +16,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item file generation, or multi-step orchestration through shell_command. Use apply_patch for file edits. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
 
   The harness has already applied packaged MANAfuel skill orientation through WORKFLOW.md and the injected issue runtime context. Do not use hosted shell_command to read packaged SKILL.md files from the user plugin cache, including .codex/plugins/cache/**/skills/*/SKILL.md and manafuel-codex:* skill files. Use the provided WORKFLOW.md contract, issue context, and repository files instead. Task-specific source files, tests, status commands, and existing scripts may still be read or executed when needed.
+
+  The current cwd is a scratch Symphony issue workspace. Before reading or editing product repository files, create or select the named product worktree under manafuel.worktree_root and run product file reads from that worktree. Do not use hosted shell_command to inspect product files through the coordination checkout under manafuel.implementation_root/<repo>; that checkout may be stale or dirty and is not the ticket implementation workspace.
   """
 
   @type session :: %{
@@ -516,65 +518,143 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     metadata = metadata_from_message(port, payload)
 
-    case maybe_handle_approval_request(
-           port,
-           method,
-           payload,
-           payload_string,
-           on_message,
-           metadata,
-           tool_executor,
-           auto_approve_requests
-         ) do
-      :input_required ->
+    case maybe_block_unsafe_command(payload) do
+      {:block, reason} ->
         emit_message(
           on_message,
-          :turn_input_required,
-          %{payload: payload, raw: payload_string},
+          :unsafe_command_blocked,
+          %{payload: payload, raw: payload_string, reason: reason},
           metadata
         )
 
-        {:error, {:turn_input_required, payload}}
+        {:error, {:unsafe_command_blocked, reason, payload}}
 
-      :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+      :ok ->
+        case maybe_handle_approval_request(
+               port,
+               method,
+               payload,
+               payload_string,
+               on_message,
+               metadata,
+               tool_executor,
+               auto_approve_requests
+             ) do
+          :input_required ->
+            emit_message(
+              on_message,
+              :turn_input_required,
+              %{payload: payload, raw: payload_string},
+              metadata
+            )
 
-      :approval_required ->
-        emit_message(
-          on_message,
-          :approval_required,
-          %{payload: payload, raw: payload_string},
-          metadata
-        )
+            {:error, {:turn_input_required, payload}}
 
-        {:error, {:approval_required, payload}}
+          :approved ->
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
-      :unhandled ->
-        if needs_input?(method, payload) do
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
+          :approval_required ->
+            emit_message(
+              on_message,
+              :approval_required,
+              %{payload: payload, raw: payload_string},
+              metadata
+            )
 
-          {:error, {:turn_input_required, payload}}
-        else
-          emit_message(
-            on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
-            metadata
-          )
+            {:error, {:approval_required, payload}}
 
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          :unhandled ->
+            if needs_input?(method, payload) do
+              emit_message(
+                on_message,
+                :turn_input_required,
+                %{payload: payload, raw: payload_string},
+                metadata
+              )
+
+              {:error, {:turn_input_required, payload}}
+            else
+              emit_message(
+                on_message,
+                :notification,
+                %{
+                  payload: payload,
+                  raw: payload_string
+                },
+                metadata
+              )
+
+              Logger.debug("Codex notification: #{inspect(method)}")
+              receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+            end
         end
     end
   end
+
+  defp maybe_block_unsafe_command(payload) do
+    payload
+    |> command_execution_strings()
+    |> Enum.find_value(:ok, fn command ->
+      case unsafe_command_reason(command) do
+        nil -> false
+        reason -> {:block, reason}
+      end
+    end)
+  end
+
+  @doc false
+  def unsafe_command_block_reason_for_test(payload) do
+    case maybe_block_unsafe_command(payload) do
+      {:block, reason} -> reason
+      :ok -> nil
+    end
+  end
+
+  defp command_execution_strings(%{"params" => params}) when is_map(params) do
+    []
+    |> add_command_string(Map.get(params, "command"))
+    |> add_item_command_strings(Map.get(params, "item"))
+  end
+
+  defp command_execution_strings(_payload), do: []
+
+  defp add_item_command_strings(commands, %{"type" => "commandExecution"} = item) do
+    commands
+    |> add_command_string(Map.get(item, "command"))
+    |> add_command_string(Map.get(item, "cwd"))
+    |> add_command_action_strings(Map.get(item, "commandActions"))
+  end
+
+  defp add_item_command_strings(commands, _item), do: commands
+
+  defp add_command_action_strings(commands, actions) when is_list(actions) do
+    Enum.reduce(actions, commands, fn
+      %{"command" => command}, acc -> add_command_string(acc, command)
+      _, acc -> acc
+    end)
+  end
+
+  defp add_command_action_strings(commands, _actions), do: commands
+
+  defp add_command_string(commands, value) when is_binary(value), do: [value | commands]
+  defp add_command_string(commands, _value), do: commands
+
+  defp unsafe_command_reason(command) when is_binary(command) do
+    normalized = String.downcase(String.replace(command, "\\", "/"))
+
+    cond do
+      Regex.match?(~r{/\.codex/plugins/cache/.*/skills/.*/skill\.md}, normalized) ->
+        "packaged skill file read through hosted shell_command"
+
+      Regex.match?(~r{/development/(one|replicator)/}, normalized) ->
+        "product coordination-checkout path used instead of a named product worktree"
+
+      true ->
+        nil
+    end
+  end
+
+  defp unsafe_command_reason(_command), do: nil
 
   defp maybe_handle_approval_request(
          port,

@@ -206,6 +206,9 @@ defmodule SymphonyElixir.AppServerTest do
     assert instructions =~ "has already applied packaged MANAfuel skill orientation"
     assert instructions =~ "Do not use hosted shell_command to read packaged SKILL.md"
     assert instructions =~ "manafuel-codex:* skill files"
+    assert instructions =~ "current cwd is a scratch Symphony issue workspace"
+    assert instructions =~ "Before reading or editing product repository files"
+    assert instructions =~ "manafuel.implementation_root/<repo>"
   end
 
   test "app server marks request-for-input events as a hard failure" do
@@ -550,6 +553,53 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "app server blocks product coordination checkout command executions" do
+    unsafe_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-block",
+          "command" => "powershell.exe -Command Get-Content -Path C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\one\\SECURITY.md",
+          "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90",
+          "commandActions" => [
+            %{
+              "type" => "unknown",
+              "command" => "Get-Content -Path C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\one\\SECURITY.md"
+            }
+          ]
+        }
+      }
+    }
+
+    safe_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-safe",
+          "command" => "powershell.exe -Command Get-Content -Path C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one\\MAN-90\\SECURITY.md"
+        }
+      }
+    }
+
+    skill_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-skill",
+          "command" => "Get-Content -Path C:\\Users\\jclen\\.codex\\plugins\\cache\\manafuel-local\\manafuel-codex\\skills\\documenter\\SKILL.md"
+        }
+      }
+    }
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_payload) =~
+             "coordination-checkout"
+
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_payload))
+
+    assert AppServer.unsafe_command_block_reason_for_test(skill_payload) =~
+             "packaged skill file"
   end
 
   test "app server auto-approves MCP tool approval prompts when approval policy is never" do
