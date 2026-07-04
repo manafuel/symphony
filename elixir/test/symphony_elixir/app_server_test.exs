@@ -649,7 +649,6 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       workspace_root = Path.join(test_root, "workspaces")
       workspace = Path.join(workspace_root, "MAN-90")
-      codex_binary = Path.join(test_root, "fake-codex")
       trace_file = Path.join(test_root, "codex-unsafe-cwd-approval.trace")
       previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
@@ -664,39 +663,71 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-unsafe-cwd-approval.trace}"
-      count=0
-      while IFS= read -r line; do
-        count=$((count + 1))
-        printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
+      codex_command =
+        case :os.type() do
+          {:win32, _} ->
+            fake_script = Path.join(test_root, "fake-codex.cmd")
+            cmd = System.find_executable("cmd.exe") || "cmd.exe"
 
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-unsafe-cwd\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-unsafe-cwd\"}}}'
-            printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"Get-Content SECURITY.md\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one\",\"reason\":\"need approval\"}}'
-            ;;
-          *)
-            sleep 1
-            ;;
-        esac
-      done
-      """)
+            File.write!(fake_script, """
+            @echo off
+            set TRACE=%SYMP_TEST_CODEx_TRACE%
+            if "%TRACE%"=="" set TRACE=#{String.replace(trace_file, "\\", "/")}
+            set COUNT=0
+            :loop
+            set LINE=
+            set /p LINE=
+            if errorlevel 1 goto end
+            set /a COUNT+=1
+            >> "%TRACE%" echo JSON:%LINE%
+            if "%COUNT%"=="1" echo {"id":1,"result":{}}
+            if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-unsafe-cwd"}}}
+            if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-unsafe-cwd"}}}
+            if "%COUNT%"=="4" echo {"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"Get-Content SECURITY.md","cwd":"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one","reason":"need approval"}}
+            goto loop
+            :end
+            """)
 
-      File.chmod!(codex_binary, 0o755)
+            "#{String.replace(cmd, "\\", "/")} /c #{String.replace(fake_script, "\\", "/")} app-server"
+
+          _ ->
+            codex_binary = Path.join(test_root, "fake-codex")
+
+            File.write!(codex_binary, """
+            #!/bin/sh
+            trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-unsafe-cwd-approval.trace}"
+            count=0
+            while IFS= read -r line; do
+              count=$((count + 1))
+              printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
+
+              case \"$count\" in
+                1)
+                  printf '%s\\n' '{\"id\":1,\"result\":{}}'
+                  ;;
+                2)
+                  ;;
+                3)
+                  printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-unsafe-cwd\"}}}'
+                  ;;
+                4)
+                  printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-unsafe-cwd\"}}}'
+                  printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"Get-Content SECURITY.md\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one\",\"reason\":\"need approval\"}}'
+                  ;;
+                *)
+                  sleep 1
+                  ;;
+              esac
+            done
+            """)
+
+            File.chmod!(codex_binary, 0o755)
+            "#{codex_binary} app-server"
+        end
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server",
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
         codex_approval_policy: "never"
       )
 
