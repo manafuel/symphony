@@ -813,6 +813,134 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server blocks unsafe started command before output deltas are delivered" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-unsafe-started-command-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MAN-90")
+      trace_file = Path.join(test_root, "codex-unsafe-started-command.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      {:ok, event_log} = Agent.start_link(fn -> [] end)
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+
+        if Process.alive?(event_log), do: Agent.stop(event_log)
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      codex_command =
+        case :os.type() do
+          {:win32, _} ->
+            fake_script = Path.join(test_root, "fake-codex-started.cmd")
+            cmd = System.find_executable("cmd.exe") || "cmd.exe"
+
+            File.write!(fake_script, """
+            @echo off
+            set TRACE=%SYMP_TEST_CODEx_TRACE%
+            if "%TRACE%"=="" set TRACE=#{String.replace(trace_file, "\\", "/")}
+            set COUNT=0
+            :loop
+            set LINE=
+            set /p LINE=
+            if errorlevel 1 goto end
+            set /a COUNT+=1
+            >> "%TRACE%" echo JSON:%LINE%
+            if "%COUNT%"=="1" echo {"id":1,"result":{}}
+            if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-unsafe-started"}}}
+            if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-unsafe-started"}}}
+            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"type":"commandExecution","id":"call-leak","command":"Get-Content one/SECRET.txt","cwd":"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development","commandActions":[{"type":"unknown","command":"Get-Content one/SECRET.txt"}]},"threadId":"thread-unsafe-started","turnId":"turn-unsafe-started"}}
+            if "%COUNT%"=="4" echo {"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-unsafe-started","turnId":"turn-unsafe-started","itemId":"call-leak","delta":"LEAKED_STALE_CONTENT"}}
+            goto loop
+            :end
+            """)
+
+            "#{String.replace(cmd, "\\", "/")} /c #{String.replace(fake_script, "\\", "/")} app-server"
+
+          _ ->
+            codex_binary = Path.join(test_root, "fake-codex-started")
+
+            File.write!(codex_binary, """
+            #!/bin/sh
+            trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-unsafe-started-command.trace}"
+            count=0
+            while IFS= read -r line; do
+              count=$((count + 1))
+              printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
+
+              case \"$count\" in
+                1)
+                  printf '%s\\n' '{\"id\":1,\"result\":{}}'
+                  ;;
+                3)
+                  printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-unsafe-started\"}}}'
+                  ;;
+                4)
+                  printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-unsafe-started\"}}}'
+                  printf '%s\\n' '{\"method\":\"item/started\",\"params\":{\"item\":{\"type\":\"commandExecution\",\"id\":\"call-leak\",\"command\":\"Get-Content one/SECRET.txt\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development\",\"commandActions\":[{\"type\":\"unknown\",\"command\":\"Get-Content one/SECRET.txt\"}]},\"threadId\":\"thread-unsafe-started\",\"turnId\":\"turn-unsafe-started\"}}'
+                  printf '%s\\n' '{\"method\":\"item/commandExecution/outputDelta\",\"params\":{\"threadId\":\"thread-unsafe-started\",\"turnId\":\"turn-unsafe-started\",\"itemId\":\"call-leak\",\"delta\":\"LEAKED_STALE_CONTENT\"}}'
+                  ;;
+                *)
+                  sleep 1
+                  ;;
+              esac
+            done
+            """)
+
+            File.chmod!(codex_binary, 0o755)
+            "#{codex_binary} app-server"
+        end
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-unsafe-started-command",
+        identifier: "MAN-90",
+        title: "Block unsafe started command",
+        description: "Ensure unsafe command output is not delivered",
+        state: "In Progress",
+        url: "https://example.org/issues/MAN-90",
+        labels: ["harness"]
+      }
+
+      on_message = fn message ->
+        Agent.update(event_log, fn messages -> [message | messages] end)
+      end
+
+      assert {:error, {:unsafe_command_blocked, reason, payload}} =
+               AppServer.run(workspace, "Handle unsafe started command", issue, on_message: on_message)
+
+      assert reason =~ "coordination-checkout"
+      assert get_in(payload, ["params", "item", "id"]) == "call-leak"
+
+      delivered =
+        event_log
+        |> Agent.get(& &1)
+        |> Enum.map(&inspect/1)
+        |> Enum.join("\n")
+
+      refute delivered =~ "LEAKED_STALE_CONTENT"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server auto-approves MCP tool approval prompts when approval policy is never" do
     test_root =
       Path.join(
