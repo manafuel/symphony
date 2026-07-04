@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @manafuel_developer_instructions """
   MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item file generation, or multi-step orchestration through shell_command. Use apply_patch for file edits. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
+
+  The harness has already applied the manafuel-control orientation through WORKFLOW.md and the injected issue runtime context. Do not load manafuel-codex:manafuel-control/SKILL.md from the user plugin cache in app-server child sessions; use the provided WORKFLOW.md contract as the control-layer orientation. Other task-specific skills may still be loaded when needed.
   """
 
   @type session :: %{
