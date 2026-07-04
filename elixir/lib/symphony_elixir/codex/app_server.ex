@@ -15,7 +15,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @manafuel_developer_instructions """
   MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item file generation, or multi-step orchestration through shell_command. Use apply_patch for file edits. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
 
-  The harness has already applied the manafuel-control orientation through WORKFLOW.md and the injected issue runtime context. Do not load manafuel-codex:manafuel-control/SKILL.md from the user plugin cache in app-server child sessions; use the provided WORKFLOW.md contract as the control-layer orientation. Other task-specific skills may still be loaded when needed.
+  The harness has already applied packaged MANAfuel skill orientation through WORKFLOW.md and the injected issue runtime context. Do not use hosted shell_command to read packaged SKILL.md files from the user plugin cache, including .codex/plugins/cache/**/skills/*/SKILL.md and manafuel-codex:* skill files. Use the provided WORKFLOW.md contract, issue context, and repository files instead. Task-specific source files, tests, status commands, and existing scripts may still be read or executed when needed.
   """
 
   @type session :: %{

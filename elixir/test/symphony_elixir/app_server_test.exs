@@ -203,8 +203,9 @@ defmodule SymphonyElixir.AppServerTest do
     assert instructions =~ "A shell_command must be simple"
     assert instructions =~ "Use apply_patch for file edits"
     assert instructions =~ "bulk-generate files through shell_command"
-    assert instructions =~ "has already applied the manafuel-control orientation"
-    assert instructions =~ "Do not load manafuel-codex:manafuel-control/SKILL.md"
+    assert instructions =~ "has already applied packaged MANAfuel skill orientation"
+    assert instructions =~ "Do not use hosted shell_command to read packaged SKILL.md"
+    assert instructions =~ "manafuel-codex:* skill files"
   end
 
   test "app server marks request-for-input events as a hard failure" do
