@@ -327,6 +327,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
+  @spec thread_start_payload(String.t(), %{approval_policy: term(), thread_sandbox: term()}) :: map()
   def thread_start_payload(workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
     %{
       "method" => "thread/start",
@@ -603,6 +604,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
+  @spec unsafe_command_block_reason_for_test(map()) :: String.t() | nil
   def unsafe_command_block_reason_for_test(payload) do
     case maybe_block_unsafe_command(payload) do
       {:block, reason} -> reason
@@ -685,6 +687,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       Regex.match?(~r{/development/?$}, normalized_cwd) and product_relative_path?(normalized_command) ->
         "product coordination-checkout path used instead of a named product worktree"
 
+      Regex.match?(~r{/development/tools/?$}, normalized_cwd) and
+          discord_iac_relative_path?(normalized_command) ->
+        "product coordination-checkout path used instead of a named product worktree"
+
       String.contains?(normalized_cwd, "/.codex/plugins/cache/") and
           plugin_skill_relative_path?(normalized_command) ->
         "packaged skill file read through hosted shell_command"
@@ -698,11 +704,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp product_relative_path?(command) when is_binary(command) do
     Regex.match?(~r{(^|[\s"'=])(?:\./)?(one|replicator|bob)(?:/|[\s"']|$)}, command) or
+      discord_iac_relative_path?(command) or
       Regex.match?(~r{(^|[\s"'=])(?:\./)?tools/discord-iac(?:/|[\s"']|$)}, command)
+  end
+
+  defp discord_iac_relative_path?(command) when is_binary(command) do
+    Regex.match?(~r{(^|[\s"'=])(?:\./)?discord-iac(?:/|[\s"']|$)}, command)
   end
 
   defp plugin_skill_relative_path?(command) when is_binary(command) do
     Regex.match?(~r{(^|[\s"'=])(?:\./)?skills/[^ \t\r\n"']*/skill\.md(?:[\s"']|$)}, command) or
+      Regex.match?(~r{(^|[\s"'=])(?:\./)?[^ \t\r\n"'/]+/skill\.md(?:[\s"']|$)}, command) or
       Regex.match?(~r{(^|[\s"'=])(?:\./)?skill\.md(?:[\s"']|$)}, command)
   end
 

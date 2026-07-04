@@ -636,6 +636,22 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
+    unsafe_plugin_intermediate_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Content documenter/SKILL.md",
+        "cwd" => "C:\\Users\\jclen\\.codex\\plugins\\cache\\manafuel-local\\manafuel-codex\\0.1.0+codex.20260629184500\\skills"
+      }
+    }
+
+    unsafe_discord_intermediate_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Content discord-iac/README.md",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\tools"
+      }
+    }
+
     unrelated_tool_payload = %{
       "method" => "item/tool/call",
       "params" => %{
@@ -670,6 +686,12 @@ defmodule SymphonyElixir.AppServerTest do
 
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_plugin_relative_payload) =~
              "packaged skill file"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_plugin_intermediate_payload) =~
+             "packaged skill file"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_discord_intermediate_payload) =~
+             "coordination-checkout"
 
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(unrelated_tool_payload))
