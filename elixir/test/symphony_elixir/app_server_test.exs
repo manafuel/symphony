@@ -621,6 +621,28 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
+    unsafe_relative_cases = [
+      {"one", "Get-Content one/SECURITY.md"},
+      {"replicator", "Get-Content replicator/README.md"},
+      {"bob", "Get-Content bob/README.md"},
+      {"discord-iac", "Get-Content tools/discord-iac/README.md"}
+    ]
+
+    unsafe_plugin_relative_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Content skills/documenter/SKILL.md",
+        "cwd" => "C:\\Users\\jclen\\.codex\\plugins\\cache\\manafuel-local\\manafuel-codex\\0.1.0+codex.20260629184500"
+      }
+    }
+
+    unrelated_tool_payload = %{
+      "method" => "item/tool/call",
+      "params" => %{
+        "command" => "Get-Content C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\one\\SECURITY.md"
+      }
+    }
+
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_payload) =~
              "coordination-checkout"
 
@@ -633,7 +655,24 @@ defmodule SymphonyElixir.AppServerTest do
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_top_level_cwd_payload) =~
              "coordination-checkout"
 
+    Enum.each(unsafe_relative_cases, fn {_name, command} ->
+      payload = %{
+        "method" => "item/commandExecution/requestApproval",
+        "params" => %{
+          "command" => command,
+          "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development"
+        }
+      }
+
+      assert AppServer.unsafe_command_block_reason_for_test(payload) =~
+               "coordination-checkout"
+    end)
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_plugin_relative_payload) =~
+             "packaged skill file"
+
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(unrelated_tool_payload))
 
     assert AppServer.unsafe_command_block_reason_for_test(skill_payload) =~
              "packaged skill file"
@@ -683,7 +722,7 @@ defmodule SymphonyElixir.AppServerTest do
             if "%COUNT%"=="1" echo {"id":1,"result":{}}
             if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-unsafe-cwd"}}}
             if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-unsafe-cwd"}}}
-            if "%COUNT%"=="4" echo {"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"Get-Content SECURITY.md","cwd":"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one","reason":"need approval"}}
+            if "%COUNT%"=="4" echo {"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"Get-Content one/SECURITY.md","cwd":"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development","reason":"need approval"}}
             goto loop
             :end
             """)
@@ -712,7 +751,7 @@ defmodule SymphonyElixir.AppServerTest do
                   ;;
                 4)
                   printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-unsafe-cwd\"}}}'
-                  printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"Get-Content SECURITY.md\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one\",\"reason\":\"need approval\"}}'
+                  printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"Get-Content one/SECURITY.md\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development\",\"reason\":\"need approval\"}}'
                   ;;
                 *)
                   sleep 1

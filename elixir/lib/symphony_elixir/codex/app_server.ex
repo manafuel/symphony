@@ -593,9 +593,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp maybe_block_unsafe_command(payload) do
     payload
-    |> command_execution_strings()
-    |> Enum.find_value(:ok, fn command ->
-      case unsafe_command_reason(command) do
+    |> command_execution_contexts()
+    |> Enum.find_value(:ok, fn context ->
+      case unsafe_command_reason(context) do
         nil -> false
         reason -> {:block, reason}
       end
@@ -610,37 +610,54 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp command_execution_strings(%{"params" => params}) when is_map(params) do
-    []
-    |> add_command_string(Map.get(params, "command"))
-    |> add_command_string(Map.get(params, "cwd"))
-    |> add_item_command_strings(Map.get(params, "item"))
+  defp command_execution_contexts(%{"method" => "item/commandExecution/requestApproval", "params" => params})
+       when is_map(params) do
+    [
+      %{
+        command: Map.get(params, "command"),
+        cwd: Map.get(params, "cwd"),
+        command_actions: []
+      }
+    ]
   end
 
-  defp command_execution_strings(_payload), do: []
-
-  defp add_item_command_strings(commands, %{"type" => "commandExecution"} = item) do
-    commands
-    |> add_command_string(Map.get(item, "command"))
-    |> add_command_string(Map.get(item, "cwd"))
-    |> add_command_action_strings(Map.get(item, "commandActions"))
+  defp command_execution_contexts(%{"params" => %{"item" => %{"type" => "commandExecution"} = item}}) do
+    [
+      %{
+        command: Map.get(item, "command"),
+        cwd: Map.get(item, "cwd"),
+        command_actions: command_action_strings(Map.get(item, "commandActions"))
+      }
+    ]
   end
 
-  defp add_item_command_strings(commands, _item), do: commands
+  defp command_execution_contexts(_payload), do: []
 
-  defp add_command_action_strings(commands, actions) when is_list(actions) do
-    Enum.reduce(actions, commands, fn
-      %{"command" => command}, acc -> add_command_string(acc, command)
-      _, acc -> acc
+  defp command_action_strings(actions) when is_list(actions) do
+    actions
+    |> Enum.flat_map(fn
+      %{"command" => command} when is_binary(command) -> [command]
+      _ -> []
     end)
   end
 
-  defp add_command_action_strings(commands, _actions), do: commands
+  defp command_action_strings(_actions), do: []
 
-  defp add_command_string(commands, value) when is_binary(value), do: [value | commands]
-  defp add_command_string(commands, _value), do: commands
+  defp unsafe_command_reason(%{command: command, cwd: cwd, command_actions: command_actions}) do
+    [command, cwd | command_actions]
+    |> Enum.find_value(fn value ->
+      case unsafe_absolute_command_reason(value) do
+        nil -> false
+        reason -> reason
+      end
+    end) ||
+      unsafe_relative_command_reason(command, cwd) ||
+      Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end)
+  end
 
-  defp unsafe_command_reason(command) when is_binary(command) do
+  defp unsafe_command_reason(_context), do: nil
+
+  defp unsafe_absolute_command_reason(command) when is_binary(command) do
     normalized = String.downcase(String.replace(command, "\\", "/"))
 
     cond do
@@ -658,7 +675,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp unsafe_command_reason(_command), do: nil
+  defp unsafe_absolute_command_reason(_command), do: nil
+
+  defp unsafe_relative_command_reason(command, cwd) when is_binary(command) and is_binary(cwd) do
+    normalized_command = String.downcase(String.replace(command, "\\", "/"))
+    normalized_cwd = String.downcase(String.replace(cwd, "\\", "/"))
+
+    cond do
+      Regex.match?(~r{/development/?$}, normalized_cwd) and product_relative_path?(normalized_command) ->
+        "product coordination-checkout path used instead of a named product worktree"
+
+      String.contains?(normalized_cwd, "/.codex/plugins/cache/") and
+          plugin_skill_relative_path?(normalized_command) ->
+        "packaged skill file read through hosted shell_command"
+
+      true ->
+        nil
+    end
+  end
+
+  defp unsafe_relative_command_reason(_command, _cwd), do: nil
+
+  defp product_relative_path?(command) when is_binary(command) do
+    Regex.match?(~r{(^|[\s"'=])(?:\./)?(one|replicator|bob)(?:/|[\s"']|$)}, command) or
+      Regex.match?(~r{(^|[\s"'=])(?:\./)?tools/discord-iac(?:/|[\s"']|$)}, command)
+  end
+
+  defp plugin_skill_relative_path?(command) when is_binary(command) do
+    Regex.match?(~r{(^|[\s"'=])(?:\./)?skills/[^ \t\r\n"']*/skill\.md(?:[\s"']|$)}, command) or
+      Regex.match?(~r{(^|[\s"'=])(?:\./)?skill\.md(?:[\s"']|$)}, command)
+  end
 
   defp maybe_handle_approval_request(
          port,
