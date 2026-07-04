@@ -659,6 +659,160 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
+    unsafe_generation_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-new-item",
+          "command" => "New-Item -ItemType Directory -Force \"C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex\\runs\\2026-07-04-man-90-security-contact\"",
+          "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90",
+          "commandActions" => [
+            %{
+              "type" => "unknown",
+              "command" => "New-Item -ItemType Directory -Force \"C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex\\runs\\2026-07-04-man-90-security-contact\""
+            }
+          ]
+        }
+      }
+    }
+
+    unsafe_set_content_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command Set-Content out.txt 'generated'",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_wrapped_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command New-Item -ItemType Directory -Force .codex\\runs\\man-90",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_script_block_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command \"if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p }\"",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_unwrapped_script_block_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p }",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_pwsh_short_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "pwsh -c New-Item -ItemType Directory -Path .codex\\runs\\man-90",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_alias_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "mkdir .codex\\runs\\man-90",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_cmd_wrapped_generation_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "cmd /c powershell.exe -NoProfile -Command \"if (!(Test-Path $p)) { New-Item -ItemType Directory -Path $p }\"",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_redirection_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Process > .codex\\runs\\man-90\\processes.txt",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_quoted_powershell_redirection_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command \"Get-Process > .codex\\runs\\man-90\\processes.txt\"",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_numbered_stdout_redirection_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Process 1> .codex\\runs\\man-90\\processes.txt",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_numbered_stderr_redirection_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Process 2> .codex\\runs\\man-90\\errors.txt",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_numbered_append_redirection_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Process 2>> .codex\\runs\\man-90\\errors.txt",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_quoted_comparison_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Select-String -Path README.md -Pattern 'x > y'",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_rg_generation_search_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "rg \"New-Item|Set-Content\" .",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_select_string_generation_search_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Select-String -Path README.md -Pattern New-Item",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_wrapped_quoted_comparison_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command \"Select-String -Path README.md -Pattern 'x > y'\"",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_single_quoted_powershell_commands = [
+      "powershell.exe -NoProfile -Command 'New-Item -ItemType Directory .codex\\runs\\man-90'",
+      "pwsh -c 'Set-Content out.txt generated'",
+      "powershell.exe -Command 'Out-File out.txt'",
+      "powershell.exe -Command 'Add-Content out.txt generated'",
+      "powershell.exe -Command 'mkdir .codex\\runs\\man-90'",
+      "powershell.exe -Command 'Get-Process 2>> .codex\\runs\\man-90\\errors.txt'"
+    ]
+
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_payload) =~
              "coordination-checkout"
 
@@ -695,6 +849,63 @@ defmodule SymphonyElixir.AppServerTest do
 
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(unrelated_tool_payload))
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_set_content_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_wrapped_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_script_block_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_unwrapped_script_block_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_pwsh_short_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_alias_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_cmd_wrapped_generation_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_redirection_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_quoted_powershell_redirection_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_numbered_stdout_redirection_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_numbered_stderr_redirection_payload) =~
+             "filesystem-generation"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_numbered_append_redirection_payload) =~
+             "filesystem-generation"
+
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_quoted_comparison_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_rg_generation_search_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_select_string_generation_search_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_wrapped_quoted_comparison_payload))
+
+    Enum.each(unsafe_single_quoted_powershell_commands, fn command ->
+      payload = %{
+        "method" => "item/commandExecution/requestApproval",
+        "params" => %{
+          "command" => command,
+          "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+        }
+      }
+
+      assert AppServer.unsafe_command_block_reason_for_test(payload) =~
+               "filesystem-generation"
+    end)
 
     assert AppServer.unsafe_command_block_reason_for_test(skill_payload) =~
              "packaged skill file"

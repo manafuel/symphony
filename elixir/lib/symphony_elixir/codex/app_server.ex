@@ -13,7 +13,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @manafuel_developer_instructions """
-  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item file generation, or multi-step orchestration through shell_command. Use apply_patch for file edits. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
+  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item/Out-File/Add-Content filesystem generation, their common aliases, shell redirection file writes, run-folder creation, or multi-step orchestration through shell_command. Use apply_patch for file edits. Ad hoc run-folder notes are optional when no existing script writes them; required plan, validation, committee/reviewer, gate, and run evidence artifacts remain mandatory and must be produced through existing scripts or allowed file-edit paths. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
 
   The harness has already applied packaged MANAfuel skill orientation through WORKFLOW.md and the injected issue runtime context. Do not use hosted shell_command to read packaged SKILL.md files from the user plugin cache, including .codex/plugins/cache/**/skills/*/SKILL.md and manafuel-codex:* skill files. Use the provided WORKFLOW.md contract, issue context, and repository files instead. Task-specific source files, tests, status commands, and existing scripts may still be read or executed when needed.
 
@@ -653,6 +653,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         reason -> reason
       end
     end) ||
+      unsafe_hosted_shell_generation_reason(command) ||
+      Enum.find_value(command_actions, fn action -> unsafe_hosted_shell_generation_reason(action) end) ||
       unsafe_relative_command_reason(command, cwd) ||
       Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end)
   end
@@ -678,6 +680,73 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp unsafe_absolute_command_reason(_command), do: nil
+
+  defp unsafe_hosted_shell_generation_reason(command) when is_binary(command) do
+    normalized =
+      command
+      |> String.trim()
+      |> String.downcase()
+
+    powershell_invocation =
+      Regex.match?(
+        ~r/\b(?:powershell|pwsh)(?:\.exe)?\b/,
+        normalized
+      )
+
+    command_without_quoted_strings =
+      if powershell_invocation do
+        Regex.replace(~r/'[^']*'/, normalized, "")
+      else
+        Regex.replace(~r/'[^']*'|"[^"]*"/, normalized, "")
+      end
+
+    direct_generation =
+      Regex.match?(
+        ~r/(^|[;&|{(\r\n])\s*(?:new-item|set-content|add-content|out-file|mkdir|md|ni|sc|ac)\b/,
+        command_without_quoted_strings
+      )
+
+    generation_token =
+      Regex.match?(
+        ~r/(^|[;&|{(\r\n])\s*(?:new-item|set-content|add-content|out-file|mkdir|md|ni|sc|ac)\b/,
+        command_without_quoted_strings
+      ) ||
+        Regex.match?(
+          ~r/\s-(?:command|c)\s+['"]?(?:&\s*)?(?:\{\s*)?(?:new-item|set-content|add-content|out-file|mkdir|md|ni|sc|ac)\b/,
+          command_without_quoted_strings
+        ) ||
+        single_quoted_powershell_generation?(normalized)
+
+    redirection_source = command_without_quoted_strings
+
+    redirection_generation =
+      Regex.match?(~r/(^|[\s;&|{(\r\n])(?:\d+)?>{1,2}(?!&)\s*\S/, redirection_source)
+
+    wrapped_generation = powershell_invocation && generation_token
+
+    if direct_generation || wrapped_generation || redirection_generation do
+      "PowerShell filesystem-generation command used through hosted shell_command"
+    else
+      nil
+    end
+  end
+
+  defp unsafe_hosted_shell_generation_reason(_command), do: nil
+
+  defp single_quoted_powershell_generation?(normalized) when is_binary(normalized) do
+    ~r/\s-(?:command|c)\s+'([^']*)'/
+    |> Regex.scan(normalized, capture: :all_but_first)
+    |> List.flatten()
+    |> Enum.any?(fn script ->
+      Regex.match?(
+        ~r/(^|[;&|{(\r\n])\s*(?:new-item|set-content|add-content|out-file|mkdir|md|ni|sc|ac)\b/,
+        script
+      ) ||
+        Regex.match?(~r/(^|[\s;&|{(\r\n])(?:\d+)?>{1,2}(?!&)\s*\S/, script)
+    end)
+  end
+
+  defp single_quoted_powershell_generation?(_normalized), do: false
 
   defp unsafe_relative_command_reason(command, cwd) when is_binary(command) and is_binary(cwd) do
     normalized_command = String.downcase(String.replace(command, "\\", "/"))
