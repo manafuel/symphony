@@ -593,13 +593,132 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
+    unsafe_bob_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-bob",
+          "command" => "Get-Content C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\bob\\README.md"
+        }
+      }
+    }
+
+    unsafe_discord_payload = %{
+      "params" => %{
+        "item" => %{
+          "type" => "commandExecution",
+          "id" => "call-discord",
+          "command" => "Get-Content C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\tools\\discord-iac\\README.md"
+        }
+      }
+    }
+
+    unsafe_top_level_cwd_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-Content SECURITY.md",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\one"
+      }
+    }
+
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_payload) =~
+             "coordination-checkout"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_bob_payload) =~
+             "coordination-checkout"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_discord_payload) =~
+             "coordination-checkout"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_top_level_cwd_payload) =~
              "coordination-checkout"
 
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_payload))
 
     assert AppServer.unsafe_command_block_reason_for_test(skill_payload) =~
              "packaged skill file"
+  end
+
+  test "app server blocks unsafe top-level cwd approval before auto approval" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-unsafe-cwd-approval-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MAN-90")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-unsafe-cwd-approval.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-unsafe-cwd-approval.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
+
+        case \"$count\" in
+          1)
+            printf '%s\\n' '{\"id\":1,\"result\":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-unsafe-cwd\"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-unsafe-cwd\"}}}'
+            printf '%s\\n' '{\"id\":99,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"Get-Content SECURITY.md\",\"cwd\":\"C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/one\",\"reason\":\"need approval\"}}'
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-unsafe-cwd-approval",
+        identifier: "MAN-90",
+        title: "Block unsafe cwd approval",
+        description: "Ensure unsafe coordination-checkout cwd is never auto approved",
+        state: "In Progress",
+        url: "https://example.org/issues/MAN-90",
+        labels: ["harness"]
+      }
+
+      assert {:error, {:unsafe_command_blocked, reason, payload}} =
+               AppServer.run(workspace, "Handle unsafe approval request", issue)
+
+      assert reason =~ "coordination-checkout"
+      assert payload["method"] == "item/commandExecution/requestApproval"
+      refute File.read!(trace_file) =~ "acceptForSession"
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "app server auto-approves MCP tool approval prompts when approval policy is never" do

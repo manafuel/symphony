@@ -613,6 +613,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp command_execution_strings(%{"params" => params}) when is_map(params) do
     []
     |> add_command_string(Map.get(params, "command"))
+    |> add_command_string(Map.get(params, "cwd"))
     |> add_item_command_strings(Map.get(params, "item"))
   end
 
@@ -646,7 +647,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       Regex.match?(~r{/\.codex/plugins/cache/.*/skills/.*/skill\.md}, normalized) ->
         "packaged skill file read through hosted shell_command"
 
-      Regex.match?(~r{/development/(one|replicator)/}, normalized) ->
+      Regex.match?(~r{/development/(one|replicator|bob)(?:/|$)}, normalized) ->
+        "product coordination-checkout path used instead of a named product worktree"
+
+      Regex.match?(~r{/development/tools/discord-iac(?:/|$)}, normalized) ->
         "product coordination-checkout path used instead of a named product worktree"
 
       true ->
