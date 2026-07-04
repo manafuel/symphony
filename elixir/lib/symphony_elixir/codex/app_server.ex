@@ -394,10 +394,33 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, :turn)
+  end
+
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         timeout_context
+       ) do
+    receive_timeout_ms = receive_timeout_ms(timeout_ms, timeout_context)
+
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          timeout_context
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -406,18 +429,48 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          timeout_context
         )
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
-      timeout_ms ->
-        {:error, :turn_timeout}
+      receive_timeout_ms ->
+        timeout_error(timeout_context, receive_timeout_ms)
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp receive_timeout_ms(turn_timeout_ms, :command_execution) do
+    command_timeout_ms(turn_timeout_ms)
+  end
+
+  defp receive_timeout_ms(turn_timeout_ms, _timeout_context), do: turn_timeout_ms
+
+  defp command_timeout_ms(turn_timeout_ms) do
+    case Config.settings!().codex.stall_timeout_ms do
+      timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
+        min(timeout_ms, turn_timeout_ms)
+
+      _ ->
+        turn_timeout_ms
+    end
+  end
+
+  defp timeout_error(:command_execution, timeout_ms),
+    do: {:error, {:command_execution_timeout, timeout_ms}}
+
+  defp timeout_error(_timeout_context, _timeout_ms), do: {:error, :turn_timeout}
+
+  defp handle_incoming(
+         port,
+         on_message,
+         data,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         timeout_context
+       ) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -451,6 +504,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
+        next_timeout_context = next_timeout_context(payload, timeout_context)
+
         handle_turn_method(
           port,
           on_message,
@@ -459,7 +514,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          next_timeout_context
         )
 
       {:ok, payload} ->
@@ -473,7 +529,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          timeout_context
+        )
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -490,7 +554,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          timeout_context
+        )
     end
   end
 
@@ -515,7 +587,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         timeout_context
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -552,7 +625,15 @@ defmodule SymphonyElixir.Codex.AppServer do
             {:error, {:turn_input_required, payload}}
 
           :approved ->
-            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+            receive_loop(
+              port,
+              on_message,
+              timeout_ms,
+              "",
+              tool_executor,
+              auto_approve_requests,
+              timeout_context
+            )
 
           :approval_required ->
             emit_message(
@@ -586,11 +667,54 @@ defmodule SymphonyElixir.Codex.AppServer do
               )
 
               Logger.debug("Codex notification: #{inspect(method)}")
-              receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+              receive_loop(
+                port,
+                on_message,
+                timeout_ms,
+                "",
+                tool_executor,
+                auto_approve_requests,
+                timeout_context
+              )
             end
         end
     end
   end
+
+  defp next_timeout_context(payload, current_context) do
+    cond do
+      command_execution_completed_message?(payload) -> :turn
+      command_execution_activity_message?(payload) -> :command_execution
+      true -> current_context
+    end
+  end
+
+  defp command_execution_activity_message?(%{"method" => "item/commandExecution/requestApproval", "params" => params})
+       when is_map(params),
+       do: true
+
+  defp command_execution_activity_message?(%{"method" => method})
+       when method in ["item/commandExecution/outputDelta", "item/commandExecution/output"] do
+    true
+  end
+
+  defp command_execution_activity_message?(%{
+         "method" => "item/started",
+         "params" => %{"item" => %{"type" => "commandExecution"}}
+       }),
+       do: true
+
+  defp command_execution_activity_message?(_payload), do: false
+
+  defp command_execution_completed_message?(%{
+         "method" => method,
+         "params" => %{"item" => %{"type" => "commandExecution"}}
+       })
+       when method in ["item/completed", "item/failed"],
+       do: true
+
+  defp command_execution_completed_message?(_payload), do: false
 
   defp maybe_block_unsafe_command(payload) do
     payload

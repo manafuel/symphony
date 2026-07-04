@@ -555,6 +555,194 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server times out idle command executions with the stall timeout" do
+    test_root =
+      Path.join(
+        Path.join(File.cwd!(), "tmp"),
+        "symphony-elixir-app-server-command-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-90")
+      File.mkdir_p!(workspace)
+
+      codex_command =
+        case :os.type() do
+          {:win32, _} ->
+            fake_script = Path.join(test_root, "fake-codex-timeout.cmd")
+            cmd = System.find_executable("cmd.exe") || "cmd.exe"
+
+            File.write!(fake_script, """
+            @echo off
+            set COUNT=0
+            :loop
+            set LINE=
+            set /p LINE=
+            if errorlevel 1 goto end
+            set /a COUNT+=1
+            if "%COUNT%"=="1" echo {"id":1,"result":{}}
+            if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-command-timeout"}}}
+            if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-command-timeout"}}}
+            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"rg --files .","cwd":"C:/tmp"}}}
+            goto loop
+            :end
+            """)
+
+            "#{String.replace(cmd, "\\", "/")} /c #{String.replace(fake_script, "\\", "/")} app-server"
+
+          _ ->
+            codex_binary = Path.join(test_root, "fake-codex")
+
+            File.write!(codex_binary, """
+            #!/bin/sh
+            count=0
+            while IFS= read -r _line; do
+              count=$((count + 1))
+
+              case "$count" in
+                1)
+                  printf '%s\\n' '{"id":1,"result":{}}'
+                  ;;
+                2)
+                  ;;
+                3)
+                  printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-command-timeout"}}}'
+                  ;;
+                4)
+                  printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-command-timeout"}}}'
+                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"rg --files .","cwd":"/tmp"}}}'
+                  ;;
+                *)
+                  sleep 1
+                  ;;
+              esac
+            done
+            """)
+
+            File.chmod!(codex_binary, 0o755)
+            "#{codex_binary} app-server"
+        end
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
+        codex_turn_timeout_ms: 60_000,
+        codex_stall_timeout_ms: 25
+      )
+
+      issue = %Issue{
+        id: "issue-command-timeout",
+        identifier: "MT-90",
+        title: "Command timeout",
+        description: "Ensure command execution silence fails before the turn timeout",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-90",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:command_execution_timeout, 25}} =
+               AppServer.run(workspace, "Run a command that never completes", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server restores turn timeout after command completion" do
+    test_root =
+      Path.join(
+        Path.join(File.cwd!(), "tmp"),
+        "symphony-elixir-app-server-command-complete-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-91")
+      File.mkdir_p!(workspace)
+
+      codex_command =
+        case :os.type() do
+          {:win32, _} ->
+            fake_script = Path.join(test_root, "fake-codex-command-complete.cmd")
+            cmd = System.find_executable("cmd.exe") || "cmd.exe"
+
+            File.write!(fake_script, """
+            @echo off
+            set COUNT=0
+            :loop
+            set LINE=
+            set /p LINE=
+            if errorlevel 1 goto end
+            set /a COUNT+=1
+            if "%COUNT%"=="1" echo {"id":1,"result":{}}
+            if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-command-complete"}}}
+            if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-command-complete"}}}
+            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"rg --files .","cwd":"C:/tmp"}}}
+            if "%COUNT%"=="4" echo {"method":"item/completed","params":{"item":{"id":"call-finished","type":"commandExecution"}}}
+            goto loop
+            :end
+            """)
+
+            "#{String.replace(cmd, "\\", "/")} /c #{String.replace(fake_script, "\\", "/")} app-server"
+
+          _ ->
+            codex_binary = Path.join(test_root, "fake-codex")
+
+            File.write!(codex_binary, """
+            #!/bin/sh
+            count=0
+            while IFS= read -r _line; do
+              count=$((count + 1))
+
+              case "$count" in
+                1)
+                  printf '%s\\n' '{"id":1,"result":{}}'
+                  ;;
+                2)
+                  ;;
+                3)
+                  printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-command-complete"}}}'
+                  ;;
+                4)
+                  printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-command-complete"}}}'
+                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"rg --files .","cwd":"/tmp"}}}'
+                  printf '%s\\n' '{"method":"item/completed","params":{"item":{"id":"call-finished","type":"commandExecution"}}}'
+                  ;;
+                *)
+                  sleep 1
+                  ;;
+              esac
+            done
+            """)
+
+            File.chmod!(codex_binary, 0o755)
+            "#{codex_binary} app-server"
+        end
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
+        codex_turn_timeout_ms: 80,
+        codex_stall_timeout_ms: 25
+      )
+
+      issue = %Issue{
+        id: "issue-command-complete-timeout",
+        identifier: "MT-91",
+        title: "Command complete timeout",
+        description: "Ensure completed commands restore normal turn timeout",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-91",
+        labels: ["backend"]
+      }
+
+      assert {:error, :turn_timeout} =
+               AppServer.run(workspace, "Run a command that completes, then think silently", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server blocks product coordination checkout command executions" do
     unsafe_payload = %{
       "params" => %{
