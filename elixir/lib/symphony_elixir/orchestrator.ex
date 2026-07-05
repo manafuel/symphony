@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workflow, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -166,14 +166,21 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        append_codex_token_ledger(running_entry, updated_running_entry, update, token_delta)
 
         state =
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> maybe_block_token_runaway(issue_id, updated_running_entry)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+        if Map.has_key?(state.running, issue_id) do
+          {:noreply, %{state | running: Map.put(state.running, issue_id, updated_running_entry)}}
+        else
+          {:noreply, state}
+        end
     end
   end
 
@@ -1617,6 +1624,119 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_codex_token_delta(state, _token_delta), do: state
+
+  defp maybe_block_token_runaway(%State{} = state, issue_id, running_entry) when is_map(running_entry) do
+    max_issue_tokens = Config.settings!().agent.max_issue_tokens || 0
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0) || 0
+
+    cond do
+      max_issue_tokens <= 0 ->
+        state
+
+      total_tokens < max_issue_tokens ->
+        state
+
+      true ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
+
+        error =
+          "token runaway guard tripped: total_tokens=#{total_tokens} max_issue_tokens=#{max_issue_tokens}"
+
+        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; #{error}")
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue_id, running_entry, error)
+    end
+  end
+
+  defp maybe_block_token_runaway(state, _issue_id, _running_entry), do: state
+
+  defp append_codex_token_ledger(_running_entry, _updated_running_entry, _update, %{
+         input_tokens: input,
+         output_tokens: output,
+         total_tokens: total
+       })
+       when input <= 0 and output <= 0 and total <= 0,
+       do: :ok
+
+  defp append_codex_token_ledger(running_entry, updated_running_entry, update, token_delta)
+       when is_map(token_delta) do
+    payload = %{
+      schema_version: "symphony.token_delta.v1",
+      recorded_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      timestamp: update[:timestamp] |> ledger_timestamp(),
+      issue_id: issue_id_for_token_ledger(running_entry),
+      issue_identifier: issue_identifier_for_token_ledger(running_entry),
+      session_id: Map.get(updated_running_entry, :session_id),
+      event: update[:event],
+      input_tokens: token_delta.input_tokens,
+      output_tokens: token_delta.output_tokens,
+      total_tokens: token_delta.total_tokens,
+      reported_input_tokens: token_delta.input_reported,
+      reported_output_tokens: token_delta.output_reported,
+      reported_total_tokens: token_delta.total_reported,
+      turn_count: Map.get(updated_running_entry, :turn_count)
+    }
+
+    write_codex_token_ledger(payload)
+  end
+
+  defp append_codex_token_ledger(_running_entry, _updated_running_entry, _update, _token_delta), do: :ok
+
+  defp write_codex_token_ledger(payload) when is_map(payload) do
+    path = codex_token_ledger_path()
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         {:ok, encoded} <- Jason.encode(payload),
+         :ok <- File.write(path, encoded <> "\n", [:append]) do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning("Unable to append Codex token ledger #{path}: #{inspect(reason)}")
+        :ok
+    end
+  end
+
+  defp codex_token_ledger_path do
+    case System.get_env("SYMPHONY_TOKEN_LEDGER_PATH") do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> default_codex_token_ledger_path()
+          trimmed -> Path.expand(trimmed)
+        end
+
+      _ ->
+        default_codex_token_ledger_path()
+    end
+  end
+
+  defp default_codex_token_ledger_path do
+    workflow_path = Path.expand(Workflow.workflow_file_path())
+    path_parts = Path.split(workflow_path)
+
+    case Enum.find_index(path_parts, &(&1 == ".codex")) do
+      nil ->
+        Path.expand(Path.join([Path.dirname(workflow_path), "runs", "symphony-token-ledger", "token-usage.jsonl"]))
+
+      codex_index ->
+        repo_root_parts = Enum.take(path_parts, codex_index)
+        Path.join(repo_root_parts ++ [".codex", "runs", "symphony-token-ledger", "token-usage.jsonl"])
+    end
+  end
+
+  defp ledger_timestamp(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp ledger_timestamp(timestamp) when is_binary(timestamp), do: timestamp
+  defp ledger_timestamp(_timestamp), do: nil
+
+  defp issue_id_for_token_ledger(%{issue: %Issue{id: id}}), do: id
+  defp issue_id_for_token_ledger(%{issue_id: id}) when is_binary(id), do: id
+  defp issue_id_for_token_ledger(_running_entry), do: nil
+
+  defp issue_identifier_for_token_ledger(%{issue: %Issue{identifier: identifier}}), do: identifier
+  defp issue_identifier_for_token_ledger(%{identifier: identifier}) when is_binary(identifier), do: identifier
+  defp issue_identifier_for_token_ledger(_running_entry), do: nil
 
   defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
     case extract_rate_limits(update) do

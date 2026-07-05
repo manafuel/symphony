@@ -631,6 +631,222 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "orchestrator appends positive codex token deltas to the durable ledger" do
+    issue_id = "issue-token-ledger"
+    ledger_root = Path.join(System.tmp_dir!(), "symphony-token-ledger-#{System.unique_integer([:positive])}")
+    ledger_path = Path.join(ledger_root, "token-usage.jsonl")
+    previous_ledger_path = System.get_env("SYMPHONY_TOKEN_LEDGER_PATH")
+    System.put_env("SYMPHONY_TOKEN_LEDGER_PATH", ledger_path)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_TOKEN_LEDGER_PATH", previous_ledger_path)
+      File.rm_rf(ledger_root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-225",
+      title: "Token ledger",
+      description: "Persist token deltas",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-225"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenLedgerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "thread-token-ledger-turn-1",
+         timestamp: now
+       }}
+    )
+
+    for usage <- [
+          %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11},
+          %{"input_tokens" => 10, "output_tokens" => 4, "total_tokens" => 14}
+        ] do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{"tokenUsage" => %{"total" => usage}}
+           },
+           timestamp: now
+         }}
+      )
+    end
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 10
+    assert snapshot_entry.codex_output_tokens == 4
+    assert snapshot_entry.codex_total_tokens == 14
+
+    rows =
+      ledger_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert [
+             %{
+               "schema_version" => "symphony.token_delta.v1",
+               "issue_id" => ^issue_id,
+               "issue_identifier" => "MT-225",
+               "session_id" => "thread-token-ledger-turn-1",
+               "event" => "notification",
+               "input_tokens" => 8,
+               "output_tokens" => 3,
+               "total_tokens" => 11,
+               "reported_total_tokens" => 11,
+               "turn_count" => 1
+             },
+             %{
+               "issue_id" => ^issue_id,
+               "issue_identifier" => "MT-225",
+               "session_id" => "thread-token-ledger-turn-1",
+               "event" => "notification",
+               "input_tokens" => 2,
+               "output_tokens" => 1,
+               "total_tokens" => 3,
+               "reported_total_tokens" => 14,
+               "turn_count" => 1
+             }
+           ] = rows
+  end
+
+  test "orchestrator blocks a running issue when codex tokens exceed max_issue_tokens" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    issue_id = "issue-token-runaway"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-227",
+      title: "Token runaway",
+      description: "Stop runaway sessions before watchdog freezes the worker",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-227"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenRunawayGuardOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-turn-1",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{"tokenUsage" => %{"total" => %{"input_tokens" => 8, "output_tokens" => 4, "total_tokens" => 12}}}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.running == []
+
+    assert [
+             %{
+               issue_id: ^issue_id,
+               identifier: "MT-227",
+               session_id: "thread-token-runaway-turn-1",
+               error: "token runaway guard tripped: total_tokens=12 max_issue_tokens=10"
+             }
+           ] = snapshot.blocked
+
+    refute Process.alive?(worker_pid)
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -712,6 +928,97 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_input_tokens == 0
     assert snapshot_entry.codex_output_tokens == 0
     assert snapshot_entry.codex_total_tokens == 0
+  end
+
+  test "orchestrator does not append token ledger rows for last-only usage reports" do
+    issue_id = "issue-token-ledger-last-only"
+    ledger_root = Path.join(System.tmp_dir!(), "symphony-token-ledger-#{System.unique_integer([:positive])}")
+    ledger_path = Path.join(ledger_root, "token-usage.jsonl")
+    previous_ledger_path = System.get_env("SYMPHONY_TOKEN_LEDGER_PATH")
+    System.put_env("SYMPHONY_TOKEN_LEDGER_PATH", ledger_path)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_TOKEN_LEDGER_PATH", previous_ledger_path)
+      File.rm_rf(ledger_root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-226",
+      title: "Last-only token ledger",
+      description: "Do not persist delta-only token reports",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-226"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :LastOnlyTokenLedgerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "info" => %{
+                   "last_token_usage" => %{
+                     "input_tokens" => 8,
+                     "output_tokens" => 3,
+                     "total_tokens" => 11
+                   }
+                 }
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_total_tokens == 0
+    refute File.exists?(ledger_path)
   end
 
   test "orchestrator snapshot includes retry backoff entries" do
