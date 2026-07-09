@@ -96,6 +96,59 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     end
   end
 
+  test "local_shell ignores an empty hidden launcher env var" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-empty-launcher-#{System.unique_integer([:positive])}")
+    original_launcher = System.get_env("CODEX_HIDDEN_STDIO_LAUNCHER")
+    System.put_env("CODEX_HIDDEN_STDIO_LAUNCHER", "")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo empty-launcher-ok", "timeout_ms" => 10_000},
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+
+      payload = Jason.decode!(response["output"])
+      assert payload["exit_code"] == 0
+      assert payload["stdout"] =~ "empty-launcher-ok"
+    after
+      restore_env("CODEX_HIDDEN_STDIO_LAUNCHER", original_launcher)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell ignores workspace-local hidden launcher candidates" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-hijack-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join([test_root, "manafuel", "worktrees", "symphony", "MAN-1"])
+      fake_launcher = Path.join([workspace, ".codex", "bin", "codex-hidden-stdio-launcher.exe"])
+      File.mkdir_p!(Path.dirname(fake_launcher))
+      File.write!(fake_launcher, "not an executable launcher")
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo trusted-launcher-ok", "timeout_ms" => 10_000},
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+
+      payload = Jason.decode!(response["output"])
+      assert payload["exit_code"] == 0
+      assert payload["stdout"] =~ "trusted-launcher-ok"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "local_shell fails closed for unsafe commands" do
     test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-unsafe-#{System.unique_integer([:positive])}")
 

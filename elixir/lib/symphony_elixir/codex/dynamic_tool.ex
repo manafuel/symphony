@@ -589,38 +589,42 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp hidden_stdio_launcher_executable(workdir) do
-    candidates =
-      [System.get_env("CODEX_HIDDEN_STDIO_LAUNCHER") | hidden_stdio_launcher_candidates(workdir)]
-
-    candidates
+    workdir
+    |> hidden_stdio_launcher_candidates()
     |> Enum.reject(&is_nil/1)
     |> Enum.map(&Path.expand/1)
     |> Enum.uniq()
-    |> Enum.find(&File.exists?/1)
+    |> Enum.find(&File.regular?/1)
   end
 
   defp hidden_stdio_launcher_candidates(workdir) do
-    roots =
-      ([File.cwd!(), workdir] ++ ancestor_paths(File.cwd!()) ++ ancestor_paths(workdir))
-      |> Enum.reject(&is_nil/1)
-      |> Enum.map(&Path.expand/1)
-      |> Enum.uniq()
+    trusted_env_hidden_stdio_launcher_candidates() ++ trusted_control_hidden_stdio_launcher_candidates(workdir)
+  end
 
-    manafuel_candidates =
-      case manafuel_root_for_workspace(workdir) do
-        nil -> []
-        root -> [Path.join([root, "development", ".codex", "bin", @hidden_stdio_launcher_name])]
-      end
+  defp trusted_env_hidden_stdio_launcher_candidates do
+    case System.get_env("CODEX_HIDDEN_STDIO_LAUNCHER") do
+      value when is_binary(value) ->
+        value
+        |> String.trim()
+        |> absolute_launcher_candidate()
 
-    direct_candidates =
-      Enum.flat_map(roots, fn root ->
-        [
-          Path.join([root, "bin", @hidden_stdio_launcher_name]),
-          Path.join([root, ".codex", "bin", @hidden_stdio_launcher_name])
-        ]
-      end)
+      _ ->
+        []
+    end
+  end
 
-    direct_candidates ++ manafuel_candidates
+  defp absolute_launcher_candidate(""), do: []
+
+  defp absolute_launcher_candidate(path) do
+    if Path.type(path) == :absolute, do: [path], else: []
+  end
+
+  defp trusted_control_hidden_stdio_launcher_candidates(workdir) do
+    [workdir, File.cwd!()]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&manafuel_root_for_workspace/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&Path.join([&1, "development", ".codex", "bin", @hidden_stdio_launcher_name]))
   end
 
   defp normalize_shell_output(output) when is_binary(output) do
