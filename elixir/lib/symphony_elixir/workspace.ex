@@ -298,7 +298,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        run_local_shell_command(command, workspace)
+        run_local_shell_command(command, workspace, issue_context)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -331,16 +331,23 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_local_shell_command(command, workspace) do
+  defp run_local_shell_command(command, workspace, issue_context) do
+    hook_env = [
+      {"SYMPHONY_WORKSPACE", workspace},
+      {"SYMPHONY_ISSUE_ID", to_string(issue_context.issue_id || "")},
+      {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "issue")}
+    ]
+
     case :os.type() do
       {:win32, _} ->
         System.cmd("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
           cd: workspace,
+          env: hook_env,
           stderr_to_stdout: true
         )
 
       _ ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command], cd: workspace, env: hook_env, stderr_to_stdout: true)
     end
   end
 
@@ -427,7 +434,7 @@ defmodule SymphonyElixir.Workspace do
 
     payload =
       Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
+        case line |> String.trim_trailing("\r") |> String.split("\t", parts: 3) do
           [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
             {created == "1", path}
 

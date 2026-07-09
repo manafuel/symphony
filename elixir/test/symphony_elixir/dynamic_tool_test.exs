@@ -3,23 +3,52 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
-  test "tool_specs advertises the linear_graphql input contract" do
-    assert [
-             %{
-               "description" => description,
-               "inputSchema" => %{
-                 "properties" => %{
-                   "query" => _,
-                   "variables" => _
-                 },
-                 "required" => ["query"],
-                 "type" => "object"
-               },
-               "name" => "linear_graphql"
-             }
-           ] = DynamicTool.tool_specs()
+  test "tool_specs advertises the dynamic input contracts" do
+    specs = DynamicTool.tool_specs()
 
-    assert description =~ "Linear"
+    assert %{
+             "description" => linear_description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "query" => _,
+                 "variables" => _
+               },
+               "required" => ["query"],
+               "type" => "object"
+             }
+           } = Enum.find(specs, &(&1["name"] == "linear_graphql"))
+
+    assert linear_description =~ "Linear"
+
+    assert %{
+             "description" => shell_description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "command" => _,
+                 "timeout_ms" => _,
+                 "workdir" => _
+               },
+               "required" => ["command"],
+               "type" => "object"
+             }
+           } = Enum.find(specs, &(&1["name"] == "local_shell"))
+
+    assert shell_description =~ "local shell"
+
+    assert %{
+             "description" => artifact_description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "content" => _,
+                 "overwrite" => _,
+                 "path" => _
+               },
+               "required" => ["path", "content"],
+               "type" => "object"
+             }
+           } = Enum.find(specs, &(&1["name"] == "write_run_artifact"))
+
+    assert artifact_description =~ "run artifacts"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -30,7 +59,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_graphql", "local_shell", "write_run_artifact"]
              }
            }
 
@@ -40,6 +69,227 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "text" => response["output"]
              }
            ]
+  end
+
+  test "local_shell runs a bounded command from the issue workspace" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo local-shell-ok", "timeout_ms" => 10_000},
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+
+      payload = Jason.decode!(response["output"])
+      assert payload["exit_code"] == 0
+      assert payload["workdir"] == Path.expand(workspace)
+      assert payload["stdout"] =~ "local-shell-ok"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell fails closed for unsafe commands" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-unsafe-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo no > out.txt"},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert Jason.decode!(response["output"]) == %{
+               "error" => %{
+                 "message" => "`local_shell.command` was blocked by the MANAfuel command guard.",
+                 "reason" => "shell redirection is not allowed"
+               }
+             }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell rejects workdirs outside allowed roots" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-workdir-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      outside = Path.join(test_root, "outside")
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(outside)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo no", "workdir" => outside},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
+               "`local_shell.workdir` must be under the issue workspace, MANAfuel worktrees root, or MANAfuel control root."
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell rejects stale product coordination checkout workdirs" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-local-shell-coordination-#{System.unique_integer([:positive])}")
+
+    try do
+      manafuel_root = Path.join(test_root, "manafuel")
+      workspace = Path.join([manafuel_root, "worktrees", "symphony", "MAN-1"])
+      coordination_one = Path.join([manafuel_root, "development", "one"])
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(coordination_one)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "echo no", "workdir" => coordination_one},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
+               "`local_shell` must use product worktrees under manafuel.worktree_root, not stale product coordination checkouts under development."
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact writes bounded evidence under issue workspace runs" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => "runs/MAN-118/validation.md",
+            "content" => "# Validation\n\nPASS\n"
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+      artifact_path = Path.join([workspace, "runs", "MAN-118", "validation.md"])
+      assert File.read!(artifact_path) == "# Validation\n\nPASS\n"
+
+      payload = Jason.decode!(response["output"])
+      assert payload["path"] == Path.expand(artifact_path)
+      assert payload["bytes"] == byte_size("# Validation\n\nPASS\n")
+      assert payload["overwritten"] == false
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact writes under the MANAfuel control run root from an issue workspace" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-control-run-artifact-#{System.unique_integer([:positive])}")
+
+    try do
+      manafuel_root = Path.join(test_root, "manafuel")
+      workspace = Path.join([manafuel_root, "worktrees", "symphony", "MAN-118"])
+      control_runs = Path.join([manafuel_root, "development", ".codex", "runs"])
+      artifact_path = Path.join([control_runs, "2026-07-04-man-118", "handoff.md"])
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => artifact_path,
+            "content" => "handoff\n"
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+      assert File.read!(artifact_path) == "handoff\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact rejects paths outside run roots" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-outside-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => Path.join(test_root, "outside.md"),
+            "content" => "no\n"
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
+               "`write_run_artifact.path` must stay under the issue workspace runs directory or MANAfuel control .codex/runs."
+
+      refute File.exists?(Path.join(test_root, "outside.md"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact honors overwrite false" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-overwrite-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      artifact_path = Path.join([workspace, "runs", "MAN-118", "plan.md"])
+      File.mkdir_p!(Path.dirname(artifact_path))
+      File.write!(artifact_path, "original\n")
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => "runs/MAN-118/plan.md",
+            "content" => "new\n",
+            "overwrite" => false
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
+               "`write_run_artifact` failed to write the artifact."
+
+      assert File.read!(artifact_path) == "original\n"
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "linear_graphql returns successful GraphQL responses as tool text" do

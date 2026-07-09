@@ -407,9 +407,12 @@ defmodule SymphonyElixir.Config.Schema do
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
+    workspace_root_is_remote? =
+      settings.worker.ssh_hosts != [] and remote_workspace_root?(settings.workspace.root)
+
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"), remote: workspace_root_is_remote?)
     }
 
     codex = %{
@@ -457,16 +460,20 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defp resolve_path_value(value, default) when is_binary(value) do
-    case normalize_path_token(value) do
-      :missing ->
-        default
+  defp resolve_path_value(value, default, opts) when is_binary(value) do
+    case env_reference_name(value) do
+      {:ok, env_name} ->
+        case resolve_env_token(env_name) do
+          :missing -> default
+          "" -> default
+          path -> normalize_resolved_path(path, opts)
+        end
 
-      "" ->
-        default
-
-      path ->
-        path
+      :error ->
+        case value do
+          "" -> default
+          path -> path
+        end
     end
   end
 
@@ -484,12 +491,28 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defp normalize_path_token(value) when is_binary(value) do
-    case env_reference_name(value) do
-      {:ok, env_name} -> resolve_env_token(env_name)
-      :error -> value
+  defp normalize_resolved_path(path, opts) when is_binary(path) do
+    cond do
+      Keyword.get(opts, :remote, false) ->
+        path
+
+      String.starts_with?(path, "env:") ->
+        path
+
+      String.starts_with?(path, "~") ->
+        path
+
+      true ->
+        Path.expand(path)
     end
   end
+
+  defp remote_workspace_root?(path) when is_binary(path) do
+    String.starts_with?(path, "~") or
+      (String.starts_with?(path, "/") and not Regex.match?(~r{^/[A-Za-z](:|/)}, path))
+  end
+
+  defp remote_workspace_root?(_path), do: false
 
   defp env_reference_name("$" <> env_name) do
     if String.match?(env_name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/) do

@@ -6,7 +6,13 @@ defmodule SymphonyElixir.PathSafety do
     expanded_path = Path.expand(path)
     {root, segments} = split_absolute_path(expanded_path)
 
-    case resolve_segments(root, [], segments) do
+    result =
+      case validate_segments(segments) do
+        :ok -> resolve_segments(root, [], segments)
+        {:error, reason} -> {:error, reason}
+      end
+
+    case result do
       {:ok, canonical_path} ->
         {:ok, canonical_path}
 
@@ -18,6 +24,14 @@ defmodule SymphonyElixir.PathSafety do
   defp split_absolute_path(path) when is_binary(path) do
     [root | segments] = Path.split(path)
     {root, segments}
+  end
+
+  defp validate_segments(segments) when is_list(segments) do
+    if Enum.any?(segments, &(byte_size(&1) > 255)) do
+      {:error, :enametoolong}
+    else
+      :ok
+    end
   end
 
   defp resolve_segments(root, resolved_segments, []), do: {:ok, join_path(root, resolved_segments)}

@@ -357,7 +357,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{
+                   "input_tokens" => 4,
+                   "output_tokens" => 8,
+                   "total_tokens" => 12,
+                   "cached_input_tokens" => 0,
+                   "billable_tokens" => 12
+                 }
                }
              ],
              "retrying" => [
@@ -419,7 +425,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{
+                 "input_tokens" => 4,
+                 "output_tokens" => 8,
+                 "total_tokens" => 12,
+                 "cached_input_tokens" => 0,
+                 "billable_tokens" => 12
+               }
              },
              "retry" => nil,
              "blocked" => nil,

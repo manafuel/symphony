@@ -33,6 +33,8 @@ defmodule Mix.Tasks.PrBody.Check do
 
         with {:ok, template_path, template} <- read_template(),
              {:ok, body} <- read_file(file_path),
+             template <- normalize_newlines(template),
+             body <- normalize_newlines(body),
              {:ok, headings} <- extract_template_headings(template, template_path),
              :ok <- lint_and_print(template_path, template, body, headings) do
           Mix.shell().info("PR body format OK")
@@ -72,6 +74,12 @@ defmodule Mix.Tasks.PrBody.Check do
       {:ok, content} -> {:ok, content}
       {:error, reason} -> {:error, "Unable to read #{path}: #{inspect(reason)}"}
     end
+  end
+
+  defp normalize_newlines(value) when is_binary(value) do
+    value
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
   end
 
   defp extract_template_headings(template, template_path) do

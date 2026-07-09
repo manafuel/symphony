@@ -78,6 +78,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
       {:ok, output} ->
         output
         |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim/1)
         |> Enum.reject(&(&1 == ""))
 
       {:error, _reason} ->
@@ -131,10 +132,28 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
         {:error, {:enoent, ""}}
 
       path ->
-        case System.cmd(path, args, stderr_to_stdout: true) do
+        {executable, command_args} = executable_command(path, args)
+
+        case System.cmd(executable, command_args, stderr_to_stdout: true) do
           {output, 0} -> {:ok, output}
           {output, status} -> {:error, {status, output}}
         end
     end
+  end
+
+  defp executable_command(path, args) do
+    if windows_batch_script?(path) do
+      {windows_cmd_executable(), ["/d", "/c", path | args]}
+    else
+      {path, args}
+    end
+  end
+
+  defp windows_batch_script?(path) when is_binary(path) do
+    match?({:win32, _}, :os.type()) and String.downcase(Path.extname(path)) in [".cmd", ".bat"]
+  end
+
+  defp windows_cmd_executable do
+    System.find_executable("cmd.exe") || "C:/Windows/System32/cmd.exe"
   end
 end

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.SSH do
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     with {:ok, executable} <- ssh_executable() do
-      {:ok, System.cmd(executable, ssh_args(host, command), opts)}
+      {:ok, run_executable(executable, ssh_args(host, command), opts)}
     end
   end
 
@@ -13,16 +13,25 @@ defmodule SymphonyElixir.SSH do
     with {:ok, executable} <- ssh_executable() do
       line_bytes = Keyword.get(opts, :line)
 
+      args = ssh_args(host, command)
+
+      {port_executable, port_args} =
+        if windows_script?(executable) do
+          {windows_cmd_executable(), ["/d", "/c", executable | args]}
+        else
+          {executable, args}
+        end
+
       port_opts =
         [
           :binary,
           :exit_status,
           :stderr_to_stdout,
-          args: Enum.map(ssh_args(host, command), &String.to_charlist/1)
+          args: Enum.map(port_args, &String.to_charlist/1)
         ]
         |> maybe_put_line_option(line_bytes)
 
-      {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+      {:ok, Port.open({:spawn_executable, String.to_charlist(port_executable)}, port_opts)}
     end
   end
 
@@ -36,6 +45,27 @@ defmodule SymphonyElixir.SSH do
       nil -> {:error, :ssh_not_found}
       executable -> {:ok, executable}
     end
+  end
+
+  defp run_executable(executable, args, opts) do
+    if windows_script?(executable) do
+      System.cmd(windows_cmd_executable(), ["/d", "/c", executable | args], opts)
+    else
+      System.cmd(executable, args, opts)
+    end
+  end
+
+  defp windows_script?(path) when is_binary(path) do
+    extension =
+      path
+      |> Path.extname()
+      |> String.downcase()
+
+    match?({:win32, _}, :os.type()) and extension in [".cmd", ".bat"]
+  end
+
+  defp windows_cmd_executable do
+    System.find_executable("cmd.exe") || "C:/Windows/System32/cmd.exe"
   end
 
   defp ssh_args(host, command) do

@@ -1139,6 +1139,112 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "retry attempt #2"
   end
 
+  test "prompt builder compacts oversized MANAfuel workflow prompts" do
+    long_omitted_section = String.duplicate("grok-lane-detail ", 4_000)
+    long_comment = String.duplicate("historical workpad note ", 900)
+
+    workflow_prompt = """
+    # MANAfuel Symphony Workflow
+
+    ## App-Server Tool Execution Contract
+
+    Keep every shell command simple and use `write_run_artifact` for run evidence.
+
+    ## Issue Context
+
+    Identifier: {{ issue.identifier }}
+    Title: {{ issue.title }}
+    Current status: {{ issue.state }}
+    URL: {{ issue.url }}
+    Labels: {{ issue.labels }}
+
+    Description:
+    {{ issue.description }}
+
+    Recent Linear comments fetched by the harness:
+    {% for comment in issue.comments %}
+    Comment created_at={{ comment.created_at }}
+
+    {{ comment.body }}
+    {% endfor %}
+
+    ## Immediate Required First Actions
+
+    Post the `symphony:plan:{{ issue.identifier }}` marker before product edits.
+
+    ## Board Contract
+
+    Only `Ready for Codex`, `In Progress`, or `Rework` tickets with `codex-agent-ready` are dispatch-eligible.
+
+    ## Ticket Notes And Delivery Goal
+
+    Continue until the PR is merged and `symphony:final:{{ issue.identifier }}` evidence exists.
+
+    ## Bounded Delivery Loop
+
+    Token-runaway blockers require a reviewed guard or narrowed execution packet before requeue.
+
+    ## Worktree Rule
+
+    Product-code reads and writes require a clean named product worktree under `manafuel.worktree_root`.
+
+    ## Run Folder Contract
+
+    Required plan, validation, committee, reviewer, and proof artifacts must land in the run folder.
+
+    ## MCP Policy
+
+    Missing required MCPs move the ticket to Human Review only after documented fallback attempts.
+
+    ## Noninteractive Command Safety
+
+    Do not run inline scripts, shell redirection, or multi-step orchestration through shell tools.
+
+    ## Validation
+
+    Run the ticket-provided validation and record proof.
+
+    ## Completion
+
+    Do not mark Done without merge and final evidence.
+
+    ## Grok Candidate Lane (runtime-owner:grok)
+
+    #{long_omitted_section}
+    """
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MAN-153",
+      title: "Fix Growth page regression",
+      description: "Keep the actionable issue body in the first turn.",
+      state: "Rework",
+      url: "https://linear.app/manafuel/issue/MAN-153",
+      labels: ["codex-agent-ready", "owner:growth-marketing-system"],
+      comments: [
+        %{
+          created_at: "2026-07-06T10:00:00Z",
+          body: long_comment
+        }
+      ]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert String.length(prompt) <= 35_000
+    assert prompt =~ "compacted for token budget"
+    assert prompt =~ ".codex/workflows/symphony-manafuel/WORKFLOW.md"
+    assert prompt =~ "Keep every shell command simple"
+    assert prompt =~ "Identifier: MAN-153"
+    assert prompt =~ "Fix Growth page regression"
+    assert prompt =~ "Ready for Codex"
+    assert prompt =~ "symphony:final:MAN-153"
+    assert prompt =~ "Compacted prompt omitted"
+    assert prompt =~ "## Grok Candidate Lane"
+    refute prompt =~ String.duplicate("grok-lane-detail ", 100)
+  end
+
   test "prompt builder adds continuation guidance for retries" do
     workflow_prompt = "{% if attempt %}Retry #" <> "{{ attempt }}" <> "{% endif %}"
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
@@ -1346,33 +1452,10 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
-
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
-
-      File.write!(fake_ssh, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
-
-      case "$*" in
-        *worker-a*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\n' 'worker-a prepare failed' >&2
-          exit 75
-          ;;
-        *worker-b*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
-          exit 0
-          ;;
-        *)
-          exit 0
-          ;;
-      esac
-      """)
-
-      File.chmod!(fake_ssh, 0o755)
+      System.put_env("PATH", Enum.join([test_root, previous_path || ""], path_separator()))
+      write_workspace_prepare_fake_ssh!(test_root, trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "~/.symphony-remote-workspaces",
@@ -1798,40 +1881,11 @@ defmodule SymphonyElixir.CoreTest do
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
-      count=0
-      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
+      codex_command = write_custom_args_fake_codex!(test_root, codex_binary, trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --config 'model=\"gpt-5.5\"' app-server"
+        codex_command: "#{codex_command} --config 'model=\"gpt-5.5\"' app-server"
       )
 
       issue = %Issue{
@@ -1980,5 +2034,140 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp write_workspace_prepare_fake_ssh!(test_root, trace_file) do
+    if windows?() do
+      python = System.find_executable("python.exe") || System.find_executable("python") || "python"
+      script = Path.join(test_root, "ssh.py")
+      command = Path.join(test_root, "ssh.cmd")
+
+      File.write!(script, """
+      import sys
+
+      trace_path = #{inspect(trace_file)}
+      args = " ".join(sys.argv[1:])
+
+      with open(trace_path, "a", encoding="utf-8") as trace:
+          trace.write("ARGV:" + args + "\\n")
+
+      if "worker-a" in args and "__SYMPHONY_WORKSPACE__" in args:
+          print("worker-a prepare failed", file=sys.stderr)
+          sys.exit(75)
+
+      if "worker-b" in args and "__SYMPHONY_WORKSPACE__" in args:
+          print("__SYMPHONY_WORKSPACE__\\t1\\t/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER")
+          sys.exit(0)
+
+      sys.exit(0)
+      """)
+
+      File.write!(
+        command,
+        """
+        @echo off
+        "#{python}" "#{script}" %*
+        exit /b %ERRORLEVEL%
+        """
+      )
+    else
+      fake_ssh = Path.join(test_root, "ssh")
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      case "$*" in
+        *worker-a*"__SYMPHONY_WORKSPACE__"*)
+          printf '%s\\n' 'worker-a prepare failed' >&2
+          exit 75
+          ;;
+        *worker-b*"__SYMPHONY_WORKSPACE__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+    end
+  end
+
+  defp write_custom_args_fake_codex!(test_root, codex_binary, trace_file) do
+    if windows?() do
+      python = System.find_executable("python.exe") || System.find_executable("python") || "python"
+      script = Path.join(test_root, "fake-codex-custom-args.py")
+
+      File.write!(script, """
+      import os
+      import sys
+
+      trace_path = os.environ.get("SYMP_TEST_CODex_TRACE") or #{inspect(trace_file)}
+
+      with open(trace_path, "a", encoding="utf-8") as trace:
+          trace.write("ARGV:" + " ".join(sys.argv[1:]) + "\\n")
+
+      count = 0
+      for _line in sys.stdin:
+          count += 1
+          if count == 1:
+              print('{"id":1,"result":{}}', flush=True)
+          elif count == 2:
+              print('{"id":2,"result":{"thread":{"id":"thread-88"}}}', flush=True)
+          elif count == 3:
+              print('{"id":3,"result":{"turn":{"id":"turn-88"}}}', flush=True)
+          elif count == 4:
+              print('{"method":"turn/completed"}', flush=True)
+              sys.exit(0)
+
+      sys.exit(0)
+      """)
+
+      "#{String.replace(python, "\\", "/")} #{String.replace(script, "\\", "/")}"
+    else
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
+      count=0
+      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case \"$count\" in
+          1)
+            printf '%s\\n' '{\"id\":1,\"result\":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      codex_binary
+    end
+  end
+
+  defp windows? do
+    match?({:win32, _}, :os.type())
+  end
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
   end
 end

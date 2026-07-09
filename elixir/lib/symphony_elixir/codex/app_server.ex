@@ -11,13 +11,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @max_dynamic_tool_output_chars 8_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @manafuel_developer_instructions """
-  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Hard runtime rule: issue at most one hosted shell_command tool call per assistant turn. A second shell_command in the same turn is invalid, even after a failed, declined, or blocked command. A shell_command must be simple: one read, search, status, test, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, Set-Content/New-Item/Out-File/Add-Content filesystem generation, their common aliases, shell redirection file writes, run-folder creation, or multi-step orchestration through shell_command. Use apply_patch for file edits. Ad hoc run-folder notes are optional when no existing script writes them; required plan, validation, committee/reviewer, gate, and run evidence artifacts remain mandatory and must be produced through existing scripts or allowed file-edit paths. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command.
+  MANAfuel Symphony runs use the Windows Codex app-server stdio client. Prefer the dynamic `local_shell` tool for local command work; hosted `shell_command` is a fallback only. Use `write_run_artifact` for required plan, discovery, validation, handoff, proof JSON, and other non-secret run-folder evidence when an existing checked-in script does not generate the artifact. `local_shell` must still be simple: one read, search, status, test, git, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, direct PowerShell read/navigation cmdlets or aliases (Get-ChildItem, Get-Content, Select-Object, Set-Location, dir, ls, cat, type, cd, pwd), Set-Content/New-Item/Out-File/Add-Content filesystem generation, their common aliases, shell redirection file writes, run-folder creation, inline --ticket-text/JSON payloads, or multi-step orchestration through any shell tool. Use native executables (git, rg, cmd.exe /d /c dir /b, cmd.exe /d /c type), existing checked-in scripts with short file/path arguments, `write_run_artifact` for run evidence, or apply_patch for product/repo file edits. Ad hoc run-folder notes are optional when no existing script writes them; required plan, validation, committee/reviewer, gate, and run evidence artifacts remain mandatory and must be produced through existing scripts, `write_run_artifact`, or allowed file-edit paths. This overrides any instruction to parallelize tool calls, optimize speed with multiple shell commands, or bulk-generate files through shell_command. Concurrent, oversized, inline-payload, or direct PowerShell shell calls can stall the hosted commandExecution stream before command execution and prevent the Linear ticket from completing. If hosted shell_command is used despite this fallback rule, issue at most one hosted shell_command tool call per assistant turn. Do not move a ticket to Human Review solely because the current turn's hosted shell budget is exhausted; continue with `local_shell` or `write_run_artifact` when possible.
 
   The harness has already applied packaged MANAfuel skill orientation through WORKFLOW.md and the injected issue runtime context. Do not use hosted shell_command to read packaged SKILL.md files from the user plugin cache, including .codex/plugins/cache/**/skills/*/SKILL.md and manafuel-codex:* skill files. Use the provided WORKFLOW.md contract, issue context, and repository files instead. Task-specific source files, tests, status commands, and existing scripts may still be read or executed when needed.
 
-  The current cwd is a scratch Symphony issue workspace. Before reading or editing product repository files, create or select the named product worktree under manafuel.worktree_root and run product file reads from that worktree. Do not use hosted shell_command to inspect product files through the coordination checkout under manafuel.implementation_root/<repo>; that checkout may be stale or dirty and is not the ticket implementation workspace.
+  The current cwd is a scratch Symphony issue workspace. Before reading or editing product repository files, create or select the named product worktree under manafuel.worktree_root and run product file reads from that worktree. Do not run broad repository discovery from the scratch workspace, including rg --files, git status, or git worktree list; the scratch workspace can resolve to the parent MANAfuel tree and produce stale or oversized output. Do not use hosted shell_command to inspect product files through the coordination checkout under manafuel.implementation_root/<repo>; that checkout may be stale or dirty and is not the ticket implementation workspace.
   """
 
   @type session :: %{
@@ -92,7 +93,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments)
+        DynamicTool.execute(tool, arguments, workspace: workspace)
       end)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -194,23 +195,23 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    case local_port_command() do
-      {:ok, executable, args} ->
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [
-              :binary,
-              :exit_status,
-              :stderr_to_stdout,
-              args: Enum.map(args, &String.to_charlist/1),
-              cd: String.to_charlist(workspace),
-              line: @port_line_bytes
-            ]
-          )
+    with {:ok, executable, args} <- local_port_command(),
+         {:ok, port_executable, port_args} <- local_port_spawn_command(executable, args) do
+      port =
+        Port.open(
+          {:spawn_executable, String.to_charlist(port_executable)},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            args: Enum.map(port_args, &String.to_charlist/1),
+            cd: String.to_charlist(workspace),
+            line: @port_line_bytes
+          ]
+        )
 
-        {:ok, port}
-
+      {:ok, port}
+    else
       {:error, reason} ->
         {:error, reason}
     end
@@ -269,6 +270,52 @@ defmodule SymphonyElixir.Codex.AppServer do
       true ->
         System.find_executable(executable)
     end
+  end
+
+  defp local_port_spawn_command(executable, args) do
+    cond do
+      windows_batch_script?(executable) ->
+        {:ok, windows_cmd_executable(), ["/d", "/c", executable | args]}
+
+      windows_extensionless_script?(executable) ->
+        case git_bash_executable() do
+          nil -> {:error, {:git_bash_not_found, executable}}
+          bash -> {:ok, bash, [executable | args]}
+        end
+
+      true ->
+        {:ok, executable, args}
+    end
+  end
+
+  defp windows_batch_script?(path) when is_binary(path) do
+    match?({:win32, _}, :os.type()) and String.downcase(Path.extname(path)) in [".cmd", ".bat"]
+  end
+
+  defp windows_extensionless_script?(path) when is_binary(path) do
+    match?({:win32, _}, :os.type()) and File.regular?(path) and Path.extname(path) == ""
+  end
+
+  defp git_bash_executable do
+    [
+      "C:/Program Files/Git/bin/bash.exe",
+      "C:/Program Files/Git/usr/bin/bash.exe",
+      System.find_executable("bash")
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.reject(&windows_system_bash?/1)
+    |> Enum.find(&File.exists?/1)
+  end
+
+  defp windows_system_bash?(path) when is_binary(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.downcase()
+    |> String.contains?("/windows/system32/bash.exe")
+  end
+
+  defp windows_cmd_executable do
+    System.find_executable("cmd.exe") || "C:/Windows/System32/cmd.exe"
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -736,6 +783,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc false
+  @spec normalize_dynamic_tool_result_for_test(map()) :: map()
+  def normalize_dynamic_tool_result_for_test(result) do
+    normalize_dynamic_tool_result(result)
+  end
+
   defp command_execution_contexts(%{"method" => "item/commandExecution/requestApproval", "params" => params})
        when is_map(params) do
     [
@@ -777,10 +830,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         reason -> reason
       end
     end) ||
+      unsafe_legacy_harness_poller_reason(command) ||
+      Enum.find_value(command_actions, fn action -> unsafe_legacy_harness_poller_reason(action) end) ||
+      unsafe_inline_shell_payload_reason(command) ||
+      Enum.find_value(command_actions, fn action -> unsafe_inline_shell_payload_reason(action) end) ||
       unsafe_hosted_shell_generation_reason(command) ||
       Enum.find_value(command_actions, fn action -> unsafe_hosted_shell_generation_reason(action) end) ||
       unsafe_relative_command_reason(command, cwd) ||
-      Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end)
+      Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end) ||
+      unsafe_direct_powershell_cmdlet_reason(command) ||
+      Enum.find_value(command_actions, fn action -> unsafe_direct_powershell_cmdlet_reason(action) end) ||
+      unsafe_scratch_workspace_discovery_reason(command, cwd) ||
+      Enum.find_value(command_actions, fn action -> unsafe_scratch_workspace_discovery_reason(action, cwd) end)
   end
 
   defp unsafe_command_reason(_context), do: nil
@@ -804,6 +865,102 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp unsafe_absolute_command_reason(_command), do: nil
+
+  defp unsafe_legacy_harness_poller_reason(command) when is_binary(command) do
+    normalized =
+      command
+      |> String.replace("\\", "/")
+      |> String.downcase()
+
+    if String.contains?(normalized, "codex-kanban-linear-poll.ps1") do
+      "legacy kanban poller invoked from hosted child session"
+    else
+      nil
+    end
+  end
+
+  defp unsafe_legacy_harness_poller_reason(_command), do: nil
+
+  defp unsafe_inline_shell_payload_reason(command) when is_binary(command) do
+    normalized =
+      command
+      |> String.trim()
+      |> String.downcase()
+
+    inline_ticket_text =
+      Regex.match?(~r/(^|\s)--ticket-text(?:\s|=)/, normalized)
+
+    inline_json_literal =
+      Regex.match?(~r/(^|\s)--(?:ticket-text|input|payload|json)(?:\s|=)['"]?\s*[\{\[]/, normalized)
+
+    hosted_script =
+      Regex.match?(~r/(^|\s)(?:\.[\\\/]|scripts[\\\/]|[\w:][^\s]*[\\\/])?[^\s'"]+\.ps1\b/, normalized) ||
+        Regex.match?(~r/\b(?:powershell|pwsh)(?:\.exe)?\b/, normalized)
+
+    if hosted_script && (inline_ticket_text || inline_json_literal) do
+      "inline structured payload passed through hosted shell_command"
+    else
+      nil
+    end
+  end
+
+  defp unsafe_inline_shell_payload_reason(_command), do: nil
+
+  defp unsafe_direct_powershell_cmdlet_reason(command) when is_binary(command) do
+    normalized =
+      command
+      |> String.trim()
+      |> String.downcase()
+
+    powershell_invocation =
+      Regex.match?(
+        ~r/\b(?:powershell|pwsh)(?:\.exe)?\b/,
+        normalized
+      )
+
+    command_without_quoted_strings =
+      if powershell_invocation do
+        Regex.replace(~r/'[^']*'/, normalized, "")
+      else
+        Regex.replace(~r/'[^']*'|"[^"]*"/, normalized, "")
+      end
+
+    direct_cmdlet =
+      Regex.match?(
+        ~r/(^|[;&|\r\n])\s*(?:get-childitem|get-content|select-object|set-location|get-location|gci|gc|dir|ls|cat|type|cd|pwd)\b/,
+        command_without_quoted_strings
+      )
+
+    wrapped_cmdlet =
+      powershell_invocation &&
+        (Regex.match?(
+           ~r/\s-(?:command|c)\s+['"]?(?:&\s*)?(?:\{\s*)?(?:get-childitem|get-content|select-object|set-location|get-location|gci|gc|dir|ls|cat|type|cd|pwd)\b/,
+           normalized
+         ) ||
+           single_quoted_powershell_cmdlet?(normalized))
+
+    if direct_cmdlet || wrapped_cmdlet do
+      "direct PowerShell cmdlet used through hosted shell_command"
+    else
+      nil
+    end
+  end
+
+  defp unsafe_direct_powershell_cmdlet_reason(_command), do: nil
+
+  defp single_quoted_powershell_cmdlet?(normalized) when is_binary(normalized) do
+    ~r/\s-(?:command|c)\s+'([^']*)'/
+    |> Regex.scan(normalized, capture: :all_but_first)
+    |> List.flatten()
+    |> Enum.any?(fn script ->
+      Regex.match?(
+        ~r/(^|[;&|\r\n])\s*(?:get-childitem|get-content|select-object|set-location|get-location|gci|gc|dir|ls|cat|type|cd|pwd)\b/,
+        script
+      )
+    end)
+  end
+
+  defp single_quoted_powershell_cmdlet?(_normalized), do: false
 
   defp unsafe_hosted_shell_generation_reason(command) when is_binary(command) do
     normalized =
@@ -856,6 +1013,80 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp unsafe_hosted_shell_generation_reason(_command), do: nil
+
+  defp unsafe_scratch_workspace_discovery_reason(command, cwd)
+       when is_binary(command) and is_binary(cwd) do
+    normalized_command =
+      command
+      |> String.trim()
+      |> String.replace("\\", "/")
+      |> String.downcase()
+
+    normalized_cwd =
+      cwd
+      |> String.replace("\\", "/")
+      |> String.downcase()
+
+    scratch_workspace? = Regex.match?(~r{/worktrees/symphony/[^/]+(?:/|$)}, normalized_cwd)
+
+    broad_discovery? =
+      normalized_command
+      |> shell_command_candidates()
+      |> Enum.any?(&broad_repository_discovery_command?/1)
+
+    if scratch_workspace? && broad_discovery? do
+      "scratch Symphony workspace repository discovery used instead of a named product worktree"
+    else
+      nil
+    end
+  end
+
+  defp unsafe_scratch_workspace_discovery_reason(_command, _cwd), do: nil
+
+  defp shell_command_candidates(command) when is_binary(command) do
+    command
+    |> wrapped_shell_command_candidates()
+    |> Enum.map(&trim_shell_command_edges/1)
+    |> Enum.uniq()
+  end
+
+  defp wrapped_shell_command_candidates(command) do
+    cmd_wrapped =
+      case Regex.run(~r/\bcmd(?:\.exe)?(?:\s+\/d)?\s+\/c\s+(.+)$/, command, capture: :all_but_first) do
+        [inner] -> [inner]
+        _ -> []
+      end
+
+    powershell_wrapped =
+      case Regex.run(~r/\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:command|c)\s+(.+)$/, command, capture: :all_but_first) do
+        [inner] -> [inner]
+        _ -> []
+      end
+
+    [command | cmd_wrapped ++ powershell_wrapped]
+  end
+
+  defp trim_shell_command_edges(command) do
+    command
+    |> String.trim()
+    |> String.trim_leading("&")
+    |> String.trim()
+    |> String.trim_leading("{")
+    |> String.trim_trailing("}")
+    |> String.trim()
+    |> String.trim(~s("))
+    |> String.trim("'")
+    |> String.trim()
+  end
+
+  defp broad_repository_discovery_command?(command) when is_binary(command) do
+    Regex.match?(~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?rg(?:\.exe)?\s+--files(?:\s|$)/, command) ||
+      Regex.match?(
+        ~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?git(?:\.exe)?\s+worktree\s+list(?:\s|$)/,
+        command
+      ) ||
+      Regex.match?(~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?git(?:\.exe)?\s+status(?:\s|$)/, command)
+  end
 
   defp single_quoted_powershell_generation?(normalized) when is_binary(normalized) do
     ~r/\s-(?:command|c)\s+'([^']*)'/
@@ -1057,6 +1288,27 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
+         port,
+         "mcpServer/elicitation/request",
+         %{"id" => id, "params" => params} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         true
+       ) do
+    maybe_auto_accept_mcp_tool_elicitation(
+      port,
+      id,
+      params,
+      payload,
+      payload_string,
+      on_message,
+      metadata
+    )
+  end
+
+  defp maybe_handle_approval_request(
          _port,
          _method,
          _payload,
@@ -1069,34 +1321,109 @@ defmodule SymphonyElixir.Codex.AppServer do
     :unhandled
   end
 
+  defp maybe_auto_accept_mcp_tool_elicitation(
+         port,
+         id,
+         params,
+         payload,
+         payload_string,
+         on_message,
+         metadata
+       ) do
+    if mcp_tool_call_approval_elicitation?(params) do
+      send_message(port, %{"id" => id, "result" => %{"action" => "accept", "content" => %{}}})
+
+      emit_message(
+        on_message,
+        :approval_auto_approved,
+        %{payload: payload, raw: payload_string, decision: "accept"},
+        metadata
+      )
+
+      :approved
+    else
+      :input_required
+    end
+  end
+
+  defp mcp_tool_call_approval_elicitation?(%{
+         "_meta" => %{"codex_approval_kind" => "mcp_tool_call"},
+         "mode" => "form",
+         "requestedSchema" => schema
+       })
+       when is_map(schema) do
+    empty_object_schema?(schema)
+  end
+
+  defp mcp_tool_call_approval_elicitation?(_params), do: false
+
+  defp empty_object_schema?(%{"type" => "object"} = schema) do
+    empty_schema_properties?(Map.get(schema, "properties")) and
+      empty_schema_required?(Map.get(schema, "required"))
+  end
+
+  defp empty_object_schema?(_schema), do: false
+
+  defp empty_schema_properties?(properties) when is_map(properties), do: map_size(properties) == 0
+  defp empty_schema_properties?(nil), do: true
+  defp empty_schema_properties?(_properties), do: false
+
+  defp empty_schema_required?(required) when is_list(required), do: Enum.empty?(required)
+  defp empty_schema_required?(nil), do: true
+  defp empty_schema_required?(_required), do: false
+
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =
       case Map.get(result, "output") do
         existing_output when is_binary(existing_output) -> existing_output
         _ -> dynamic_tool_output(result)
       end
+      |> truncate_dynamic_tool_output()
 
     content_items =
       case Map.get(result, "contentItems") do
-        existing_items when is_list(existing_items) -> existing_items
+        existing_items when is_list(existing_items) -> truncate_dynamic_tool_content_items(existing_items)
         _ -> dynamic_tool_content_items(output)
       end
 
-    result
-    |> Map.put("output", output)
-    |> Map.put("contentItems", content_items)
+    %{
+      "success" => success,
+      "output" => output,
+      "contentItems" => content_items
+    }
   end
 
   defp normalize_dynamic_tool_result(result) do
+    output = result |> inspect() |> truncate_dynamic_tool_output()
+
     %{
       "success" => false,
-      "output" => inspect(result),
-      "contentItems" => dynamic_tool_content_items(inspect(result))
+      "output" => output,
+      "contentItems" => dynamic_tool_content_items(output)
     }
   end
 
   defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
   defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
+
+  defp truncate_dynamic_tool_content_items(items) when is_list(items) do
+    Enum.map(items, fn
+      %{"text" => text} = item when is_binary(text) ->
+        Map.put(item, "text", truncate_dynamic_tool_output(text))
+
+      item ->
+        item
+    end)
+  end
+
+  defp truncate_dynamic_tool_output(output) when is_binary(output) do
+    if String.length(output) > @max_dynamic_tool_output_chars do
+      String.slice(output, 0, @max_dynamic_tool_output_chars) <>
+        "\n[dynamic tool output truncated after #{@max_dynamic_tool_output_chars} characters]"
+    else
+      output
+    end
+  end
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
     [

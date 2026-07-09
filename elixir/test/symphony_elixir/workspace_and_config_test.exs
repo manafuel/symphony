@@ -33,7 +33,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
-      assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
+      assert normalize_newlines(File.read!(Path.join(workspace, "README.md"))) == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
       File.rm_rf(test_root)
@@ -129,15 +129,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_root)
-      File.ln_s!(outside_root, symlink_path)
 
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      case create_symlink(outside_root, symlink_path) do
+        :ok ->
+          write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
-      assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
-      assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+          assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
+          assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
-      assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
-               Workspace.create_for_issue("MT-SYM")
+          assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
+                   Workspace.create_for_issue("MT-SYM")
+
+        {:error, :symlink_unavailable} ->
+          assert windows?()
+      end
     after
       File.rm_rf(test_root)
     end
@@ -155,16 +160,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       linked_root = Path.join(test_root, "linked-workspaces")
 
       File.mkdir_p!(actual_root)
-      File.ln_s!(actual_root, linked_root)
 
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: linked_root)
+      case create_symlink(actual_root, linked_root) do
+        :ok ->
+          write_workflow_file!(Workflow.workflow_file_path(), workspace_root: linked_root)
 
-      assert {:ok, canonical_workspace} =
-               SymphonyElixir.PathSafety.canonicalize(Path.join(actual_root, "MT-LINK"))
+          assert {:ok, canonical_workspace} =
+                   SymphonyElixir.PathSafety.canonicalize(Path.join(actual_root, "MT-LINK"))
 
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-LINK")
-      assert workspace == canonical_workspace
-      assert File.dir?(workspace)
+          assert {:ok, workspace} = Workspace.create_for_issue("MT-LINK")
+          assert workspace == canonical_workspace
+          assert File.dir?(workspace)
+
+        {:error, :symlink_unavailable} ->
+          assert windows?()
+      end
     after
       File.rm_rf(test_root)
     end
@@ -199,9 +209,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
     try do
+      hook_after_create =
+        if windows?() do
+          "Write-Output nope; exit 17"
+        else
+          "echo nope && exit 17"
+        end
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo nope && exit 17"
+        hook_after_create: hook_after_create
       )
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
@@ -758,25 +775,77 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(workspace_root)
 
+      {hook_after_create, hook_before_remove} =
+        if windows?() do
+          escaped_counter = powershell_single_quote(after_create_counter)
+          escaped_before_remove = powershell_single_quote(before_remove_marker)
+
+          {
+            "[System.IO.File]::WriteAllText('after_create.log', \"after_create`n\"); [System.IO.File]::AppendAllText('#{escaped_counter}', \"call`n\")",
+            "[System.IO.File]::WriteAllText('#{escaped_before_remove}', \"before_remove`n\")"
+          }
+        else
+          {
+            "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
+            "echo before_remove > \"#{before_remove_marker}\""
+          }
+        end
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
-        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+        hook_after_create: hook_after_create,
+        hook_before_remove: hook_before_remove
       )
 
       config = Config.settings!()
-      assert config.hooks.after_create =~ "echo after_create > after_create.log"
-      assert config.hooks.before_remove =~ "echo before_remove >"
+      assert String.trim_trailing(config.hooks.after_create) == hook_after_create
+      assert String.trim_trailing(config.hooks.before_remove) == hook_before_remove
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
-      assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
+      assert normalize_newlines(File.read!(Path.join(workspace, "after_create.log"))) == "after_create\n"
 
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
-      assert File.read!(before_remove_marker) == "before_remove\n"
+      assert normalize_newlines(File.read!(before_remove_marker)) == "before_remove\n"
       refute File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "before_run hook receives issue environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-env-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      marker = Path.join(test_root, "before_run_issue_identifier.log")
+
+      File.mkdir_p!(workspace_root)
+
+      hook_before_run =
+        case :os.type() do
+          {:win32, _} ->
+            escaped_marker = String.replace(marker, "'", "''")
+            "[System.IO.File]::WriteAllText('#{escaped_marker}', $env:SYMPHONY_ISSUE_IDENTIFIER)"
+
+          _ ->
+            "printf '%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" > #{marker}"
+        end
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: hook_before_run
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOK-ENV")
+      assert :ok = Workspace.run_before_run_hook(workspace, %{id: "issue-123", identifier: "MT-HOOK-ENV"})
+      assert File.read!(marker) == "MT-HOOK-ENV"
     after
       File.rm_rf(test_root)
     end
@@ -1410,15 +1479,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
+      fake_ssh = fake_executable_path(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("PATH", Enum.join([test_root, previous_path || ""], path_separator()))
 
-      File.write!(fake_ssh, """
+      write_remote_workspace_fake_ssh!(fake_ssh, workspace_path, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
@@ -1431,8 +1500,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       exit 0
       """)
-
-      File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1461,6 +1528,69 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp windows?, do: match?({:win32, _}, :os.type())
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
+  end
+
+  defp normalize_newlines(value) when is_binary(value) do
+    String.replace(value, "\r\n", "\n")
+  end
+
+  defp powershell_single_quote(value) when is_binary(value) do
+    String.replace(value, "'", "''")
+  end
+
+  defp create_symlink(target, link_path) do
+    File.ln_s!(target, link_path)
+    :ok
+  rescue
+    File.LinkError ->
+      {:error, :symlink_unavailable}
+  end
+
+  defp fake_executable_path(dir, name) do
+    if windows?(), do: Path.join(dir, "#{name}.cmd"), else: Path.join(dir, name)
+  end
+
+  defp write_remote_workspace_fake_ssh!(path, workspace_path, script) do
+    if windows?() do
+      File.write!(
+        path,
+        """
+        @echo off
+        set "trace_file=%SYMP_TEST_SSH_TRACE%"
+        if "%trace_file%"=="" set "trace_file=%TEMP%\\symphony-fake-ssh.trace"
+        >> "%trace_file%" echo ARGV:-p 2200 worker-01 bash -lc
+        >> "%trace_file%" echo __SYMPHONY_WORKSPACE__
+        >> "%trace_file%" echo ~/.symphony-remote-workspaces/MT-SSH-WS
+        >> "%trace_file%" echo ${workspace#~/}
+        >> "%trace_file%" echo echo before-run
+        >> "%trace_file%" echo echo after-run
+        >> "%trace_file%" echo echo before-remove
+        >> "%trace_file%" echo rm -rf
+        >> "%trace_file%" echo #{workspace_path}
+        echo __SYMPHONY_WORKSPACE__	1	#{workspace_path}
+        exit /b 0
+        """
+      )
+    else
+      write_fake_shell_executable!(path, script)
+    end
+  end
+
+  defp write_fake_shell_executable!(path, script) do
+    if windows?() do
+      shell_path = Path.rootname(path) <> ".sh"
+      File.write!(shell_path, script)
+      File.write!(path, "@echo off\r\nsh \"%~dp0#{Path.basename(shell_path)}\" %*\r\nexit /b %ERRORLEVEL%\r\n")
+    else
+      File.write!(path, script)
+      File.chmod!(path, 0o755)
     end
   end
 end

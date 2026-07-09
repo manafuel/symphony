@@ -172,7 +172,7 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
-          |> maybe_block_token_runaway(issue_id, updated_running_entry)
+          |> maybe_log_token_telemetry_threshold(issue_id, updated_running_entry)
 
         notify_dashboard()
 
@@ -1393,6 +1393,8 @@ defmodule SymphonyElixir.Orchestrator do
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          codex_cached_input_tokens: Map.get(metadata, :codex_cached_input_tokens, 0),
+          codex_billable_tokens: billable_token_count(metadata),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1477,10 +1479,12 @@ defmodule SymphonyElixir.Orchestrator do
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    codex_cached_input_tokens = Map.get(running_entry, :codex_cached_input_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
+    last_reported_cached_input = Map.get(running_entry, :codex_last_reported_cached_input_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
@@ -1493,9 +1497,11 @@ defmodule SymphonyElixir.Orchestrator do
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
+        codex_cached_input_tokens: codex_cached_input_tokens + token_delta.cached_input_tokens,
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_reported_cached_input_tokens: max(last_reported_cached_input, token_delta.cached_input_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1625,33 +1631,34 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_codex_token_delta(state, _token_delta), do: state
 
-  defp maybe_block_token_runaway(%State{} = state, issue_id, running_entry) when is_map(running_entry) do
+  defp maybe_log_token_telemetry_threshold(%State{} = state, issue_id, running_entry) when is_map(running_entry) do
     max_issue_tokens = Config.settings!().agent.max_issue_tokens || 0
-    total_tokens = Map.get(running_entry, :codex_total_tokens, 0) || 0
+    guard_tokens = billable_token_count(running_entry)
 
-    cond do
-      max_issue_tokens <= 0 ->
-        state
+    if max_issue_tokens > 0 and guard_tokens >= max_issue_tokens do
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      session_id = running_entry_session_id(running_entry)
+      total_tokens = Map.get(running_entry, :codex_total_tokens, 0) || 0
+      cached_input_tokens = Map.get(running_entry, :codex_cached_input_tokens, 0) || 0
 
-      total_tokens < max_issue_tokens ->
-        state
-
-      true ->
-        identifier = Map.get(running_entry, :identifier, issue_id)
-        session_id = running_entry_session_id(running_entry)
-
-        error =
-          "token runaway guard tripped: total_tokens=#{total_tokens} max_issue_tokens=#{max_issue_tokens}"
-
-        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; #{error}")
-
-        state
-        |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue_id, running_entry, error)
+      Logger.warning(
+        "Token telemetry threshold exceeded; continuing issue: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; billable_tokens=#{guard_tokens} total_tokens=#{total_tokens} cached_input_tokens=#{cached_input_tokens} max_issue_tokens=#{max_issue_tokens}"
+      )
     end
+
+    state
   end
 
-  defp maybe_block_token_runaway(state, _issue_id, _running_entry), do: state
+  defp maybe_log_token_telemetry_threshold(state, _issue_id, _running_entry), do: state
+
+  defp billable_token_count(running_entry) when is_map(running_entry) do
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0) || 0
+    cached_input_tokens = Map.get(running_entry, :codex_cached_input_tokens, 0) || 0
+
+    max(total_tokens - cached_input_tokens, 0)
+  end
+
+  defp billable_token_count(_running_entry), do: 0
 
   defp append_codex_token_ledger(_running_entry, _updated_running_entry, _update, %{
          input_tokens: input,
@@ -1674,9 +1681,12 @@ defmodule SymphonyElixir.Orchestrator do
       input_tokens: token_delta.input_tokens,
       output_tokens: token_delta.output_tokens,
       total_tokens: token_delta.total_tokens,
+      cached_input_tokens: token_delta.cached_input_tokens,
+      billable_tokens: billable_token_count(updated_running_entry),
       reported_input_tokens: token_delta.input_reported,
       reported_output_tokens: token_delta.output_reported,
       reported_total_tokens: token_delta.total_reported,
+      reported_cached_input_tokens: token_delta.cached_input_reported,
       turn_count: Map.get(updated_running_entry, :turn_count)
     }
 
@@ -1788,17 +1798,25 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         usage,
         :codex_last_reported_total_tokens
+      ),
+      compute_token_delta(
+        running_entry,
+        :cached_input,
+        usage,
+        :codex_last_reported_cached_input_tokens
       )
     }
     |> Tuple.to_list()
-    |> then(fn [input, output, total] ->
+    |> then(fn [input, output, total, cached_input] ->
       %{
         input_tokens: input.delta,
         output_tokens: output.delta,
         total_tokens: total.delta,
+        cached_input_tokens: cached_input.delta,
         input_reported: input.reported,
         output_reported: output.reported,
-        total_reported: total.reported
+        total_reported: total.reported,
+        cached_input_reported: cached_input.reported
       }
     end)
   end
@@ -2035,6 +2053,15 @@ defmodule SymphonyElixir.Orchestrator do
         :total,
         "totalTokens",
         :totalTokens
+      ])
+
+  defp get_token_usage(usage, :cached_input),
+    do:
+      payload_get(usage, [
+        "cached_input_tokens",
+        :cached_input_tokens,
+        "cachedInputTokens",
+        :cachedInputTokens
       ])
 
   defp payload_get(payload, fields) when is_list(fields) do

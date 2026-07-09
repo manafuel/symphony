@@ -113,11 +113,7 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
-      tokens: %{
-        input_tokens: entry.codex_input_tokens,
-        output_tokens: entry.codex_output_tokens,
-        total_tokens: entry.codex_total_tokens
-      }
+      tokens: token_payload(entry)
     }
   end
 
@@ -162,13 +158,34 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
       last_event_at: iso8601(running.last_codex_timestamp),
-      tokens: %{
-        input_tokens: running.codex_input_tokens,
-        output_tokens: running.codex_output_tokens,
-        total_tokens: running.codex_total_tokens
-      }
+      tokens: token_payload(running)
     }
   end
+
+  defp token_payload(entry) do
+    total_tokens = Map.get(entry, :codex_total_tokens)
+    cached_input_tokens = Map.get(entry, :codex_cached_input_tokens, 0)
+
+    %{
+      input_tokens: Map.get(entry, :codex_input_tokens),
+      output_tokens: Map.get(entry, :codex_output_tokens),
+      total_tokens: total_tokens,
+      cached_input_tokens: cached_input_tokens,
+      billable_tokens:
+        Map.get(
+          entry,
+          :codex_billable_tokens,
+          billable_token_count(total_tokens, cached_input_tokens)
+        )
+    }
+  end
+
+  defp billable_token_count(total_tokens, cached_input_tokens) when is_integer(total_tokens) do
+    cached_input_tokens = if is_integer(cached_input_tokens), do: cached_input_tokens, else: 0
+    max(total_tokens - cached_input_tokens, 0)
+  end
+
+  defp billable_token_count(_total_tokens, _cached_input_tokens), do: 0
 
   defp retry_issue_payload(retry) do
     %{

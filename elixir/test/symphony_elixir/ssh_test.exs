@@ -164,22 +164,59 @@ defmodule SymphonyElixir.SSHTest do
 
   defp install_fake_ssh!(test_root, trace_file, script \\ nil) do
     fake_bin_dir = Path.join(test_root, "bin")
-    fake_ssh = Path.join(fake_bin_dir, "ssh")
 
     File.mkdir_p!(fake_bin_dir)
 
-    File.write!(
-      fake_ssh,
-      script ||
-        """
-        #!/bin/sh
-        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-        exit 0
-        """
-    )
+    fake_ssh =
+      if windows?() do
+        path = Path.join(fake_bin_dir, "ssh.cmd")
+        File.write!(path, windows_fake_ssh_script(trace_file, not is_nil(script)))
+        path
+      else
+        path = Path.join(fake_bin_dir, "ssh")
+
+        File.write!(
+          path,
+          script ||
+            """
+            #!/bin/sh
+            printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+            exit 0
+            """
+        )
+
+        path
+      end
 
     File.chmod!(fake_ssh, 0o755)
-    System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
+    System.put_env("PATH", Enum.join([fake_bin_dir, System.get_env("PATH") || ""], path_separator()))
+  end
+
+  defp windows_fake_ssh_script(trace_file, emit_ready?) do
+    ready = if emit_ready?, do: "1", else: "0"
+
+    """
+    @echo off
+    setlocal EnableDelayedExpansion
+    set "args="
+    :loop
+    if "%~1"=="" goto done
+    if defined args (set "args=!args! %~1") else set "args=%~1"
+    shift
+    goto loop
+    :done
+    >> "#{trace_file}" echo ARGV:!args!
+    if "#{ready}"=="1" echo ready
+    exit /b 0
+    """
+  end
+
+  defp windows? do
+    match?({:win32, _}, :os.type())
+  end
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
   end
 
   defp wait_for_trace!(trace_file, attempts \\ 20)

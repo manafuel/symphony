@@ -53,24 +53,38 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_workspace)
-      File.ln_s!(outside_workspace, symlink_workspace)
 
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root
-      )
+      case File.ln_s(outside_workspace, symlink_workspace) do
+        :ok ->
+          :ok
 
-      issue = %Issue{
-        id: "issue-workspace-symlink-guard",
-        identifier: "MT-1000",
-        title: "Validate symlink workspace guard",
-        description: "Ensure app-server refuses symlink escape cwd targets",
-        state: "In Progress",
-        url: "https://example.org/issues/MT-1000",
-        labels: ["backend"]
-      }
+        {:error, :eperm} ->
+          assert windows?()
 
-      assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
-               AppServer.run(symlink_workspace, "guard", issue)
+        {:error, reason} ->
+          flunk("failed to create symlink: #{inspect(reason)}")
+      end
+
+      if File.exists?(symlink_workspace) do
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root
+        )
+
+        issue = %Issue{
+          id: "issue-workspace-symlink-guard",
+          identifier: "MT-1000",
+          title: "Validate symlink workspace guard",
+          description: "Ensure app-server refuses symlink escape cwd targets",
+          state: "In Progress",
+          url: "https://example.org/issues/MT-1000",
+          labels: ["backend"]
+        }
+
+        assert {:error, {:invalid_workspace_cwd, :symlink_escape, ^symlink_workspace, _root}} =
+                 AppServer.run(symlink_workspace, "guard", issue)
+      else
+        assert windows?()
+      end
     after
       File.rm_rf(test_root)
     end
@@ -183,7 +197,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server injects MANAfuel hosted shell serialization instructions at thread start" do
+  test "app server injects MANAfuel local shell and hosted shell fallback instructions at thread start" do
     payload =
       AppServer.thread_start_payload("C:/workspaces/MT-1002", %{
         approval_policy: "never",
@@ -198,11 +212,18 @@ defmodule SymphonyElixir.AppServerTest do
     assert get_in(payload, ["params", "cwd"]) == "C:/workspaces/MT-1002"
     assert is_list(get_in(payload, ["params", "dynamicTools"]))
     assert is_binary(instructions)
-    assert instructions =~ "Hard runtime rule: issue at most one hosted shell_command"
-    assert instructions =~ "even after a failed, declined, or blocked command"
-    assert instructions =~ "A shell_command must be simple"
-    assert instructions =~ "Use apply_patch for file edits"
+    assert instructions =~ "Prefer the dynamic `local_shell` tool"
+    assert instructions =~ "hosted `shell_command` is a fallback only"
+    assert instructions =~ "`local_shell` must still be simple"
+    assert instructions =~ "direct PowerShell read/navigation cmdlets"
+    assert instructions =~ "Get-ChildItem"
+    assert instructions =~ "cmd.exe /d /c dir /b"
+    assert instructions =~ "Use `write_run_artifact` for required plan"
+    assert instructions =~ "`write_run_artifact` for run evidence"
+    assert instructions =~ "apply_patch for product/repo file edits"
     assert instructions =~ "bulk-generate files through shell_command"
+    assert instructions =~ "issue at most one hosted shell_command tool call per assistant turn"
+    assert instructions =~ "Do not move a ticket to Human Review solely"
     assert instructions =~ "has already applied packaged MANAfuel skill orientation"
     assert instructions =~ "Do not use hosted shell_command to read packaged SKILL.md"
     assert instructions =~ "manafuel-codex:* skill files"
@@ -267,8 +288,8 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(codex_binary, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server"
       )
 
       issue = %Issue{
@@ -348,6 +369,109 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert {:error, {:turn_input_required, payload}} =
                AppServer.run(workspace, "Needs MCP input", issue)
+
+      assert payload["method"] == "mcpServer/elicitation/request"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server auto-accepts MCP tool approval elicitations under never policy" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-tool-elicitation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-189")
+      trace_file = Path.join(test_root, "codex-mcp-tool-elicitation.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+      codex_command = write_mcp_tool_approval_elicitation_codex!(test_root, trace_file)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-tool-elicitation",
+        identifier: "MT-189",
+        title: "MCP tool approval elicitation",
+        description: "Ensure app tool approval elicitations continue automatically",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-189",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle MCP tool approval elicitation", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") and String.contains?(line, ~s("id":120)) do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 120 and
+                   get_in(payload, ["result", "action"]) == "accept" and
+                   get_in(payload, ["result", "content"]) == %{}
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server blocks MCP tool approval elicitations that request form content" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-tool-elicitation-content-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-190")
+      File.mkdir_p!(workspace)
+      codex_command = write_mcp_tool_content_elicitation_codex!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: codex_command,
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-tool-elicitation-content",
+        identifier: "MT-190",
+        title: "MCP tool approval content elicitation",
+        description: "Ensure approval elicitations requesting form content fail closed",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-190",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:turn_input_required, payload}} =
+               AppServer.run(workspace, "Handle MCP tool approval content elicitation", issue)
 
       assert payload["method"] == "mcpServer/elicitation/request"
     after
@@ -478,8 +602,8 @@ defmodule SymphonyElixir.AppServerTest do
       File.chmod!(codex_binary, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server",
+        workspace_root: String.replace(workspace_root, "\\", "/"),
+        codex_command: "#{String.replace(codex_binary, "\\", "/")} app-server",
         codex_approval_policy: "never"
       )
 
@@ -519,20 +643,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 2 and
-                   case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
-
-                     _ ->
-                       false
-                   end
+                 payload["id"] == 2 and linear_graphql_tool_present?(get_in(payload, ["params", "dynamicTools"]))
                else
                  false
                end
@@ -766,7 +877,7 @@ defmodule SymphonyElixir.AppServerTest do
         "item" => %{
           "type" => "commandExecution",
           "id" => "call-safe",
-          "command" => "powershell.exe -Command Get-Content -Path C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one\\MAN-90\\SECURITY.md"
+          "command" => "cmd.exe /d /c type C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one\\MAN-90\\SECURITY.md"
         }
       }
     }
@@ -992,6 +1103,119 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
+    unsafe_direct_powershell_read_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "Get-ChildItem -Name C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_piped_powershell_read_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "git status --short | Select-Object -First 1",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_wrapped_powershell_read_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command Get-ChildItem -Name .",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_native_directory_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "cmd.exe /d /c dir /b C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_scratch_rg_files_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "rg --files",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_scratch_git_worktree_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "git worktree list",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_scratch_git_status_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "git status --short --branch",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_scratch_subdir_git_status_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "git status --short --branch",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90\\nested"
+      }
+    }
+
+    unsafe_wrapped_scratch_git_status_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "cmd.exe /d /c git status --short --branch",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_ampersand_scratch_git_worktree_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "& git worktree list",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    unsafe_wrapped_scratch_rg_files_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "powershell.exe -NoProfile -Command \"rg --files\"",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90"
+      }
+    }
+
+    safe_product_rg_files_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "rg --files",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\one\\MAN-90"
+      }
+    }
+
+    unsafe_inline_ticket_text_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" =>
+          ".\\scripts\\codex-kanban-dry-run.ps1 --mode strict --ticket-text '{\"id\":\"MAN-90\",\"state\":\"Ready for Codex\",\"labels\":[\"codex-agent-ready\"]}' --evidence-output C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex\\runs\\MAN-90\\kanban-dry-run.md --json",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex"
+      }
+    }
+
+    safe_ticket_file_script_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => ".\\scripts\\codex-kanban-dry-run.ps1 --mode strict --ticket-file C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\worktrees\\symphony\\MAN-90\\ticket.json --json",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex"
+      }
+    }
+
     unsafe_single_quoted_powershell_commands = [
       "powershell.exe -NoProfile -Command 'New-Item -ItemType Directory .codex\\runs\\man-90'",
       "pwsh -c 'Set-Content out.txt generated'",
@@ -1077,10 +1301,57 @@ defmodule SymphonyElixir.AppServerTest do
     assert AppServer.unsafe_command_block_reason_for_test(unsafe_numbered_append_redirection_payload) =~
              "filesystem-generation"
 
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_direct_powershell_read_payload) =~
+             "direct PowerShell cmdlet"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_piped_powershell_read_payload) =~
+             "direct PowerShell cmdlet"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_wrapped_powershell_read_payload) =~
+             "direct PowerShell cmdlet"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_inline_ticket_text_payload) =~
+             "inline structured payload"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_scratch_rg_files_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_scratch_git_worktree_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_scratch_git_status_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_scratch_subdir_git_status_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_wrapped_scratch_git_status_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_ampersand_scratch_git_worktree_payload) =~
+             "scratch Symphony workspace"
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_wrapped_scratch_rg_files_payload) =~
+             "scratch Symphony workspace"
+
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_quoted_comparison_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_rg_generation_search_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_select_string_generation_search_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_wrapped_quoted_comparison_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_native_directory_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_ticket_file_script_payload))
+    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_product_rg_files_payload))
+
+    poller_payload = %{
+      "method" => "item/commandExecution/requestApproval",
+      "params" => %{
+        "command" => "scripts/codex-kanban-linear-poll.ps1 --mode strict --json",
+        "cwd" => "C:\\Users\\jclen\\OneDrive\\Documents\\apps\\manafuel\\development\\.codex"
+      }
+    }
+
+    assert AppServer.unsafe_command_block_reason_for_test(poller_payload) =~
+             "legacy kanban poller"
 
     Enum.each(unsafe_single_quoted_powershell_commands, fn command ->
       payload = %{
@@ -1838,6 +2109,48 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server truncates oversized dynamic tool result payloads" do
+    large_text = String.duplicate("x", 10_000)
+
+    result =
+      AppServer.normalize_dynamic_tool_result_for_test(%{
+        "success" => true,
+        "output" => large_text,
+        "contentItems" => [
+          %{
+            "type" => "inputText",
+            "text" => large_text
+          }
+        ]
+      })
+
+    assert result["success"] == true
+    assert String.length(result["output"]) < 8_100
+    assert result["output"] =~ "[dynamic tool output truncated after 8000 characters]"
+    assert String.length(get_in(result, ["contentItems", Access.at(0), "text"])) < 8_100
+
+    assert get_in(result, ["contentItems", Access.at(0), "text"]) =~
+             "[dynamic tool output truncated after 8000 characters]"
+  end
+
+  test "app server strips oversized dynamic tool side fields before returning results" do
+    large_text = String.duplicate("x", 10_000)
+
+    result =
+      AppServer.normalize_dynamic_tool_result_for_test(%{
+        "success" => true,
+        "output" => large_text,
+        "data" => %{"large" => large_text},
+        "debug" => large_text
+      })
+
+    assert Map.keys(result) |> Enum.sort() == ["contentItems", "output", "success"]
+    assert result["success"] == true
+    assert String.length(result["output"]) < 8_100
+    refute Map.has_key?(result, "data")
+    refute Map.has_key?(result, "debug")
+  end
+
   test "app server emits tool_call_failed for supported tool failures" do
     test_root =
       Path.join(
@@ -2170,13 +2483,199 @@ defmodule SymphonyElixir.AppServerTest do
     end)
 
     try do
-      trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
-      remote_workspace = "/remote/workspaces/MT-REMOTE"
+      if windows?() do
+        assert windows?()
+      else
+        trace_file = Path.join(test_root, "ssh.trace")
+        remote_workspace = "/remote/workspaces/MT-REMOTE"
 
-      File.mkdir_p!(test_root)
-      System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+        File.mkdir_p!(test_root)
+        System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
+        System.put_env("PATH", Enum.join([test_root, previous_path || ""], path_separator()))
+        write_remote_app_server_fake_ssh!(test_root, trace_file)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: "/remote/workspaces",
+          codex_command: "fake-remote-codex app-server"
+        )
+
+        issue = %Issue{
+          id: "issue-remote",
+          identifier: "MT-REMOTE",
+          title: "Run remote app server",
+          description: "Validate ssh-backed codex startup",
+          state: "In Progress",
+          url: "https://example.org/issues/MT-REMOTE",
+          labels: ["backend"]
+        }
+
+        assert {:ok, _result} =
+                 AppServer.run(
+                   remote_workspace,
+                   "Run remote worker",
+                   issue,
+                   worker_host: "worker-01:2200"
+                 )
+
+        trace = File.read!(trace_file)
+        lines = String.split(trace, "\n", trim: true)
+
+        assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
+        assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
+        assert argv_line =~ "cd "
+        assert argv_line =~ remote_workspace
+        assert argv_line =~ "exec "
+        assert argv_line =~ "fake-remote-codex app-server"
+
+        assert Enum.any?(lines, fn line ->
+                 String.starts_with?(line, "JSON:") and
+                   line =~ ~s("method":"thread/start") and
+                   line =~ ~s("cwd":"#{remote_workspace}")
+               end)
+
+        assert Enum.any?(lines, fn line ->
+                 String.starts_with?(line, "JSON:") and
+                   line =~ ~s("method":"turn/start") and
+                   line =~ ~s("cwd":"#{remote_workspace}") and
+                   line =~ ~s("sandboxPolicy":) and
+                   line =~ ~s("type":"workspaceWrite")
+               end)
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp write_mcp_tool_approval_elicitation_codex!(test_root, trace_file) do
+    case :os.type() do
+      {:win32, _} ->
+        fake_script = Path.join(test_root, "fake-codex.py")
+        python = System.find_executable("python.exe") || System.find_executable("python") || "python"
+
+        File.write!(fake_script, """
+        import os
+        import sys
+
+        trace = os.environ.get("SYMP_TEST_CODEx_TRACE") or "#{String.replace(trace_file, "\\", "/")}"
+        count = 0
+
+        for line in sys.stdin:
+            count += 1
+            with open(trace, "a", encoding="utf-8") as trace_file:
+                trace_file.write("JSON:" + line.rstrip("\\n") + "\\n")
+
+            if count == 1:
+                print('{"id":1,"result":{}}', flush=True)
+            if count == 3:
+                print('{"id":2,"result":{"thread":{"id":"thread-189"}}}', flush=True)
+            if count == 4:
+                print('{"id":3,"result":{"turn":{"id":"turn-189"}}}', flush=True)
+                print('{"id":120,"method":"mcpServer/elicitation/request","params":{"_meta":{"codex_approval_kind":"mcp_tool_call","connector_name":"GitHub","source":"connector","tool_title":"create_branch"},"message":"Allow GitHub to create a branch?","mode":"form","requestedSchema":{"properties":{},"type":"object"},"serverName":"codex_apps","threadId":"thread-189","turnId":"turn-189"}}', flush=True)
+            if count == 5:
+                print('{"method":"turn/completed"}', flush=True)
+        """)
+
+        "#{String.replace(python, "\\", "/")} #{String.replace(fake_script, "\\", "/")} app-server"
+
+      _ ->
+        codex_binary = Path.join(test_root, "fake-codex")
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-mcp-tool-elicitation.trace}"
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-189"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-189"}}}'
+              printf '%s\\n' '{"id":120,"method":"mcpServer/elicitation/request","params":{"_meta":{"codex_approval_kind":"mcp_tool_call","connector_name":"GitHub","source":"connector","tool_title":"create_branch"},"message":"Allow GitHub to create a branch?","mode":"form","requestedSchema":{"properties":{},"type":"object"},"serverName":"codex_apps","threadId":"thread-189","turnId":"turn-189"}}'
+              ;;
+            5)
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+        "#{codex_binary} app-server"
+    end
+  end
+
+  defp linear_graphql_tool_present?(tools) when is_list(tools) do
+    Enum.any?(tools, fn
+      %{
+        "description" => description,
+        "inputSchema" => %{"required" => ["query"]},
+        "name" => "linear_graphql"
+      } ->
+        description =~ "Linear"
+
+      _ ->
+        false
+    end)
+  end
+
+  defp linear_graphql_tool_present?(_tools), do: false
+
+  defp write_remote_app_server_fake_ssh!(test_root, trace_file) do
+    if windows?() do
+      script = Path.join(test_root, "ssh.ps1")
+      command = Path.join(test_root, "ssh.cmd")
+
+      File.write!(script, """
+      [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+      $tracePath = @'
+      #{trace_file}
+      '@.Trim()
+      $argv = $args -join ' '
+      Add-Content -LiteralPath $tracePath -Value ("ARGV:" + $argv)
+      $count = 0
+      while ($null -ne ($line = [Console]::In.ReadLine())) {
+        $count += 1
+        Add-Content -LiteralPath $tracePath -Value ("JSON:" + $line)
+
+        if ($count -eq 1) {
+          [Console]::Out.WriteLine('{"id":1,"result":{}}')
+          [Console]::Out.Flush()
+        } elseif ($count -eq 3) {
+          [Console]::Out.WriteLine('{"id":2,"result":{"thread":{"id":"thread-remote"}}}')
+          [Console]::Out.Flush()
+        } elseif ($count -eq 4) {
+          [Console]::Out.WriteLine('{"id":3,"result":{"turn":{"id":"turn-remote"}}}')
+          [Console]::Out.WriteLine('{"method":"turn/completed"}')
+          [Console]::Out.Flush()
+          exit 0
+        }
+      }
+      exit 0
+      """)
+
+      File.write!(
+        command,
+        """
+        @echo off
+        powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "#{script}" %*
+        exit /b %ERRORLEVEL%
+        """
+      )
+    else
+      fake_ssh = Path.join(test_root, "ssh")
 
       File.write!(fake_ssh, """
       #!/bin/sh
@@ -2210,79 +2709,72 @@ defmodule SymphonyElixir.AppServerTest do
       """)
 
       File.chmod!(fake_ssh, 0o755)
+    end
+  end
 
-      write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: "/remote/workspaces",
-        codex_command: "fake-remote-codex app-server"
-      )
+  defp windows? do
+    match?({:win32, _}, :os.type())
+  end
 
-      issue = %Issue{
-        id: "issue-remote",
-        identifier: "MT-REMOTE",
-        title: "Run remote app server",
-        description: "Validate ssh-backed codex startup",
-        state: "In Progress",
-        url: "https://example.org/issues/MT-REMOTE",
-        labels: ["backend"]
-      }
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
+  end
 
-      assert {:ok, _result} =
-               AppServer.run(
-                 remote_workspace,
-                 "Run remote worker",
-                 issue,
-                 worker_host: "worker-01:2200"
-               )
+  defp write_mcp_tool_content_elicitation_codex!(test_root) do
+    case :os.type() do
+      {:win32, _} ->
+        fake_script = Path.join(test_root, "fake-codex-content.py")
+        python = System.find_executable("python.exe") || System.find_executable("python") || "python"
 
-      trace = File.read!(trace_file)
-      lines = String.split(trace, "\n", trim: true)
+        File.write!(fake_script, """
+        import sys
 
-      assert argv_line = Enum.find(lines, &String.starts_with?(&1, "ARGV:"))
-      assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
-      assert argv_line =~ "cd "
-      assert argv_line =~ remote_workspace
-      assert argv_line =~ "exec "
-      assert argv_line =~ "fake-remote-codex app-server"
+        count = 0
 
-      expected_turn_policy = %{
-        "type" => "workspaceWrite",
-        "writableRoots" => [remote_workspace],
-        "readOnlyAccess" => %{"type" => "fullAccess"},
-        "networkAccess" => false,
-        "excludeTmpdirEnvVar" => false,
-        "excludeSlashTmp" => false
-      }
+        for _line in sys.stdin:
+            count += 1
+            if count == 1:
+                print('{"id":1,"result":{}}', flush=True)
+            if count == 3:
+                print('{"id":2,"result":{"thread":{"id":"thread-190"}}}', flush=True)
+            if count == 4:
+                print('{"id":3,"result":{"turn":{"id":"turn-190"}}}', flush=True)
+                print('{"id":121,"method":"mcpServer/elicitation/request","params":{"_meta":{"codex_approval_kind":"mcp_tool_call"},"message":"Need additional content","mode":"form","requestedSchema":{"properties":{"reason":{"type":"string"}},"required":["reason"],"type":"object"},"serverName":"codex_apps","threadId":"thread-190","turnId":"turn-190"}}', flush=True)
+        """)
 
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   payload["method"] == "thread/start" &&
-                     get_in(payload, ["params", "cwd"]) == remote_workspace
-                 end)
-               else
-                 false
-               end
-             end)
+        "#{String.replace(python, "\\", "/")} #{String.replace(fake_script, "\\", "/")} app-server"
 
-      assert Enum.any?(lines, fn line ->
-               if String.starts_with?(line, "JSON:") do
-                 line
-                 |> String.trim_leading("JSON:")
-                 |> Jason.decode!()
-                 |> then(fn payload ->
-                   payload["method"] == "turn/start" &&
-                     get_in(payload, ["params", "cwd"]) == remote_workspace &&
-                     get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
-                 end)
-               else
-                 false
-               end
-             end)
-    after
-      File.rm_rf(test_root)
+      _ ->
+        codex_binary = Path.join(test_root, "fake-codex-content")
+
+        File.write!(codex_binary, """
+        #!/bin/sh
+        count=0
+        while IFS= read -r _line; do
+          count=$((count + 1))
+
+          case "$count" in
+            1)
+              printf '%s\\n' '{"id":1,"result":{}}'
+              ;;
+            2)
+              ;;
+            3)
+              printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-190"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-190"}}}'
+              printf '%s\\n' '{"id":121,"method":"mcpServer/elicitation/request","params":{"_meta":{"codex_approval_kind":"mcp_tool_call"},"message":"Need additional content","mode":"form","requestedSchema":{"properties":{"reason":{"type":"string"}},"required":["reason"],"type":"object"},"serverName":"codex_apps","threadId":"thread-190","turnId":"turn-190"}}'
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+        done
+        """)
+
+        File.chmod!(codex_binary, 0o755)
+        "#{codex_binary} app-server"
     end
   end
 end

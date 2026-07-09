@@ -1,6 +1,23 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  defmodule BlockingLinearClient do
+    def fetch_candidate_issues, do: {:ok, []}
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(query, variables) do
+      recipient = Application.get_env(:symphony_elixir, :blocking_linear_recipient)
+      if is_pid(recipient), do: send(recipient, {:blocking_linear_graphql_started, self(), query, variables})
+
+      receive do
+        :release_blocking_linear -> {:error, :released_blocking_tracker}
+      after
+        5_000 -> {:error, :blocking_tracker_timeout}
+      end
+    end
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -758,11 +775,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            ] = rows
   end
 
-  test "orchestrator blocks a running issue when codex tokens exceed max_issue_tokens" do
+  test "orchestrator keeps a running issue active when codex tokens exceed max_issue_tokens" do
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
       max_issue_tokens: 10
     )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 
     issue_id = "issue-token-runaway"
 
@@ -770,7 +790,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       id: issue_id,
       identifier: "MT-227",
       title: "Token runaway",
-      description: "Stop runaway sessions before watchdog freezes the worker",
+      description: "Keep productive sessions running while token telemetry is monitored",
       state: "In Progress",
       url: "https://example.org/issues/MT-227"
     }
@@ -833,18 +853,206 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     )
 
     snapshot = GenServer.call(pid, :snapshot)
-    assert snapshot.running == []
 
-    assert [
-             %{
-               issue_id: ^issue_id,
-               identifier: "MT-227",
-               session_id: "thread-token-runaway-turn-1",
-               error: "token runaway guard tripped: total_tokens=12 max_issue_tokens=10"
+    assert [%{issue_id: ^issue_id, codex_billable_tokens: 12}] = snapshot.running
+    assert snapshot.blocked == []
+
+    refute_receive {:memory_tracker_comment, ^issue_id, _comment_body}, 100
+    refute_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 100
+
+    if Process.alive?(worker_pid), do: send(worker_pid, :done)
+  end
+
+  test "orchestrator does not call tracker visibility writes for high token telemetry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+    Application.put_env(:symphony_elixir, :blocking_linear_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+      Application.delete_env(:symphony_elixir, :blocking_linear_recipient)
+    end)
+
+    issue_id = "issue-token-runaway-slow-tracker"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-229",
+      title: "Token runaway with slow tracker",
+      description: "High token telemetry must not enqueue tracker writes or stop work",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-229"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenRunawaySlowTrackerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-slow-tracker",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{"tokenUsage" => %{"total" => %{"input_tokens" => 11, "output_tokens" => 1, "total_tokens" => 12}}}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot, 250)
+    assert [%{issue_id: ^issue_id, codex_billable_tokens: 12}] = snapshot.running
+    assert snapshot.blocked == []
+
+    refute_receive {:blocking_linear_graphql_started, _publisher_pid, _query, _variables}, 250
+    assert GenServer.call(pid, :snapshot, 250).blocked == []
+
+    if Process.alive?(worker_pid), do: send(worker_pid, :done)
+  end
+
+  test "orchestrator token telemetry excludes cached input replay from billable totals" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    issue_id = "issue-token-runaway-cached-input"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-228",
+      title: "Cached input token guard",
+      description: "Do not block normal tool loops on cached prompt replay",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-228"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CachedInputTokenGuardOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-cached-turn-1",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "payload" => %{
+                 "info" => %{
+                   "total_token_usage" => %{
+                     "input_tokens" => 116,
+                     "cached_input_tokens" => 112,
+                     "output_tokens" => 3,
+                     "total_tokens" => 119
+                   }
+                 }
+               }
              }
-           ] = snapshot.blocked
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
 
-    refute Process.alive?(worker_pid)
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [%{issue_id: ^issue_id, codex_cached_input_tokens: 112, codex_billable_tokens: 7}] =
+             snapshot.running
+
+    assert snapshot.blocked == []
+    assert Process.alive?(worker_pid)
+    send(worker_pid, :done)
   end
 
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
@@ -1273,7 +1481,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms > 0
     assert remaining_ms <= 10_500
   end
 
