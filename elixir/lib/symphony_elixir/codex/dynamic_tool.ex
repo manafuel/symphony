@@ -588,7 +588,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     ]
   end
 
-  defp hidden_stdio_launcher_executable(workdir) do
+  @doc false
+  def hidden_stdio_launcher_executable(workdir) do
     workdir
     |> hidden_stdio_launcher_candidates()
     |> Enum.reject(&is_nil/1)

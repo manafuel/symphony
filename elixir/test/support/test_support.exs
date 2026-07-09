@@ -37,8 +37,15 @@ defmodule SymphonyElixir.TestSupport do
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
+        previous_hidden_launcher_disabled = System.get_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER")
+        System.put_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER", "true")
 
         on_exit(fn ->
+          SymphonyElixir.TestSupport.restore_env(
+            "SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER",
+            previous_hidden_launcher_disabled
+          )
+
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)

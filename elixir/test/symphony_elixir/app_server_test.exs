@@ -232,6 +232,73 @@ defmodule SymphonyElixir.AppServerTest do
     assert instructions =~ "manafuel.implementation_root/<repo>"
   end
 
+  test "app server wraps local Windows app-server launch with hidden stdio launcher" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-hidden-stdio-launch-#{System.unique_integer([:positive])}"
+      )
+
+    previous_launcher = System.get_env("CODEX_HIDDEN_STDIO_LAUNCHER")
+    previous_disabled = System.get_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER")
+
+    on_exit(fn ->
+      restore_env("CODEX_HIDDEN_STDIO_LAUNCHER", previous_launcher)
+      restore_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER", previous_disabled)
+    end)
+
+    try do
+      File.mkdir_p!(test_root)
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      if windows?() do
+        launcher = Path.join(test_root, "codex-hidden-stdio-launcher.exe")
+        File.write!(launcher, "")
+
+        System.put_env("CODEX_HIDDEN_STDIO_LAUNCHER", launcher)
+        System.delete_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER")
+
+        assert {:ok, wrapped_executable, wrapped_args} =
+                 AppServer.local_port_spawn_command_for_test(
+                   "C:/tools/codex.exe",
+                   ["app-server", "--listen", "stdio://"],
+                   workspace
+                 )
+
+        assert wrapped_executable == Path.expand(launcher)
+
+        assert wrapped_args == [
+                 "--cwd",
+                 workspace,
+                 "--",
+                 "C:/tools/codex.exe",
+                 "app-server",
+                 "--listen",
+                 "stdio://"
+               ]
+
+        System.put_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER", "true")
+
+        assert {:ok, "C:/tools/codex.exe", ["app-server"]} =
+                 AppServer.local_port_spawn_command_for_test(
+                   "C:/tools/codex.exe",
+                   ["app-server"],
+                   workspace
+                 )
+      else
+        assert {:ok, "/usr/bin/codex", ["app-server"]} =
+                 AppServer.local_port_spawn_command_for_test(
+                   "/usr/bin/codex",
+                   ["app-server"],
+                   workspace
+                 )
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(

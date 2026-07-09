@@ -196,7 +196,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp start_port(workspace, nil) do
     with {:ok, executable, args} <- local_port_command(),
-         {:ok, port_executable, port_args} <- local_port_spawn_command(executable, args) do
+         {:ok, port_executable, port_args} <- local_port_spawn_command(executable, args, workspace) do
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(port_executable)},
@@ -272,7 +272,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp local_port_spawn_command(executable, args) do
+  @doc false
+  def local_port_spawn_command_for_test(executable, args, workspace) do
+    local_port_spawn_command(executable, args, workspace)
+  end
+
+  defp local_port_spawn_command(executable, args, workspace) do
+    with {:ok, port_executable, port_args} <- local_port_base_spawn_command(executable, args) do
+      windows_hidden_stdio_spawn_command(port_executable, port_args, workspace)
+    end
+  end
+
+  defp local_port_base_spawn_command(executable, args) do
     cond do
       windows_batch_script?(executable) ->
         {:ok, windows_cmd_executable(), ["/d", "/c", executable | args]}
@@ -287,6 +298,55 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:ok, executable, args}
     end
   end
+
+  defp windows_hidden_stdio_spawn_command(executable, args, workspace) do
+    cond do
+      not match?({:win32, _}, :os.type()) ->
+        {:ok, executable, args}
+
+      hidden_stdio_launcher_disabled?() ->
+        {:ok, executable, args}
+
+      hidden_stdio_launcher_executable?(executable) ->
+        {:ok, executable, args}
+
+      true ->
+        case DynamicTool.hidden_stdio_launcher_executable(workspace) do
+          nil -> {:ok, executable, args}
+          launcher -> {:ok, launcher, hidden_stdio_launcher_args(workspace, executable, args)}
+        end
+    end
+  end
+
+  defp hidden_stdio_launcher_args(workspace, executable, args) do
+    cwd_args =
+      if is_binary(workspace) and String.trim(workspace) != "" do
+        ["--cwd", workspace]
+      else
+        []
+      end
+
+    cwd_args ++ ["--", executable | args]
+  end
+
+  defp hidden_stdio_launcher_disabled? do
+    case System.get_env("SYMPHONY_DISABLE_CODEX_HIDDEN_STDIO_LAUNCHER") do
+      value when is_binary(value) ->
+        String.downcase(String.trim(value)) in ["1", "true", "yes"]
+
+      _ ->
+        false
+    end
+  end
+
+  defp hidden_stdio_launcher_executable?(path) when is_binary(path) do
+    path
+    |> Path.basename()
+    |> String.downcase()
+    |> Kernel.==("codex-hidden-stdio-launcher.exe")
+  end
+
+  defp hidden_stdio_launcher_executable?(_path), do: false
 
   defp windows_batch_script?(path) when is_binary(path) do
     match?({:win32, _}, :os.type()) and String.downcase(Path.extname(path)) in [".cmd", ".bat"]
