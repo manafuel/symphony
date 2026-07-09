@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @max_shell_timeout_ms 300_000
   @max_shell_output_chars 120_000
   @max_run_artifact_bytes 1_000_000
+  @hidden_stdio_launcher_name "codex-hidden-stdio-launcher.exe"
   @blocked_product_coordination_checkouts ~w(bob one replicator)
   @linear_graphql_description """
   Execute a raw GraphQL query or mutation against Linear using Symphony's configured auth.
@@ -538,7 +539,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   defp run_local_shell_command(command, workdir, timeout_ms) do
     task =
       Task.async(fn ->
-        {executable, args} = local_shell_executable(command)
+        {executable, args} = local_shell_executable(command, workdir)
         System.cmd(executable, args, cd: workdir, stderr_to_stdout: true)
       end)
 
@@ -556,12 +557,70 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     error -> {:error, {:local_shell_execution_failed, Exception.message(error)}}
   end
 
-  defp local_shell_executable(command) do
+  defp local_shell_executable(command, workdir) do
     if match?({:win32, _}, :os.type()) do
-      {"cmd.exe", ["/d", "/s", "/c", command]}
+      power_shell_args = windows_power_shell_args(command)
+
+      case hidden_stdio_launcher_executable(workdir) do
+        nil -> {windows_power_shell_executable(), power_shell_args}
+        launcher -> {launcher, ["--", "powershell.exe" | power_shell_args]}
+      end
     else
       {"/bin/sh", ["-lc", command]}
     end
+  end
+
+  defp windows_power_shell_executable do
+    System.find_executable("powershell.exe") || "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+  end
+
+  defp windows_power_shell_args(command) do
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-WindowStyle",
+      "Hidden",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      command
+    ]
+  end
+
+  defp hidden_stdio_launcher_executable(workdir) do
+    candidates =
+      [System.get_env("CODEX_HIDDEN_STDIO_LAUNCHER") | hidden_stdio_launcher_candidates(workdir)]
+
+    candidates
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&Path.expand/1)
+    |> Enum.uniq()
+    |> Enum.find(&File.exists?/1)
+  end
+
+  defp hidden_stdio_launcher_candidates(workdir) do
+    roots =
+      ([File.cwd!(), workdir] ++ ancestor_paths(File.cwd!()) ++ ancestor_paths(workdir))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&Path.expand/1)
+      |> Enum.uniq()
+
+    manafuel_candidates =
+      case manafuel_root_for_workspace(workdir) do
+        nil -> []
+        root -> [Path.join([root, "development", ".codex", "bin", @hidden_stdio_launcher_name])]
+      end
+
+    direct_candidates =
+      Enum.flat_map(roots, fn root ->
+        [
+          Path.join([root, "bin", @hidden_stdio_launcher_name]),
+          Path.join([root, ".codex", "bin", @hidden_stdio_launcher_name])
+        ]
+      end)
+
+    direct_candidates ++ manafuel_candidates
   end
 
   defp normalize_shell_output(output) when is_binary(output) do
