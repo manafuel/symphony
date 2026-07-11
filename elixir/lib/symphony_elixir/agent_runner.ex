@@ -4,8 +4,8 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
+  alias SymphonyElixir.{AgentMemory, Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -15,6 +15,13 @@ defmodule SymphonyElixir.AgentRunner do
   def continue_with_issue_for_test(%Issue{} = issue, issue_state_fetcher)
       when is_function(issue_state_fetcher, 1) do
     continue_with_issue?(issue, issue_state_fetcher)
+  end
+
+  @doc false
+  @spec build_turn_prompt_for_test(Issue.t(), keyword(), pos_integer(), pos_integer()) ::
+          String.t()
+  def build_turn_prompt_for_test(%Issue{} = issue, opts, turn_number, max_turns) do
+    build_turn_prompt(issue, opts, turn_number, max_turns)
   end
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -138,7 +145,14 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    recaller = Keyword.get(opts, :agentmemory_recaller, &AgentMemory.recall/1)
+    prompt_builder = Keyword.get(opts, :prompt_builder, &PromptBuilder.build_prompt/2)
+
+    memory_context = recall_context(recaller, issue)
+    prompt = prompt_builder.(issue, opts)
+    AgentMemory.append_context(prompt, memory_context)
+  end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -150,6 +164,23 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp recall_context(recaller, issue) do
+    case recaller.(issue) do
+      {:ok, context} when is_binary(context) and context != "" -> context
+      _ -> nil
+    end
+  rescue
+    _exception ->
+      Logger.warning("AgentMemory first-turn recall raised unexpectedly; continuing without memory context")
+
+      nil
+  catch
+    _kind, _reason ->
+      Logger.warning("AgentMemory first-turn recall exited unexpectedly; continuing without memory context")
+
+      nil
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
