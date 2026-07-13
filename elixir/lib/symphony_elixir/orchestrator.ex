@@ -972,24 +972,24 @@ defmodule SymphonyElixir.Orchestrator do
   defp completion_save_result_class(_value), do: :unexpected
 
   defp block_running_completion(%State{} = state, %Issue{} = issue, error_class) do
-    route_completion_blocker(issue, error_class)
+    routed_error_class = routed_completion_error_class(issue, error_class)
 
     case Map.get(state.running, issue.id) do
       %{pid: _pid} = running_entry ->
-        error = completion_memory_blocker_error(error_class)
+        error = completion_memory_blocker_error(routed_error_class)
 
         state
         |> record_session_completion_totals(running_entry)
         |> stop_and_block_issue(issue.id, running_entry, error)
 
       _ ->
-        block_completion_from_metadata(state, issue, %{}, error_class)
+        put_completion_block_from_metadata(state, issue, %{}, routed_error_class)
     end
   end
 
   defp retain_blocked_completion(%State{} = state, %Issue{} = issue, error_class) do
-    route_completion_blocker(issue, error_class)
-    error = completion_memory_blocker_error(error_class)
+    routed_error_class = routed_completion_error_class(issue, error_class)
+    error = completion_memory_blocker_error(routed_error_class)
 
     blocked_entry =
       state.blocked
@@ -1015,8 +1015,16 @@ defmodule SymphonyElixir.Orchestrator do
          metadata,
          error_class
        ) do
-    route_completion_blocker(issue, error_class)
+    routed_error_class = routed_completion_error_class(issue, error_class)
+    put_completion_block_from_metadata(state, issue, metadata, routed_error_class)
+  end
 
+  defp put_completion_block_from_metadata(
+         %State{} = state,
+         %Issue{} = issue,
+         metadata,
+         routed_error_class
+       ) do
     blocked_entry = %{
       issue_id: issue.id,
       identifier: issue.identifier,
@@ -1024,7 +1032,7 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(metadata, :worker_host),
       workspace_path: Map.get(metadata, :workspace_path),
       session_id: Map.get(metadata, :session_id),
-      error: completion_memory_blocker_error(error_class),
+      error: completion_memory_blocker_error(routed_error_class),
       blocked_at: DateTime.utc_now(),
       last_codex_message: nil,
       last_codex_event: nil,
@@ -1037,6 +1045,13 @@ defmodule SymphonyElixir.Orchestrator do
         claimed: MapSet.put(state.claimed, issue.id),
         blocked: Map.put(state.blocked, issue.id, blocked_entry)
     }
+  end
+
+  defp routed_completion_error_class(issue, error_class) do
+    case route_completion_blocker(issue, error_class) do
+      :ok -> error_class
+      {:error, route_error} -> {:completion_blocker_route_failed, error_class, route_error}
+    end
   end
 
   defp route_completion_blocker(%Issue{} = issue, error_class) do
@@ -1067,24 +1082,65 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp move_completion_to_human_review(%Issue{id: issue_id} = issue, error_class)
        when is_binary(issue_id) do
+    state_updater =
+      Application.get_env(
+        :symphony_elixir,
+        :agentmemory_completion_state_updater,
+        &Tracker.update_issue_state/2
+      )
+
+    comment_creator =
+      Application.get_env(
+        :symphony_elixir,
+        :agentmemory_completion_comment_creator,
+        &Tracker.create_comment/2
+      )
+
     marker = "<!-- symphony:agentmemory-completion-block:#{issue.identifier || issue_id} -->"
 
     comment =
       marker <>
         "\nAgentMemory completion evidence is not verified (error_class=#{error_class}). " <>
-        "The worker retained a blocker and moved this ticket to Human Review."
+        "The worker retained a blocker. The ticket was moved to Human Review; " <>
+        "completion must be retried after the blocker is resolved."
 
-    case Tracker.create_comment(issue_id, comment) do
+    case safe_completion_state_update(state_updater, issue_id) do
       :ok ->
-        Tracker.update_issue_state(issue_id, "Human Review")
+        case safe_completion_comment_create(comment_creator, issue_id, comment) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            {:error, {:completion_blocker_comment_failed, completion_save_result_class(reason)}}
+        end
 
       {:error, reason} ->
-        {:error, {:completion_blocker_comment_failed, reason}}
+        {:error, {:completion_blocker_state_failed, completion_save_result_class(reason)}}
     end
   end
 
   defp move_completion_to_human_review(_issue, _error_class),
     do: {:error, :missing_issue_id}
+
+  defp safe_completion_state_update(state_updater, issue_id) do
+    state_updater.(issue_id, "Human Review")
+  rescue
+    _exception -> {:error, :completion_state_updater_raised}
+  catch
+    kind, _reason -> {:error, {:completion_state_updater_exited, kind}}
+  end
+
+  defp safe_completion_comment_create(comment_creator, issue_id, comment) do
+    comment_creator.(issue_id, comment)
+  rescue
+    _exception -> {:error, :completion_comment_creator_raised}
+  catch
+    kind, _reason -> {:error, {:completion_comment_creator_exited, kind}}
+  end
+
+  defp completion_memory_blocker_error({:completion_blocker_route_failed, error_class, route_error}) do
+    "AgentMemory completion evidence blocked error_class=#{error_class} routing_error=#{route_error}"
+  end
 
   defp completion_memory_blocker_error(error_class) do
     "AgentMemory completion evidence blocked error_class=#{error_class}"

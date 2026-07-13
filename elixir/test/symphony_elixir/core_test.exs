@@ -631,9 +631,10 @@ defmodule SymphonyElixir.CoreTest do
           identifier: issue.identifier
         })
 
-      assert_receive {:memory_tracker_comment, ^issue_id, comment}
       assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}
       assert comment =~ "symphony:agentmemory-completion-block"
+      assert comment =~ "was moved to Human Review"
       refute comment =~ "raw"
       assert MapSet.member?(updated_state.claimed, issue_id)
       assert Map.has_key?(updated_state.blocked, issue_id)
@@ -641,6 +642,187 @@ defmodule SymphonyElixir.CoreTest do
       restore_app_env(:agentmemory_completion_saver, previous_saver)
       restore_app_env(:agentmemory_completion_blocker, previous_blocker)
       restore_app_env(:memory_tracker_recipient, previous_recipient)
+    end
+  end
+
+  test "state routing failure stays blocked and never emits a misleading comment across restarts" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    previous_state_updater =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_state_updater)
+
+    previous_comment_creator =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_comment_creator)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    parent = self()
+    issue_id = "issue-completion-state-routing-failure"
+    Application.delete_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> {:error, :agentmemory_completion_failed} end
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_state_updater,
+      fn routed_issue_id, state_name ->
+        send(parent, {:attempted_human_review, routed_issue_id, state_name})
+        {:error, :linear_state_unavailable}
+      end
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_comment_creator,
+      fn routed_issue_id, comment ->
+        send(parent, {:unexpected_blocker_comment, routed_issue_id, comment})
+        :ok
+      end
+    )
+
+    try do
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-COMPLETION-STATE-FAILURE",
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:04:00Z]
+      }
+
+      initial_state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      first_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, initial_state, issue_id, 1, %{
+          identifier: issue.identifier
+        })
+
+      restart_state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      second_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, restart_state, issue_id, 1, %{
+          identifier: issue.identifier
+        })
+
+      assert_receive {:attempted_human_review, ^issue_id, "Human Review"}
+      assert_receive {:attempted_human_review, ^issue_id, "Human Review"}
+      refute_receive {:unexpected_blocker_comment, ^issue_id, _comment}
+
+      for blocked_state <- [first_state, second_state] do
+        assert MapSet.member?(blocked_state.claimed, issue_id)
+
+        assert blocked_state.blocked[issue_id].error =~
+                 "routing_error=completion_blocker_failed"
+      end
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+      restore_app_env(:agentmemory_completion_state_updater, previous_state_updater)
+      restore_app_env(:agentmemory_completion_comment_creator, previous_comment_creator)
+    end
+  end
+
+  test "comment failure follows a successful Human Review transition and is not duplicated" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    previous_state_updater =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_state_updater)
+
+    previous_comment_creator =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_comment_creator)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    parent = self()
+    issue_id = "issue-completion-comment-failure"
+    Application.delete_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> {:error, :agentmemory_completion_failed} end
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_state_updater,
+      fn routed_issue_id, state_name ->
+        send(parent, {:human_review_succeeded, routed_issue_id, state_name})
+        :ok
+      end
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_comment_creator,
+      fn routed_issue_id, comment ->
+        send(parent, {:blocker_comment_failed, routed_issue_id, comment})
+        {:error, :linear_comment_unavailable}
+      end
+    )
+
+    try do
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-COMPLETION-COMMENT-FAILURE",
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:05:00Z]
+      }
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      blocked_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+          identifier: issue.identifier
+        })
+
+      assert_receive {:human_review_succeeded, ^issue_id, "Human Review"}
+      assert_receive {:blocker_comment_failed, ^issue_id, comment}
+      assert comment =~ "symphony:agentmemory-completion-block"
+      assert comment =~ "was moved to Human Review"
+
+      assert blocked_state.blocked[issue_id].error =~
+               "routing_error=completion_blocker_failed"
+
+      refreshed_issue = %{issue | state: "Human Review"}
+
+      released_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(
+          refreshed_issue,
+          blocked_state,
+          issue_id,
+          1,
+          %{identifier: issue.identifier}
+        )
+
+      refute_receive {:human_review_succeeded, ^issue_id, "Human Review"}
+      refute_receive {:blocker_comment_failed, ^issue_id, _comment}
+      refute MapSet.member?(released_state.claimed, issue_id)
+      refute Map.has_key?(released_state.blocked, issue_id)
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+      restore_app_env(:agentmemory_completion_state_updater, previous_state_updater)
+      restore_app_env(:agentmemory_completion_comment_creator, previous_comment_creator)
     end
   end
 
