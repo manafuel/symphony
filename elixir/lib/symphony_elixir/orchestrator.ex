@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @terminal_retry_min_delay_ms 1_000
+  @terminal_retry_max_delay_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -65,7 +67,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    state = run_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -361,7 +363,17 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+    requested_issue_ids = Map.keys(state.blocked)
+
+    issues
+    |> reconcile_blocked_issue_states(state, active_state_set(), terminal_state_set())
+    |> reconcile_missing_blocked_issue_ids(requested_issue_ids, issues)
+  end
+
+  @doc false
+  @spec recover_startup_terminal_issues_for_test([Issue.t()], term()) :: term()
+  def recover_startup_terminal_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    recover_startup_terminal_issues(issues, state)
   end
 
   @doc false
@@ -470,8 +482,13 @@ defmodule SymphonyElixir.Orchestrator do
 
     case Map.get(blocked_entry, :block_kind) do
       :before_terminal ->
-        Logger.info("Terminal acceptance remains blocked: #{issue_context(issue)} state=#{issue.state}; preserving claim and workspace")
-        refresh_blocked_issue_state(state, issue)
+        if terminal_retry_due?(blocked_entry) do
+          Logger.info("Retrying terminal acceptance: #{issue_context(issue)} state=#{issue.state} attempt=#{Map.get(blocked_entry, :terminal_retry_attempt, 0) + 1}")
+          verify_terminal_blocked_issue(issue, state, blocked_entry)
+        else
+          Logger.info("Terminal acceptance remains blocked: #{issue_context(issue)} state=#{issue.state}; preserving claim and workspace until bounded retry")
+          refresh_blocked_issue_state(state, issue)
+        end
 
       _other ->
         verify_terminal_blocked_issue(issue, state, blocked_entry)
@@ -528,11 +545,17 @@ defmodule SymphonyElixir.Orchestrator do
       |> MapSet.new()
 
     Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
-      if MapSet.member?(visible_issue_ids, issue_id) do
-        state_acc
-      else
-        Logger.info("Blocked issue no longer visible during state refresh: issue_id=#{issue_id}; releasing block")
-        release_issue_claim(state_acc, issue_id)
+      cond do
+        MapSet.member?(visible_issue_ids, issue_id) ->
+          state_acc
+
+        get_in(state_acc.blocked, [issue_id, :block_kind]) == :before_terminal ->
+          Logger.warning("Terminal-blocked issue omitted from state refresh: issue_id=#{issue_id}; preserving claim and workspace until an authoritative terminal snapshot is available")
+          state_acc
+
+        true ->
+          Logger.info("Blocked issue no longer visible during state refresh: issue_id=#{issue_id}; releasing block")
+          release_issue_claim(state_acc, issue_id)
       end
     end)
   end
@@ -618,6 +641,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> Map.put(:issue, issue)
       |> Map.put(:error, terminal_acceptance_error(reason))
       |> Map.put(:block_kind, :before_terminal)
+      |> schedule_terminal_retry()
 
     %{
       state
@@ -628,6 +652,43 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminal_acceptance_error(reason) do
     "before_terminal acceptance failed: #{inspect(reason)}"
+  end
+
+  defp terminal_retry_due?(blocked_entry) when is_map(blocked_entry) do
+    case Map.get(blocked_entry, :terminal_retry_at_ms) do
+      retry_at_ms when is_integer(retry_at_ms) ->
+        System.monotonic_time(:millisecond) >= retry_at_ms
+
+      _missing ->
+        true
+    end
+  end
+
+  defp schedule_terminal_retry(blocked_entry) when is_map(blocked_entry) do
+    if Map.get(blocked_entry, :block_kind) == :before_terminal do
+      attempt =
+        case Map.get(blocked_entry, :terminal_retry_attempt, 0) do
+          value when is_integer(value) and value >= 0 -> value + 1
+          _invalid -> 1
+        end
+
+      Map.merge(blocked_entry, %{
+        terminal_retry_attempt: attempt,
+        terminal_retry_at_ms: System.monotonic_time(:millisecond) + terminal_retry_delay_ms(attempt)
+      })
+    else
+      blocked_entry
+    end
+  end
+
+  defp terminal_retry_delay_ms(attempt) when is_integer(attempt) and attempt > 0 do
+    base_delay_ms =
+      Config.settings!().polling.interval_ms
+      |> max(@terminal_retry_min_delay_ms)
+      |> min(@terminal_retry_max_delay_ms)
+
+    shift = (attempt - 1) |> max(0) |> min(6)
+    min(base_delay_ms <<< shift, @terminal_retry_max_delay_ms)
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
@@ -830,20 +891,22 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
-    blocked_entry = %{
-      issue_id: issue_id,
-      identifier: Map.get(running_entry, :identifier, issue_id),
-      issue: Map.get(running_entry, :issue),
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      session_id: running_entry_session_id(running_entry),
-      error: error,
-      blocked_at: DateTime.utc_now(),
-      last_codex_message: Map.get(running_entry, :last_codex_message),
-      last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
-      block_kind: Map.get(running_entry, :block_kind)
-    }
+    blocked_entry =
+      %{
+        issue_id: issue_id,
+        identifier: Map.get(running_entry, :identifier, issue_id),
+        issue: Map.get(running_entry, :issue),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        session_id: running_entry_session_id(running_entry),
+        error: error,
+        blocked_at: DateTime.utc_now(),
+        last_codex_message: Map.get(running_entry, :last_codex_message),
+        last_codex_event: Map.get(running_entry, :last_codex_event),
+        last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+        block_kind: Map.get(running_entry, :block_kind)
+      }
+      |> schedule_terminal_retry()
 
     %{
       state
@@ -1249,27 +1312,47 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        Enum.each(issues, &cleanup_startup_terminal_workspace/1)
+        recover_startup_terminal_issues(issues, state)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        state
     end
   end
 
-  defp cleanup_startup_terminal_workspace(%Issue{} = issue) do
+  defp recover_startup_terminal_issues(issues, %State{} = state) when is_list(issues) do
+    Enum.reduce(issues, state, &cleanup_startup_terminal_workspace/2)
+  end
+
+  defp cleanup_startup_terminal_workspace(%Issue{} = issue, %State{} = state) do
     case cleanup_terminal_issue_workspace(issue, nil, nil) do
       :ok ->
-        :ok
+        state
 
       {:error, reason} ->
-        Logger.warning("Startup terminal acceptance failed for #{issue_context(issue)} reason=#{inspect(reason)}; preserving workspace")
+        Logger.warning("Startup terminal acceptance failed for #{issue_context(issue)} reason=#{inspect(reason)}; reconstructing claim and terminal block")
+
+        startup_entry = %{
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: nil,
+          workspace_path: nil,
+          block_kind: :before_terminal
+        }
+
+        block_issue_from_entry(
+          state,
+          issue.id,
+          startup_entry,
+          terminal_acceptance_error(reason)
+        )
     end
   end
 
-  defp cleanup_startup_terminal_workspace(_issue), do: :ok
+  defp cleanup_startup_terminal_workspace(_issue, state), do: state
 
   defp notify_dashboard do
     StatusDashboard.notify_update()

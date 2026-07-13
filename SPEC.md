@@ -401,8 +401,15 @@ Fields:
   - Runs after a refreshed tracker snapshot enters a configured terminal state and before Symphony
     removes the issue workspace or releases its claim.
   - Failure blocks terminal acceptance and preserves the claim and workspace for recovery.
+  - A terminal-acceptance block MUST be retried at a bounded rate after future authoritative
+    terminal snapshots. Implementations MUST run at most one retry per reconciliation refresh,
+    bound every attempt by `hooks.timeout_ms`, and cap retry backoff.
+  - An issue omitted from an otherwise successful batch refresh is not an authoritative terminal
+    snapshot. Implementations MUST preserve terminal-acceptance claims and workspaces across empty
+    or partial refreshes.
   - Implementations MUST also apply this gate to terminal cleanup discovered by reconciliation,
-    retry lookup, or startup cleanup.
+    retry lookup, or startup cleanup. A failed startup cleanup MUST reconstruct a claimed,
+    terminal-acceptance-blocked entry so the next authoritative refresh can recover safely.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -636,7 +643,8 @@ claim state.
 
 2. `Claimed`
    - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - In practice, claimed issues are `Running`, `RetryQueued`, or
+     `TerminalAcceptanceBlocked`.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
@@ -644,7 +652,11 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `TerminalAcceptanceBlocked`
+   - Worker is stopped, but `hooks.before_terminal` has not accepted the authoritative terminal
+     snapshot. The claim and workspace remain reserved while bounded reconciliation retries run.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -718,6 +730,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Failed startup terminal cleanup reconstructs `TerminalAcceptanceBlocked` state in memory.
+- Empty or partial tracker batches never release a terminal-acceptance block; only an authoritative
+  snapshot that passes the hook can release it.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

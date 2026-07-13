@@ -358,7 +358,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "terminal hook failure stops the agent but preserves claim and workspace" do
+  test "terminal hook failure preserves claim and workspace then recovers on a bounded retry" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -367,15 +367,17 @@ defmodule SymphonyElixir.CoreTest do
 
     issue_id = "issue-terminal-hook-block"
     issue_identifier = "MT-TERMINAL-BLOCK"
-    workspace = Path.join(test_root, issue_identifier)
+    workspace_root = String.replace(test_root, "\\", "/")
+    workspace = Path.join(workspace_root, issue_identifier)
     hook_script = Path.join(test_root, "terminal-block.exs")
+    recovery_marker = Path.join(test_root, "terminal-recovered.log")
 
     try do
       File.mkdir_p!(test_root)
       File.write!(hook_script, "System.halt(19)\n")
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: test_root,
+        workspace_root: workspace_root,
         tracker_active_states: ["Todo", "In Progress"],
         tracker_terminal_states: ["Done"],
         hook_before_terminal: "elixir \"#{hook_script}\""
@@ -427,10 +429,73 @@ defmodule SymphonyElixir.CoreTest do
 
       assert MapSet.member?(still_blocked.claimed, issue_id)
       assert Map.has_key?(still_blocked.blocked, issue_id)
+      assert still_blocked.blocked[issue_id].terminal_retry_attempt == 1
       assert File.dir?(workspace)
+
+      File.write!(
+        hook_script,
+        "File.write!(#{inspect(recovery_marker)}, \"recovered\\n\")\n"
+      )
+
+      retry_due_state =
+        put_in(
+          still_blocked.blocked[issue_id].terminal_retry_at_ms,
+          System.monotonic_time(:millisecond) - 1
+        )
+
+      recovered_state =
+        Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], retry_due_state)
+
+      refute MapSet.member?(recovered_state.claimed, issue_id)
+
+      refute Map.has_key?(recovered_state.blocked, issue_id)
+      refute File.exists?(workspace)
+      assert File.read!(recovery_marker) == "recovered\n"
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "terminal acceptance blocks survive empty and partial tracker refreshes" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_terminal_states: ["Done"])
+
+    issue_a = %Issue{id: "terminal-a", identifier: "MT-TERMINAL-A", state: "Done"}
+    issue_b = %Issue{id: "terminal-b", identifier: "MT-TERMINAL-B", state: "Done"}
+    retry_at_ms = System.monotonic_time(:millisecond) + 60_000
+
+    state = %Orchestrator.State{
+      blocked: %{
+        issue_a.id => %{
+          issue: issue_a,
+          identifier: issue_a.identifier,
+          block_kind: :before_terminal,
+          terminal_retry_attempt: 1,
+          terminal_retry_at_ms: retry_at_ms
+        },
+        issue_b.id => %{
+          issue: issue_b,
+          identifier: issue_b.identifier,
+          block_kind: :before_terminal,
+          terminal_retry_attempt: 1,
+          terminal_retry_at_ms: retry_at_ms
+        }
+      },
+      claimed: MapSet.new([issue_a.id, issue_b.id]),
+      retry_attempts: %{}
+    }
+
+    partial_state =
+      Orchestrator.reconcile_blocked_issue_states_for_test([issue_a], state)
+
+    assert MapSet.equal?(partial_state.claimed, state.claimed)
+    assert Map.has_key?(partial_state.blocked, issue_a.id)
+    assert Map.has_key?(partial_state.blocked, issue_b.id)
+
+    empty_state = Orchestrator.reconcile_blocked_issue_states_for_test([], partial_state)
+
+    assert MapSet.equal?(empty_state.claimed, state.claimed)
+    assert Map.has_key?(empty_state.blocked, issue_a.id)
+    assert Map.has_key?(empty_state.blocked, issue_b.id)
   end
 
   test "terminal retry lookup preserves claim and workspace when hook blocks" do
@@ -480,6 +545,75 @@ defmodule SymphonyElixir.CoreTest do
       assert MapSet.member?(blocked_state.claimed, issue_id)
       assert blocked_state.blocked[issue_id].block_kind == :before_terminal
       assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "startup terminal cleanup reconstructs a claim and recovers after restart failure" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-startup-terminal-block-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-startup-terminal-block"
+    issue_identifier = "MT-STARTUP-TERMINAL"
+    workspace_root = String.replace(test_root, "\\", "/")
+    workspace = Path.join(workspace_root, issue_identifier)
+    hook_script = Path.join(test_root, "startup-terminal.exs")
+    recovery_marker = Path.join(test_root, "startup-terminal-recovered.log")
+
+    try do
+      File.mkdir_p!(test_root)
+      File.write!(hook_script, "System.halt(31)\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        poll_interval_ms: 1_000,
+        tracker_terminal_states: ["Done"],
+        hook_before_terminal: "elixir \"#{hook_script}\""
+      )
+
+      File.mkdir_p!(workspace)
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Done",
+        title: "Restart terminal verification",
+        updated_at: ~U[2026-07-13 13:02:00Z]
+      }
+
+      startup_state =
+        Orchestrator.recover_startup_terminal_issues_for_test(
+          [terminal_issue],
+          %Orchestrator.State{retry_attempts: %{}}
+        )
+
+      assert MapSet.member?(startup_state.claimed, issue_id)
+      assert startup_state.blocked[issue_id].block_kind == :before_terminal
+      assert startup_state.blocked[issue_id].terminal_retry_attempt == 1
+      assert File.dir?(workspace)
+
+      File.write!(
+        hook_script,
+        "File.write!(#{inspect(recovery_marker)}, \"recovered\\n\")\n"
+      )
+
+      retry_due_state =
+        put_in(
+          startup_state.blocked[issue_id].terminal_retry_at_ms,
+          System.monotonic_time(:millisecond) - 1
+        )
+
+      recovered_state =
+        Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], retry_due_state)
+
+      refute MapSet.member?(recovered_state.claimed, issue_id)
+      refute Map.has_key?(recovered_state.blocked, issue_id)
+      refute File.exists?(workspace)
+      assert File.read!(recovery_marker) == "recovered\n"
     after
       File.rm_rf(test_root)
     end

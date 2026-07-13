@@ -139,7 +139,10 @@ Notes:
 - Use `hooks.before_terminal` for read-only acceptance checks that must pass before Symphony
   removes a terminal issue's workspace and releases its claim. A nonzero exit or timeout preserves
   both for recovery. The gate also applies when terminal state is observed by reconciliation,
-  retry lookup, or startup cleanup.
+  retry lookup, or startup cleanup. Failed checks retry no more than once per tracker refresh with
+  exponential backoff capped at 60 seconds; each attempt remains bounded by `hooks.timeout_ms`.
+  Empty or partial tracker batches do not release a terminal block. If startup cleanup fails,
+  Symphony reconstructs the claim and block so a later authoritative snapshot can retry safely.
 - Issue-aware hooks receive `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`,
   `SYMPHONY_ISSUE_TITLE`, `SYMPHONY_ISSUE_DESCRIPTION`, `SYMPHONY_ISSUE_LABELS`,
   `SYMPHONY_ISSUE_STATE`, and `SYMPHONY_ISSUE_UPDATED_AT`. The timestamp is the ISO 8601
