@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workflow, Workspace}
+  alias SymphonyElixir.{AgentMemory, AgentRunner, Config, StatusDashboard, Tracker, Workflow, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -381,6 +381,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec fetch_retry_issue_for_test(String.t(), ([String.t()] -> term())) ::
+          {:ok, Issue.t()} | :missing | {:error, term()}
+  def fetch_retry_issue_for_test(issue_id, issue_fetcher) do
+    fetch_retry_issue(issue_id, issue_fetcher)
+  end
+
+  @doc false
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
@@ -422,6 +429,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
+        maybe_remember_completion(issue)
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
@@ -456,6 +464,7 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
+        maybe_remember_completion(issue)
         cleanup_issue_workspace(issue.identifier, blocked_issue_worker_host(state, issue.id))
         release_issue_claim(state, issue.id)
 
@@ -891,6 +900,58 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminal_issue_state?(_state_name, _terminal_states), do: false
 
+  defp maybe_remember_completion(%Issue{} = issue) do
+    if completion_issue_state?(issue.state) do
+      saver =
+        Application.get_env(
+          :symphony_elixir,
+          :agentmemory_completion_saver,
+          &AgentMemory.remember_completion/1
+        )
+
+      case safe_remember_completion(saver, issue) do
+        {:ok, :already_recorded} ->
+          Logger.debug("AgentMemory completion already recorded for #{issue_context(issue)} state=#{issue.state}")
+
+        {:ok, memory_id} ->
+          Logger.info("AgentMemory completion saved for #{issue_context(issue)} state=#{issue.state} memory_id=#{memory_id}")
+
+        :disabled ->
+          Logger.warning("AgentMemory completion save disabled for #{issue_context(issue)} state=#{issue.state}")
+
+        {:error, reason} ->
+          Logger.warning("AgentMemory completion save failed for #{issue_context(issue)} state=#{issue.state} error_class=#{completion_save_result_class(reason)}")
+
+        other ->
+          Logger.warning("AgentMemory completion save returned unexpected result for #{issue_context(issue)} result_class=#{completion_save_result_class(other)}")
+      end
+    end
+
+    :ok
+  end
+
+  defp completion_issue_state?(state_name) when is_binary(state_name) do
+    normalize_issue_state(state_name) in ["closed", "completed", "done"]
+  end
+
+  defp completion_issue_state?(_state_name), do: false
+
+  defp safe_remember_completion(saver, issue) do
+    saver.(issue)
+  rescue
+    _exception -> {:error, :completion_saver_raised}
+  catch
+    kind, _reason -> {:error, {:completion_saver_exited, kind}}
+  end
+
+  defp completion_save_result_class(value) when is_atom(value), do: value
+  defp completion_save_result_class({value, _detail}) when is_atom(value), do: value
+  defp completion_save_result_class(value) when is_binary(value), do: :binary
+  defp completion_save_result_class(value) when is_map(value), do: :map
+  defp completion_save_result_class(value) when is_list(value), do: :list
+  defp completion_save_result_class(value) when is_number(value), do: :number
+  defp completion_save_result_class(_value), do: :unexpected
+
   defp active_issue_state?(state_name, active_states) when is_binary(state_name) do
     MapSet.member?(active_states, normalize_issue_state(state_name))
   end
@@ -1087,11 +1148,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
-      {:ok, issues} ->
-        issues
-        |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+    case fetch_retry_issue(issue_id, &Tracker.fetch_issue_states_by_ids/1) do
+      {:ok, issue} ->
+        handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
+
+      :missing ->
+        handle_retry_issue_lookup(nil, state, issue_id, attempt, metadata)
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
@@ -1106,6 +1168,20 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp fetch_retry_issue(issue_id, issue_fetcher)
+       when is_binary(issue_id) and is_function(issue_fetcher, 1) do
+    case issue_fetcher.([issue_id]) do
+      {:ok, issues} ->
+        case find_issue_by_id(issues, issue_id) do
+          %Issue{} = issue -> {:ok, issue}
+          nil -> :missing
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
 
@@ -1113,6 +1189,7 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
+        maybe_remember_completion(issue)
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 

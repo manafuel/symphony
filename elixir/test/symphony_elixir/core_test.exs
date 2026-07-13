@@ -374,6 +374,213 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "completed terminal issue saves AgentMemory outcome before release" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    parent = self()
+    issue_id = "issue-completion-save"
+    issue_identifier = "MT-556-COMPLETE"
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn issue ->
+        send(parent, {:completion_saved, issue.identifier, issue.state})
+        {:ok, "mem_completion"}
+      end
+    )
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    try do
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Done",
+        title: "Completed",
+        updated_at: ~U[2026-07-13 15:00:00Z]
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      assert_receive {:completion_saved, ^issue_identifier, "Done"}
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+
+      if Process.alive?(agent_pid) do
+        Process.exit(agent_pid, :kill)
+      end
+    end
+  end
+
+  test "cancelled terminal issue does not save a completion memory" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> flunk("cancelled issues are terminal but not completed") end
+    )
+
+    issue_id = "issue-cancelled"
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    try do
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: "MT-CANCELLED",
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: "MT-CANCELLED"},
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{id: issue_id, identifier: "MT-CANCELLED", state: "Cancelled"}
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      refute Map.has_key?(updated_state.running, issue_id)
+      refute MapSet.member?(updated_state.claimed, issue_id)
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+
+      if Process.alive?(agent_pid) do
+        Process.exit(agent_pid, :kill)
+      end
+    end
+  end
+
+  test "terminal continuation lookup saves completion memory and releases claim" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    parent = self()
+    issue_id = "issue-retry-completed"
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn issue ->
+        send(parent, {:retry_completion_saved, issue.id})
+        {:ok, "mem_retry_completion"}
+      end
+    )
+
+    try do
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-RETRY-DONE",
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:01:00Z]
+      }
+
+      updated_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+          identifier: issue.identifier
+        })
+
+      assert_receive {:retry_completion_saved, ^issue_id}
+      refute MapSet.member?(updated_state.claimed, issue_id)
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+    end
+  end
+
+  test "completion save failure is non-fatal and sanitizes terminal logs" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    secret_error = "raw-provider-error-must-not-appear"
+    issue_id = "issue-retry-save-failed"
+    parent = self()
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> {:error, secret_error} end
+    )
+
+    try do
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-RETRY-SAVE-FAILED",
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:02:00Z]
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          updated_state =
+            Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+              identifier: issue.identifier
+            })
+
+          send(parent, {:failed_save_state, updated_state})
+        end)
+
+      assert_receive {:failed_save_state, updated_state}
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      assert log =~ "error_class=binary"
+      refute log =~ secret_error
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+    end
+  end
+
+  test "continuation lookup fetches issue state by id so terminal issues remain visible" do
+    issue = %Issue{id: "issue-terminal-fetch", identifier: "MT-FETCH-DONE", state: "Done"}
+    parent = self()
+
+    fetcher = fn ids ->
+      send(parent, {:fetched_issue_states, ids})
+      {:ok, [issue]}
+    end
+
+    assert {:ok, ^issue} =
+             Orchestrator.fetch_retry_issue_for_test(issue.id, fetcher)
+
+    assert_receive {:fetched_issue_states, ["issue-terminal-fetch"]}
+  end
+
   test "missing running issues stop active agents without cleaning the workspace" do
     test_root =
       Path.join(

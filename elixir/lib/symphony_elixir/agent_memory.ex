@@ -10,6 +10,8 @@ defmodule SymphonyElixir.AgentMemory do
   @max_results 5
   @max_item_chars 800
   @max_context_chars 4_000
+  @memory_id_keys ["id", :id, "memory_id", :memory_id, "memoryId", :memoryId]
+  @result_id_keys ["obsId", :obsId, "obs_id", :obs_id] ++ @memory_id_keys
 
   @spec recall(Issue.t(), keyword()) :: {:ok, String.t() | nil} | {:error, term()} | :disabled
   def recall(%Issue{} = issue, opts \\ []) do
@@ -49,6 +51,339 @@ defmodule SymphonyElixir.AgentMemory do
 
       {:error, :agentmemory_recall_failed}
   end
+
+  @spec remember_completion(Issue.t(), keyword()) ::
+          {:ok, String.t() | :already_recorded} | {:error, term()} | :disabled
+  def remember_completion(%Issue{} = issue, opts \\ []) do
+    base_url = configured_url(opts)
+    ledger_path = completion_ledger_path(opts)
+    completion_key = completion_key(issue)
+
+    cond do
+      is_nil(base_url) ->
+        :disabled
+
+      is_nil(ledger_path) ->
+        Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=ledger_unconfigured")
+
+        {:error, :agentmemory_completion_failed}
+
+      completion_recorded?(ledger_path, completion_key) ->
+        {:ok, :already_recorded}
+
+      true ->
+        do_remember_completion(issue, base_url, ledger_path, completion_key, opts)
+    end
+  rescue
+    exception ->
+      Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=#{error_class(exception)}")
+
+      {:error, :agentmemory_completion_failed}
+  catch
+    kind, _reason ->
+      Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=#{kind}")
+
+      {:error, :agentmemory_completion_failed}
+  end
+
+  defp do_remember_completion(issue, base_url, ledger_path, completion_key, opts) do
+    timeout_ms = timeout_ms(opts)
+    request_timeout_ms = max(div(timeout_ms, 3), 1)
+    post_requester = Keyword.get(opts, :post_requester, &Req.post/2)
+    get_requester = Keyword.get(opts, :get_requester, &Req.get/2)
+    content = completion_content(issue, completion_key)
+    started_at = System.monotonic_time(:millisecond)
+
+    with {:ok, memory_id} <-
+           save_completion_memory(
+             issue,
+             content,
+             base_url,
+             request_timeout_ms,
+             post_requester
+           ),
+         :ok <-
+           verify_completion_lookup(
+             memory_id,
+             base_url,
+             request_timeout_ms,
+             get_requester
+           ),
+         :ok <-
+           verify_completion_search(
+             issue,
+             memory_id,
+             base_url,
+             request_timeout_ms,
+             post_requester
+           ) do
+      duration_ms = System.monotonic_time(:millisecond) - started_at
+
+      case write_completion_ledger(
+             issue,
+             ledger_path,
+             completion_key,
+             duration_ms,
+             "ok",
+             %{
+               operation: "verified",
+               saved_memory_id: memory_id,
+               exact_lookup_verified: true,
+               search_verified: true,
+               concept_count: length(completion_concepts(issue)),
+               saved_content_tokens: estimate_tokens(content)
+             }
+           ) do
+        :ok ->
+          {:ok, memory_id}
+
+        {:error, _reason} ->
+          {:error, :agentmemory_completion_failed}
+      end
+    else
+      {:error, operation, error} ->
+        duration_ms = System.monotonic_time(:millisecond) - started_at
+
+        _ =
+          write_completion_ledger(
+            issue,
+            ledger_path,
+            completion_key,
+            duration_ms,
+            "error",
+            %{operation: operation, error: error, saved_content_tokens: 0}
+          )
+
+        Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} operation=#{operation} error=#{error}")
+
+        {:error, :agentmemory_completion_failed}
+    end
+  end
+
+  defp save_completion_memory(issue, content, base_url, timeout_ms, requester) do
+    payload = %{
+      content: content,
+      type: "workflow",
+      concepts: completion_concepts(issue),
+      files: ["elixir/lib/symphony_elixir/agent_memory.ex"]
+    }
+
+    result =
+      safe_request(
+        requester,
+        String.trim_trailing(base_url, "/") <> "/agentmemory/remember",
+        [json: payload] ++ completion_request_options(timeout_ms)
+      )
+
+    case result do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        case completion_memory_id(body) do
+          memory_id when is_binary(memory_id) and memory_id != "" -> {:ok, memory_id}
+          _ -> {:error, "remember", "missing_memory_id"}
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, "remember", "http_#{status}"}
+
+      {:error, reason} ->
+        {:error, "remember", error_class(reason)}
+
+      other ->
+        {:error, "remember", error_class(other)}
+    end
+  end
+
+  defp verify_completion_lookup(memory_id, base_url, timeout_ms, requester) do
+    result =
+      safe_request(
+        requester,
+        String.trim_trailing(base_url, "/") <>
+          "/agentmemory/memories/" <> URI.encode_www_form(memory_id),
+        completion_request_options(timeout_ms)
+      )
+
+    case result do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        if completion_memory_id(body) == memory_id do
+          :ok
+        else
+          {:error, "exact_lookup", "memory_id_mismatch"}
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, "exact_lookup", "http_#{status}"}
+
+      {:error, reason} ->
+        {:error, "exact_lookup", error_class(reason)}
+
+      other ->
+        {:error, "exact_lookup", error_class(other)}
+    end
+  end
+
+  defp verify_completion_search(issue, memory_id, base_url, timeout_ms, requester) do
+    result =
+      safe_request(
+        requester,
+        String.trim_trailing(base_url, "/") <> "/agentmemory/smart-search",
+        [
+          json: %{
+            query: "MANAfuel Symphony completion #{issue_identifier(issue)} #{memory_id}",
+            limit: @max_results
+          }
+        ] ++ completion_request_options(timeout_ms)
+      )
+
+    case result do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        items = list_field(body, "results") ++ list_field(body, "lessons")
+
+        if Enum.any?(items, &(completion_result_id(&1) == memory_id)) do
+          :ok
+        else
+          {:error, "smart_search", "memory_not_recalled"}
+        end
+
+      {:ok, %{status: status}} ->
+        {:error, "smart_search", "http_#{status}"}
+
+      {:error, reason} ->
+        {:error, "smart_search", error_class(reason)}
+
+      other ->
+        {:error, "smart_search", error_class(other)}
+    end
+  end
+
+  defp completion_request_options(timeout_ms) do
+    connect_timeout_ms = min(max(div(timeout_ms, 2), 1), 1_000)
+    receive_timeout_ms = max(timeout_ms - connect_timeout_ms, 1)
+
+    [
+      connect_options: [timeout: connect_timeout_ms],
+      receive_timeout: receive_timeout_ms,
+      retry: false
+    ]
+  end
+
+  defp completion_content(issue, completion_key) do
+    [
+      "MANAfuel Symphony completion outcome.",
+      "Ticket: #{issue_identifier(issue)}",
+      "Terminal state: #{safe_query_part(issue.state, 80)}",
+      "Completion key: #{completion_key}",
+      "Source: Symphony parent worker.",
+      "Raw ticket descriptions, logs, and credentials are intentionally omitted."
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp completion_concepts(issue) do
+    ["MANAfuel", "Symphony", "AgentMemory", "completion-save", issue_identifier(issue)]
+  end
+
+  defp completion_key(%Issue{} = issue) do
+    issue_key = issue.id || issue.identifier || "unknown"
+
+    updated_at =
+      case issue.updated_at do
+        %DateTime{} = value -> DateTime.to_iso8601(value)
+        value when is_binary(value) and value != "" -> value
+        _ -> "state:#{safe_query_part(issue.state, 80)}"
+      end
+
+    "#{issue_key}:#{updated_at}"
+  end
+
+  defp completion_ledger_path(opts) do
+    case Keyword.fetch(opts, :ledger_path) do
+      {:ok, explicit} when is_binary(explicit) and explicit != "" -> explicit
+      {:ok, _explicit} -> nil
+      :error -> configured_ledger_path()
+    end
+  end
+
+  defp completion_recorded?(path, completion_key) do
+    if File.regular?(path) do
+      path
+      |> File.stream!([], :line)
+      |> Enum.any?(&completion_record_matches?(&1, completion_key))
+    else
+      false
+    end
+  rescue
+    _exception -> false
+  end
+
+  defp completion_record_matches?(line, completion_key) do
+    case Jason.decode(line) do
+      {:ok, record} ->
+        record["event"] == "remember_completion" and
+          record["status"] == "ok" and
+          record["completion_key"] == completion_key
+
+      {:error, _reason} ->
+        false
+    end
+  end
+
+  defp write_completion_ledger(
+         issue,
+         path,
+         completion_key,
+         duration_ms,
+         status,
+         extra
+       ) do
+    recorded_at = DateTime.utc_now()
+
+    record =
+      %{
+        schema_version: 1,
+        source: "symphony_agentmemory",
+        function: "mem::remember",
+        event: "remember_completion",
+        status: status,
+        recorded_at: DateTime.to_iso8601(recorded_at),
+        date: Date.to_iso8601(DateTime.to_date(recorded_at)),
+        call_count: 1,
+        duration_ms: duration_ms,
+        issue_id: issue.id,
+        issue_identifier: issue.identifier,
+        issue_url: issue.url,
+        completion_key: completion_key
+      }
+      |> Map.merge(extra)
+
+    append_json_line(path, record)
+  end
+
+  defp completion_memory_id(body) when is_map(body) do
+    [
+      body,
+      body["memory"],
+      body[:memory],
+      body["data"],
+      body[:data],
+      body["result"],
+      body[:result]
+    ]
+    |> Enum.find_value(&map_id(&1, @memory_id_keys))
+  end
+
+  defp completion_memory_id(_body), do: nil
+
+  defp completion_result_id(item) when is_map(item) do
+    map_id(item, @result_id_keys)
+  end
+
+  defp completion_result_id(_item), do: nil
+
+  defp map_id(value, keys) when is_map(value) do
+    Enum.find_value(keys, &Map.get(value, &1))
+  end
+
+  defp map_id(_value, _keys), do: nil
 
   @spec append_context(String.t(), String.t() | nil) :: String.t()
   def append_context(prompt, nil) when is_binary(prompt), do: prompt
@@ -275,7 +610,7 @@ defmodule SymphonyElixir.AgentMemory do
       else
         {:error, reason} ->
           Logger.warning("Unable to append AgentMemory usage ledger error=#{error_class(reason)}")
-          :ok
+          {:error, :ledger_write_failed}
       end
     end)
   end
