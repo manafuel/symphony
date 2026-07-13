@@ -467,7 +467,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
-        refresh_blocked_issue_state(state, issue)
+        reconcile_active_blocked_issue(issue, state)
 
       true ->
         Logger.info("Blocked issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; releasing block")
@@ -476,6 +476,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp reconcile_active_blocked_issue(%Issue{} = issue, %State{} = state) do
+    case get_in(state.blocked, [issue.id, :block_kind]) do
+      :before_terminal ->
+        Logger.info("Terminal-blocked issue returned to an active state: #{issue_context(issue)} state=#{issue.state}; releasing claim and preserving workspace for redispatch")
+        release_issue_claim(state, issue.id)
+
+      _other ->
+        refresh_blocked_issue_state(state, issue)
+    end
+  end
 
   defp reconcile_terminal_blocked_issue(%Issue{} = issue, %State{} = state) do
     blocked_entry = Map.get(state.blocked, issue.id, %{})
@@ -506,9 +517,10 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       {:error, reason} ->
-        Logger.warning("Blocked issue failed terminal acceptance: #{issue_context(issue)} state=#{issue.state} reason=#{inspect(reason)}; preserving claim and workspace")
+        error = terminal_acceptance_error(reason)
+        Logger.warning("Blocked issue failed terminal acceptance: #{issue_context(issue)} state=#{issue.state} error=#{error}; preserving claim and workspace")
 
-        preserve_terminal_block(state, issue, blocked_entry, reason)
+        preserve_terminal_block(state, issue, blocked_entry, error)
     end
   end
 
@@ -615,7 +627,8 @@ defmodule SymphonyElixir.Orchestrator do
             |> release_issue_claim(issue.id)
 
           {:error, reason} ->
-            Logger.warning("Terminal acceptance failed for #{issue_context(issue)} reason=#{inspect(reason)}; preserving claim and workspace")
+            error = terminal_acceptance_error(reason)
+            Logger.warning("Terminal acceptance failed for #{issue_context(issue)} error=#{error}; preserving claim and workspace")
 
             terminal_entry =
               running_entry
@@ -626,20 +639,20 @@ defmodule SymphonyElixir.Orchestrator do
               state,
               issue.id,
               terminal_entry,
-              terminal_acceptance_error(reason)
+              error
             )
         end
     end
   end
 
-  defp preserve_terminal_block(%State{} = state, %Issue{} = issue, blocked_entry, reason)
+  defp preserve_terminal_block(%State{} = state, %Issue{} = issue, blocked_entry, error)
        when is_map(blocked_entry) do
     updated_entry =
       blocked_entry
       |> Map.put(:issue_id, issue.id)
       |> Map.put(:identifier, issue.identifier)
       |> Map.put(:issue, issue)
-      |> Map.put(:error, terminal_acceptance_error(reason))
+      |> Map.put(:error, error)
       |> Map.put(:block_kind, :before_terminal)
       |> schedule_terminal_retry()
 
@@ -651,8 +664,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminal_acceptance_error(reason) do
-    "before_terminal acceptance failed: #{inspect(reason)}"
+    "before_terminal acceptance failed: #{terminal_acceptance_error_code(reason)}"
   end
+
+  defp terminal_acceptance_error_code({:workspace_hook_failed, "before_terminal", status})
+       when is_integer(status),
+       do: "hook_failed_status_#{status}"
+
+  defp terminal_acceptance_error_code({:workspace_hook_failed, _hook_name, _status}),
+    do: "hook_failed"
+
+  defp terminal_acceptance_error_code({:workspace_hook_timeout, _hook_name, _timeout_ms}),
+    do: "hook_timeout"
+
+  defp terminal_acceptance_error_code({:workspace_hook_execution_failed, _hook_name, _reason}),
+    do: "hook_execution_failed"
+
+  defp terminal_acceptance_error_code({:remote_workspace_probe_failed, _reason}),
+    do: "remote_workspace_probe_failed"
+
+  defp terminal_acceptance_error_code({type, _rest}) when is_atom(type), do: Atom.to_string(type)
+  defp terminal_acceptance_error_code({type, _left, _right}) when is_atom(type), do: Atom.to_string(type)
+  defp terminal_acceptance_error_code(type) when is_atom(type), do: Atom.to_string(type)
+  defp terminal_acceptance_error_code(_reason), do: "unknown_error"
 
   defp terminal_retry_due?(blocked_entry) when is_map(blocked_entry) do
     case Map.get(blocked_entry, :terminal_retry_at_ms) do
@@ -1265,7 +1299,8 @@ defmodule SymphonyElixir.Orchestrator do
             {:noreply, release_issue_claim(state, issue_id)}
 
           {:error, reason} ->
-            Logger.warning("Issue failed terminal acceptance: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state} reason=#{inspect(reason)}; preserving claim and workspace")
+            error = terminal_acceptance_error(reason)
+            Logger.warning("Issue failed terminal acceptance: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state} error=#{error}; preserving claim and workspace")
 
             terminal_entry =
               metadata
@@ -1278,7 +1313,7 @@ defmodule SymphonyElixir.Orchestrator do
                state,
                issue_id,
                terminal_entry,
-               terminal_acceptance_error(reason)
+               error
              )}
         end
 
@@ -1333,7 +1368,8 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:error, reason} ->
-        Logger.warning("Startup terminal acceptance failed for #{issue_context(issue)} reason=#{inspect(reason)}; reconstructing claim and terminal block")
+        error = terminal_acceptance_error(reason)
+        Logger.warning("Startup terminal acceptance failed for #{issue_context(issue)} error=#{error}; reconstructing claim and terminal block")
 
         startup_entry = %{
           identifier: issue.identifier,
@@ -1347,7 +1383,7 @@ defmodule SymphonyElixir.Orchestrator do
           state,
           issue.id,
           startup_entry,
-          terminal_acceptance_error(reason)
+          error
         )
     end
   end

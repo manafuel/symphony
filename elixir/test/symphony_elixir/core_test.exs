@@ -1,6 +1,20 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  defmodule RedactedSnapshotServer do
+    use GenServer
+
+    def start_link(snapshot) do
+      GenServer.start_link(__MODULE__, snapshot, name: __MODULE__)
+    end
+
+    @impl true
+    def init(snapshot), do: {:ok, snapshot}
+
+    @impl true
+    def handle_call(:snapshot, _from, snapshot), do: {:reply, snapshot, snapshot}
+  end
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -371,10 +385,15 @@ defmodule SymphonyElixir.CoreTest do
     workspace = Path.join(workspace_root, issue_identifier)
     hook_script = Path.join(test_root, "terminal-block.exs")
     recovery_marker = Path.join(test_root, "terminal-recovered.log")
+    secret_sentinel = "sk_live_MAN176_SENTINEL"
 
     try do
       File.mkdir_p!(test_root)
-      File.write!(hook_script, "System.halt(19)\n")
+
+      File.write!(
+        hook_script,
+        "IO.write(String.duplicate(#{inspect(secret_sentinel)}, 1024)); System.halt(19)\n"
+      )
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -416,12 +435,50 @@ defmodule SymphonyElixir.CoreTest do
         updated_at: ~U[2026-07-13 13:00:00Z]
       }
 
-      blocked_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+      blocked_log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          blocked_state = Orchestrator.reconcile_issue_states_for_test([terminal_issue], state)
+          send(self(), {:terminal_blocked_state, blocked_state})
+        end)
+
+      assert_receive {:terminal_blocked_state, blocked_state}
 
       refute Map.has_key?(blocked_state.running, issue_id)
       assert MapSet.member?(blocked_state.claimed, issue_id)
       assert blocked_state.blocked[issue_id].block_kind == :before_terminal
+
+      assert blocked_state.blocked[issue_id].error ==
+               "before_terminal acceptance failed: hook_failed_status_19"
+
       refute Process.alive?(agent_pid)
+      assert File.dir?(workspace)
+      refute blocked_log =~ secret_sentinel
+      refute inspect(blocked_state) =~ secret_sentinel
+
+      {:reply, snapshot, _state} =
+        Orchestrator.handle_call(:snapshot, {self(), make_ref()}, blocked_state)
+
+      refute inspect(snapshot) =~ secret_sentinel
+
+      {:ok, snapshot_server} = RedactedSnapshotServer.start_link(snapshot)
+
+      on_exit(fn ->
+        if Process.alive?(snapshot_server), do: Process.exit(snapshot_server, :normal)
+      end)
+
+      api_payload =
+        SymphonyElixirWeb.Presenter.state_payload(RedactedSnapshotServer, 1_000)
+
+      refute inspect(api_payload) =~ secret_sentinel
+
+      reopened_state =
+        Orchestrator.reconcile_blocked_issue_states_for_test(
+          [%{terminal_issue | state: "In Progress"}],
+          blocked_state
+        )
+
+      refute MapSet.member?(reopened_state.claimed, issue_id)
+      refute Map.has_key?(reopened_state.blocked, issue_id)
       assert File.dir?(workspace)
 
       still_blocked =

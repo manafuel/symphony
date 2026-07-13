@@ -7,7 +7,6 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
-  @remote_terminal_workspace_missing_marker "__SYMPHONY_TERMINAL_WORKSPACE_MISSING__"
 
   @type worker_host :: String.t() | nil
 
@@ -307,44 +306,63 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        script =
-          [
-            remote_shell_assign("workspace", workspace),
-            "if [ ! -d \"$workspace\" ]; then",
-            "  printf '%s\\n' '#{@remote_terminal_workspace_missing_marker}'",
-            "  exit 0",
-            "fi",
-            "cd \"$workspace\"",
-            hook_environment_exports(issue_context),
-            command
-          ]
-          |> List.flatten()
-          |> Enum.join("\n")
-
-        worker_host
-        |> run_remote_command(script, Config.settings!().hooks.timeout_ms)
-        |> handle_remote_terminal_hook_result(workspace, issue_context)
+        run_remote_before_terminal_hook(command, workspace, issue_context, worker_host)
     end
   end
 
-  defp handle_remote_terminal_hook_result({:ok, {output, 0}}, _workspace, _issue_context) do
-    if String.contains?(output, @remote_terminal_workspace_missing_marker) do
-      :missing
-    else
-      :ok
+  defp run_remote_before_terminal_hook(command, workspace, issue_context, worker_host) do
+    case probe_remote_terminal_workspace(workspace, worker_host) do
+      :present ->
+        run_hook(command, workspace, issue_context, "before_terminal", worker_host)
+
+      :missing ->
+        :missing
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp handle_remote_terminal_hook_result({:ok, cmd_result}, workspace, issue_context) do
-    handle_hook_command_result(cmd_result, workspace, issue_context, "before_terminal")
+  @doc false
+  @spec classify_remote_terminal_workspace_probe_for_test(term()) ::
+          :present | :missing | {:error, term()}
+  def classify_remote_terminal_workspace_probe_for_test(result) do
+    classify_remote_terminal_workspace_probe(result)
   end
 
-  defp handle_remote_terminal_hook_result(
-         {:error, reason},
-         _workspace,
-         _issue_context
-       ),
-       do: {:error, reason}
+  defp probe_remote_terminal_workspace(workspace, worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "test -d \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    worker_host
+    |> run_remote_command(script, Config.settings!().hooks.timeout_ms)
+    |> classify_remote_terminal_workspace_probe()
+  end
+
+  defp classify_remote_terminal_workspace_probe(result) do
+    case result do
+      {:ok, {_output, 0}} ->
+        :present
+
+      {:ok, {_output, 1}} ->
+        :missing
+
+      {:ok, {_output, status}} ->
+        {:error, {:remote_workspace_probe_failed, status}}
+
+      {:error, reason} ->
+        {:error, {:remote_workspace_probe_failed, terminal_probe_error_code(reason)}}
+    end
+  end
+
+  defp terminal_probe_error_code({type, _rest}) when is_atom(type), do: type
+  defp terminal_probe_error_code({type, _left, _right}) when is_atom(type), do: type
+  defp terminal_probe_error_code(type) when is_atom(type), do: type
+  defp terminal_probe_error_code(_reason), do: :unknown
 
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.settings!().workspace.root
@@ -541,23 +559,11 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp handle_hook_command_result({output, status}, workspace, issue_context, hook_name) do
-    sanitized_output = sanitize_hook_output_for_log(output)
+    output_bytes = output |> IO.iodata_to_binary() |> byte_size()
 
-    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output=#{inspect(sanitized_output)}")
+    Logger.warning("Workspace hook failed hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} status=#{status} output_bytes=#{output_bytes} output_redacted=true")
 
-    {:error, {:workspace_hook_failed, hook_name, status, output}}
-  end
-
-  defp sanitize_hook_output_for_log(output, max_bytes \\ 2_048) do
-    binary_output = IO.iodata_to_binary(output)
-
-    case byte_size(binary_output) <= max_bytes do
-      true ->
-        binary_output
-
-      false ->
-        binary_part(binary_output, 0, max_bytes) <> "... (truncated)"
-    end
+    {:error, {:workspace_hook_failed, hook_name, status}}
   end
 
   defp validate_workspace_path(workspace, nil) when is_binary(workspace) do

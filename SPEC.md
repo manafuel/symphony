@@ -407,6 +407,12 @@ Fields:
   - An issue omitted from an otherwise successful batch refresh is not an authoritative terminal
     snapshot. Implementations MUST preserve terminal-acceptance claims and workspaces across empty
     or partial refreshes.
+  - An authoritative active-state snapshot MUST release a terminal-acceptance block without
+    deleting the workspace so normal remediation can be redispatched.
+  - Hook output MUST NOT be retained in orchestrator state, logs, status snapshots, or observability
+    responses. Failure records MUST contain only a bounded error code and non-secret metadata.
+  - Remote implementations MUST determine workspace absence independently of hook output. A hook
+    MUST NOT be able to spoof a missing workspace by printing a control marker.
   - Implementations MUST also apply this gate to terminal cleanup discovered by reconciliation,
     retry lookup, or startup cleanup. A failed startup cleanup MUST reconstruct a claimed,
     terminal-acceptance-blocked entry so the next authoritative refresh can recover safely.
@@ -731,8 +737,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
 - Failed startup terminal cleanup reconstructs `TerminalAcceptanceBlocked` state in memory.
-- Empty or partial tracker batches never release a terminal-acceptance block; only an authoritative
-  snapshot that passes the hook can release it.
+- Empty or partial tracker batches never release a terminal-acceptance block.
+- An authoritative terminal snapshot releases the block only after the hook passes. An
+  authoritative active-state snapshot releases the block without cleanup so remediation can resume.
 
 ## 8. Polling, Scheduling, and Reconciliation
 

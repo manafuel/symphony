@@ -204,7 +204,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         hook_after_create: "echo nope && exit 17"
       )
 
-      assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
+      assert {:error, {:workspace_hook_failed, "after_create", 17}} =
                Workspace.create_for_issue("MT-FAIL")
     after
       File.rm_rf(workspace_root)
@@ -776,13 +776,60 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue(issue)
 
-      assert {:error, {:workspace_hook_failed, "before_terminal", 17, _output}} =
+      assert {:error, {:workspace_hook_failed, "before_terminal", 17}} =
                Workspace.remove_terminal_issue_workspaces(issue)
 
       assert File.dir?(workspace)
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "before_terminal timeout preserves the workspace with a bounded error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-terminal-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = String.replace(Path.join(test_root, "workspaces"), "\\", "/")
+
+    try do
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_terminal: "sleep 1",
+        hook_timeout_ms: 10
+      )
+
+      issue = %Issue{
+        id: "issue-terminal-timeout",
+        identifier: "MT-TERMINAL-TIMEOUT",
+        title: "Timeout terminal cleanup",
+        state: "Done",
+        updated_at: ~U[2026-07-13 12:34:56Z]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert {:error, {:workspace_hook_timeout, "before_terminal", 10}} =
+               Workspace.remove_terminal_issue_workspaces(issue)
+
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote terminal workspace probe ignores marker text and uses exit status" do
+    old_marker = "__SYMPHONY_TERMINAL_WORKSPACE_MISSING__"
+
+    assert :present =
+             Workspace.classify_remote_terminal_workspace_probe_for_test({:ok, {old_marker <> "\n", 0}})
+
+    assert :missing =
+             Workspace.classify_remote_terminal_workspace_probe_for_test({:ok, {"", 1}})
   end
 
   test "before_terminal validates workspace containment before running the hook" do
@@ -1435,7 +1482,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.workflow_prompt() == workflow_prompt
   end
 
-  test "remote workspace lifecycle uses ssh host aliases from worker config" do
+  test "remote workspace lifecycle cannot spoof terminal absence with hook output" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1469,6 +1516,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         *"__SYMPHONY_WORKSPACE__"*)
           printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '#{workspace_path}'
           ;;
+        *"__SYMPHONY_TERMINAL_WORKSPACE_MISSING__"*)
+          printf '%s\\n' '__SYMPHONY_TERMINAL_WORKSPACE_MISSING__'
+          ;;
       esac
 
       exit 0
@@ -1480,7 +1530,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         workspace_root: workspace_root,
         worker_ssh_hosts: ["worker-01:2200"],
         hook_before_run: "echo before-run",
-        hook_before_terminal: "echo before-terminal",
+        hook_before_terminal: "printf '%s\\n' '__SYMPHONY_TERMINAL_WORKSPACE_MISSING__'",
         hook_after_run: "echo after-run",
         hook_before_remove: "echo before-remove"
       )
@@ -1508,7 +1558,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#~/}"
       assert trace =~ "echo before-run"
-      assert trace =~ "echo before-terminal"
+      assert trace =~ "__SYMPHONY_TERMINAL_WORKSPACE_MISSING__"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
       assert trace =~ "export SYMPHONY_ISSUE_ID='issue-ssh-workspace'"

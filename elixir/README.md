@@ -143,6 +143,10 @@ Notes:
   exponential backoff capped at 60 seconds; each attempt remains bounded by `hooks.timeout_ms`.
   Empty or partial tracker batches do not release a terminal block. If startup cleanup fails,
   Symphony reconstructs the claim and block so a later authoritative snapshot can retry safely.
+  An issue moved back to an active state releases the terminal block without deleting its workspace
+  so remediation can resume. Hook output is redacted from logs, blocked state, and observability;
+  only a bounded error code is retained. Remote workspace existence is probed separately from the
+  hook command, so hook output cannot imitate the missing-workspace control result.
 - Issue-aware hooks receive `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`,
   `SYMPHONY_ISSUE_TITLE`, `SYMPHONY_ISSUE_DESCRIPTION`, `SYMPHONY_ISSUE_LABELS`,
   `SYMPHONY_ISSUE_STATE`, and `SYMPHONY_ISSUE_UPDATED_AT`. The timestamp is the ISO 8601
