@@ -751,7 +751,9 @@ defmodule SymphonyElixir.AgentMemory do
 
   defp completion_state_transition(_state, %{
          "status" => "ok",
-         "saved_memory_id" => memory_id
+         "saved_memory_id" => memory_id,
+         "exact_lookup_verified" => true,
+         "search_verified" => true
        })
        when is_binary(memory_id) and memory_id != "",
        do: {:ok, memory_id}
@@ -864,7 +866,9 @@ defmodule SymphonyElixir.AgentMemory do
       event: "remember_completion",
       completion_key: completion_key,
       status: "ok",
-      saved_memory_id: memory_id
+      saved_memory_id: memory_id,
+      exact_lookup_verified: true,
+      search_verified: true
     }
   end
 

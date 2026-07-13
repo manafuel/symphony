@@ -235,6 +235,13 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert record["exact_lookup_verified"]
     assert record["search_verified"]
     assert record["completion_key"] == @completion_key
+
+    index_record =
+      ledger_path |> completion_index_path_for_test() |> File.read!() |> Jason.decode!()
+
+    assert index_record["exact_lookup_verified"] == true
+    assert index_record["search_verified"] == true
+
     assert Enum.all?(records, &(not Map.has_key?(&1, "content")))
     refute File.read!(ledger_path) =~ completion_issue().description
     refute File.read!(ledger_path) =~ auth_fixture
@@ -252,6 +259,87 @@ defmodule SymphonyElixir.AgentMemoryTest do
              )
 
     assert length(read_ledger(ledger_path)) == 3
+  end
+
+  test "bare and unverified ok ledger records fail closed instead of bypassing verification" do
+    records = [
+      %{
+        event: "remember_completion",
+        completion_key: @completion_key,
+        status: "ok",
+        saved_memory_id: "mem_bare_ok"
+      },
+      %{
+        event: "remember_completion",
+        completion_key: @completion_key,
+        status: "ok",
+        saved_memory_id: "mem_false_lookup",
+        exact_lookup_verified: false,
+        search_verified: true
+      },
+      %{
+        event: "remember_completion",
+        completion_key: @completion_key,
+        status: "ok",
+        saved_memory_id: "mem_false_search",
+        exact_lookup_verified: true,
+        search_verified: false
+      }
+    ]
+
+    for record <- records do
+      ledger_path = temp_ledger_path()
+      :ok = append_test_record(ledger_path, record)
+
+      assert {:error, :agentmemory_completion_failed} =
+               AgentMemory.remember_completion(completion_issue(),
+                 url: "http://127.0.0.1:3111",
+                 ledger_path: ledger_path,
+                 post_requester: fn _url, _opts ->
+                   flunk("unverified ok ledger record must not issue a remember POST")
+                 end,
+                 get_requester: fn _url, _opts ->
+                   flunk("unverified ok ledger record must not be treated as verified")
+                 end
+               )
+    end
+  end
+
+  test "bare and unverified ok completion indexes fail closed" do
+    records = [
+      %{
+        schema_version: 1,
+        event: "remember_completion",
+        completion_key: @completion_key,
+        status: "ok",
+        saved_memory_id: "mem_bare_index"
+      },
+      %{
+        schema_version: 1,
+        event: "remember_completion",
+        completion_key: @completion_key,
+        status: "ok",
+        saved_memory_id: "mem_unverified_index",
+        exact_lookup_verified: true,
+        search_verified: false
+      }
+    ]
+
+    for record <- records do
+      ledger_path = temp_ledger_path()
+      index_path = completion_index_path_for_test(ledger_path)
+      File.mkdir_p!(Path.dirname(index_path))
+      File.write!(ledger_path, "")
+      File.write!(index_path, Jason.encode!(record) <> "\n")
+
+      assert {:error, :agentmemory_completion_failed} =
+               AgentMemory.remember_completion(completion_issue(),
+                 url: "http://127.0.0.1:3111",
+                 ledger_path: ledger_path,
+                 post_requester: fn _url, _opts -> flunk("unverified ok index must not POST") end,
+                 get_requester: fn _url, _opts -> flunk("unverified ok index must not verify") end
+               )
+    end
   end
 
   test "concurrent completion calls serialize the full transaction and issue one remember POST" do
@@ -610,7 +698,9 @@ defmodule SymphonyElixir.AgentMemoryTest do
         event: "remember_completion",
         status: "ok",
         completion_key: @completion_key,
-        saved_memory_id: "mem_bounded_tail"
+        saved_memory_id: "mem_bounded_tail",
+        exact_lookup_verified: true,
+        search_verified: true
       })
 
     assert {:ok, :already_recorded} =
@@ -723,6 +813,15 @@ defmodule SymphonyElixir.AgentMemoryTest do
     |> File.read!()
     |> String.split("\n", trim: true)
     |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp completion_index_path_for_test(ledger_path) do
+    digest =
+      :sha256
+      |> :crypto.hash(@completion_key)
+      |> Base.encode16(case: :lower)
+
+    Path.join(ledger_path <> ".completion-index", digest <> ".json")
   end
 
   defp append_test_record(path, record) do
