@@ -147,6 +147,8 @@ Notes:
   so remediation can resume. Hook output is redacted from logs, blocked state, and observability;
   only a bounded error code is retained. Remote workspace existence is probed separately from the
   hook command, so hook output cannot imitate the missing-workspace control result.
+  Scheduled retries refresh their claimed issue directly by ID, including terminal states, before
+  deciding whether to run the gate or release the claim.
 - Issue-aware hooks receive `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`,
   `SYMPHONY_ISSUE_TITLE`, `SYMPHONY_ISSUE_DESCRIPTION`, `SYMPHONY_ISSUE_LABELS`,
   `SYMPHONY_ISSUE_STATE`, and `SYMPHONY_ISSUE_UPDATED_AT`. The timestamp is the ISO 8601

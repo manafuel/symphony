@@ -416,6 +416,8 @@ Fields:
   - Implementations MUST also apply this gate to terminal cleanup discovered by reconciliation,
     retry lookup, or startup cleanup. A failed startup cleanup MUST reconstruct a claimed,
     terminal-acceptance-blocked entry so the next authoritative refresh can recover safely.
+  - Retry lookup MUST refresh the claimed issue by ID without an active-state filter before
+    deciding that it is missing or releasable.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.

@@ -555,7 +555,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(empty_state.blocked, issue_b.id)
   end
 
-  test "terminal retry lookup preserves claim and workspace when hook blocks" do
+  test "scheduled retry fetches terminal issue by id and gates failure and success" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -564,25 +564,39 @@ defmodule SymphonyElixir.CoreTest do
 
     issue_id = "issue-terminal-retry-block"
     issue_identifier = "MT-TERMINAL-RETRY"
-    workspace = Path.join(test_root, issue_identifier)
+    workspace_root = String.replace(test_root, "\\", "/")
+    workspace = Path.join(workspace_root, issue_identifier)
     hook_script = Path.join(test_root, "terminal-retry-block.exs")
+    success_marker = Path.join(test_root, "terminal-retry-success.log")
+    previous_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    previous_recipient = Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    on_exit(fn ->
+      if is_nil(previous_issues) do
+        Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+      else
+        Application.put_env(:symphony_elixir, :memory_tracker_issues, previous_issues)
+      end
+
+      if is_nil(previous_recipient) do
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+      else
+        Application.put_env(:symphony_elixir, :memory_tracker_recipient, previous_recipient)
+      end
+    end)
 
     try do
       File.mkdir_p!(test_root)
       File.write!(hook_script, "System.halt(23)\n")
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: test_root,
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
         tracker_terminal_states: ["Done"],
         hook_before_terminal: "elixir \"#{hook_script}\""
       )
 
       File.mkdir_p!(workspace)
-
-      state = %Orchestrator.State{
-        claimed: MapSet.new([issue_id]),
-        retry_attempts: %{}
-      }
 
       terminal_issue = %Issue{
         id: issue_id,
@@ -592,16 +606,61 @@ defmodule SymphonyElixir.CoreTest do
         updated_at: ~U[2026-07-13 13:01:00Z]
       }
 
-      blocked_state =
-        Orchestrator.handle_retry_issue_lookup_for_test(terminal_issue, state, issue_id, 1, %{
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      retry_entry = fn retry_token ->
+        %{
+          attempt: 1,
+          retry_token: retry_token,
+          due_at_ms: System.monotonic_time(:millisecond),
           identifier: issue_identifier,
           workspace_path: workspace,
           worker_host: nil
-        })
+        }
+      end
 
+      blocked_token = make_ref()
+
+      blocked_input = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{issue_id => retry_entry.(blocked_token)}
+      }
+
+      assert {:noreply, blocked_state} =
+               Orchestrator.handle_info(
+                 {:retry_issue, issue_id, blocked_token},
+                 blocked_input
+               )
+
+      assert_receive {:memory_tracker_fetch_by_ids, [^issue_id]}
       assert MapSet.member?(blocked_state.claimed, issue_id)
       assert blocked_state.blocked[issue_id].block_kind == :before_terminal
       assert File.dir?(workspace)
+
+      File.write!(
+        hook_script,
+        "File.write!(#{inspect(success_marker)}, \"accepted\\n\")\n"
+      )
+
+      accepted_token = make_ref()
+
+      accepted_input = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{issue_id => retry_entry.(accepted_token)}
+      }
+
+      assert {:noreply, accepted_state} =
+               Orchestrator.handle_info(
+                 {:retry_issue, issue_id, accepted_token},
+                 accepted_input
+               )
+
+      assert_receive {:memory_tracker_fetch_by_ids, [^issue_id]}
+      refute MapSet.member?(accepted_state.claimed, issue_id)
+      refute Map.has_key?(accepted_state.blocked, issue_id)
+      refute File.exists?(workspace)
+      assert File.read!(success_marker) == "accepted\n"
     after
       File.rm_rf(test_root)
     end
