@@ -690,6 +690,94 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "unverified ok ledger state cannot release terminal closeout" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-unverified-closeout-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-unverified-closeout"
+    issue_identifier = "MT-UNVERIFIED-CLOSEOUT"
+    ledger_path = Path.join(test_root, "memory-usage.jsonl")
+    workspace = Path.join(test_root, issue_identifier)
+    parent = self()
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_terminal_states: ["Done"]
+      )
+
+      File.mkdir_p!(workspace)
+
+      File.write!(
+        ledger_path,
+        Jason.encode!(%{
+          event: "remember_completion",
+          completion_key: "issue:#{issue_id}",
+          status: "ok",
+          saved_memory_id: "mem_unverified_closeout"
+        }) <> "\n"
+      )
+
+      Application.put_env(
+        :symphony_elixir,
+        :agentmemory_completion_saver,
+        fn issue ->
+          SymphonyElixir.AgentMemory.remember_completion(issue,
+            url: "http://127.0.0.1:3111",
+            ledger_path: ledger_path,
+            post_requester: fn _url, _opts ->
+              flunk("unverified ok closeout must not issue a remember POST")
+            end,
+            get_requester: fn _url, _opts ->
+              flunk("unverified ok closeout must not be treated as verified")
+            end
+          )
+        end
+      )
+
+      Application.put_env(
+        :symphony_elixir,
+        :agentmemory_completion_blocker,
+        fn issue, error_class ->
+          send(parent, {:unverified_closeout_blocked, issue.id, error_class})
+          :ok
+        end
+      )
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:02:30Z]
+      }
+
+      state = %Orchestrator.State{claimed: MapSet.new([issue_id]), retry_attempts: %{}}
+
+      blocked_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+          identifier: issue_identifier
+        })
+
+      assert_receive {:unverified_closeout_blocked, ^issue_id, :agentmemory_completion_failed}
+      assert MapSet.member?(blocked_state.claimed, issue_id)
+      assert Map.has_key?(blocked_state.blocked, issue_id)
+      assert File.exists?(workspace)
+    after
+      File.rm_rf(test_root)
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+    end
+  end
+
   test "default completion blocker moves the ticket to Human Review" do
     previous_saver =
       Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
