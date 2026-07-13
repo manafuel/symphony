@@ -254,6 +254,65 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert length(read_ledger(ledger_path)) == 3
   end
 
+  test "concurrent completion calls serialize the full transaction and issue one remember POST" do
+    ledger_path = temp_ledger_path()
+    parent = self()
+
+    post_requester = fn url, _opts ->
+      cond do
+        String.ends_with?(url, "/agentmemory/remember") ->
+          send(parent, {:concurrent_remember_posted, self()})
+
+          receive do
+            :release_concurrent_remember -> :ok
+          end
+
+          {:ok,
+           %Req.Response{
+             status: 201,
+             body: %{"memory" => %{"id" => "mem_concurrent_completion"}}
+           }}
+
+        String.ends_with?(url, "/agentmemory/smart-search") ->
+          {:ok,
+           %Req.Response{
+             status: 200,
+             body: %{"results" => [%{"obsId" => "mem_concurrent_completion"}]}
+           }}
+      end
+    end
+
+    opts = [
+      url: "http://127.0.0.1:3111",
+      ledger_path: ledger_path,
+      post_requester: post_requester,
+      get_requester: fn _url, _opts ->
+        {:ok,
+         %Req.Response{
+           status: 200,
+           body: %{"memory" => %{"id" => "mem_concurrent_completion"}}
+         }}
+      end
+    ]
+
+    first = Task.async(fn -> AgentMemory.remember_completion(completion_issue(), opts) end)
+    assert_receive {:concurrent_remember_posted, first_requester}
+
+    second = Task.async(fn -> AgentMemory.remember_completion(completion_issue(), opts) end)
+    refute_receive {:concurrent_remember_posted, _other_requester}, 100
+
+    send(first_requester, :release_concurrent_remember)
+
+    assert {:ok, "mem_concurrent_completion"} = Task.await(first)
+    assert {:ok, :already_recorded} = Task.await(second)
+    refute_receive {:concurrent_remember_posted, _other_requester}
+
+    records = read_ledger(ledger_path)
+    assert Enum.count(records, &(&1["status"] == "intent")) == 1
+    assert Enum.count(records, &(&1["status"] == "pending")) == 1
+    assert Enum.count(records, &(&1["status"] == "ok")) == 1
+  end
+
   test "completion save failure records only a sanitized error class" do
     ledger_path = temp_ledger_path()
 

@@ -65,7 +65,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    state = run_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -369,6 +369,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec recover_terminal_issues_for_test([Issue.t()], State.t()) :: State.t()
+  def recover_terminal_issues_for_test(issues, %State{} = state) when is_list(issues) do
+    recover_terminal_issues(issues, state)
   end
 
   @doc false
@@ -1421,22 +1427,38 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.get(:worker_host)
   end
 
-  defp run_terminal_workspace_cleanup do
+  defp run_terminal_workspace_cleanup(%State{} = state) do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
-
-          _ ->
-            :ok
-        end)
+        recover_terminal_issues(issues, state)
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        state
     end
   end
+
+  defp recover_terminal_issues(issues, %State{} = state) when is_list(issues) do
+    Enum.reduce(issues, state, &recover_terminal_issue/2)
+  end
+
+  defp recover_terminal_issue(%Issue{} = issue, %State{} = state) do
+    case maybe_remember_completion(issue) do
+      result when result in [:ok, :skip] ->
+        cleanup_issue_workspace(issue.identifier)
+        state
+
+      {:error, error_class} ->
+        block_completion_from_metadata(
+          state,
+          issue,
+          %{identifier: issue.identifier},
+          error_class
+        )
+    end
+  end
+
+  defp recover_terminal_issue(_issue, %State{} = state), do: state
 
   defp notify_dashboard do
     StatusDashboard.notify_update()

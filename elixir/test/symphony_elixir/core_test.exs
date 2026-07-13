@@ -384,6 +384,105 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "startup recovery resumes intent and pending completion states before workspace cleanup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-completion-startup-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    parent = self()
+
+    issues = [
+      %Issue{
+        id: "issue-startup-intent",
+        identifier: "MT-STARTUP-INTENT",
+        state: "Done",
+        title: "Recover intent"
+      },
+      %Issue{
+        id: "issue-startup-pending",
+        identifier: "MT-STARTUP-PENDING",
+        state: "Done",
+        title: "Recover pending"
+      },
+      %Issue{
+        id: "issue-startup-failed",
+        identifier: "MT-STARTUP-FAILED",
+        state: "Done",
+        title: "Retain failed"
+      }
+    ]
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_terminal_states: ["Done"]
+      )
+
+      for issue <- issues do
+        File.mkdir_p!(Path.join(test_root, issue.identifier))
+      end
+
+      Application.put_env(
+        :symphony_elixir,
+        :agentmemory_completion_saver,
+        fn issue ->
+          recovery_state =
+            case issue.identifier do
+              "MT-STARTUP-INTENT" -> :intent
+              "MT-STARTUP-PENDING" -> :pending
+              "MT-STARTUP-FAILED" -> :failed
+            end
+
+          send(parent, {:startup_completion_resumed, recovery_state, issue.id})
+
+          case recovery_state do
+            :intent -> {:ok, "mem_startup_intent"}
+            :pending -> {:ok, :already_recorded}
+            :failed -> {:error, :agentmemory_completion_failed}
+          end
+        end
+      )
+
+      Application.put_env(
+        :symphony_elixir,
+        :agentmemory_completion_blocker,
+        fn issue, error_class ->
+          send(parent, {:startup_completion_blocked, issue.id, error_class})
+          :ok
+        end
+      )
+
+      recovered_state =
+        Orchestrator.recover_terminal_issues_for_test(issues, %Orchestrator.State{})
+
+      assert_receive {:startup_completion_resumed, :intent, "issue-startup-intent"}
+      assert_receive {:startup_completion_resumed, :pending, "issue-startup-pending"}
+      assert_receive {:startup_completion_resumed, :failed, "issue-startup-failed"}
+      assert_receive {:startup_completion_blocked, "issue-startup-failed", :agentmemory_completion_failed}
+
+      refute File.exists?(Path.join(test_root, "MT-STARTUP-INTENT"))
+      refute File.exists?(Path.join(test_root, "MT-STARTUP-PENDING"))
+      assert File.exists?(Path.join(test_root, "MT-STARTUP-FAILED"))
+
+      assert MapSet.member?(recovered_state.claimed, "issue-startup-failed")
+      assert recovered_state.blocked["issue-startup-failed"].identifier == "MT-STARTUP-FAILED"
+      refute MapSet.member?(recovered_state.claimed, "issue-startup-intent")
+      refute MapSet.member?(recovered_state.claimed, "issue-startup-pending")
+    after
+      File.rm_rf(test_root)
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+    end
+  end
+
   test "completed terminal issue saves AgentMemory outcome before release" do
     previous_saver =
       Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
