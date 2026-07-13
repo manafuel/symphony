@@ -397,6 +397,12 @@ Fields:
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
   - Failure aborts the current attempt.
+- `before_terminal` (multiline shell script string, OPTIONAL)
+  - Runs after a refreshed tracker snapshot enters a configured terminal state and before Symphony
+    removes the issue workspace or releases its claim.
+  - Failure blocks terminal acceptance and preserves the claim and workspace for recovery.
+  - Implementations MUST also apply this gate to terminal cleanup discovered by reconciliation,
+    retry lookup, or startup cleanup.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -409,6 +415,19 @@ Fields:
   - Applies to all workspace hooks.
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
+
+Hooks that receive an issue snapshot expose these environment variables:
+
+- `SYMPHONY_ISSUE_ID`
+- `SYMPHONY_ISSUE_IDENTIFIER`
+- `SYMPHONY_ISSUE_TITLE`
+- `SYMPHONY_ISSUE_DESCRIPTION`
+- `SYMPHONY_ISSUE_LABELS` (comma-separated label names)
+- `SYMPHONY_ISSUE_STATE`
+- `SYMPHONY_ISSUE_UPDATED_AT` (ISO 8601 with the tracker snapshot's precision)
+
+The `before_terminal` values MUST come from the terminal snapshot being accepted, not the
+pre-run snapshot.
 
 #### 5.3.5 `agent` (object)
 
@@ -586,6 +605,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
+- `hooks.before_terminal`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
@@ -872,6 +892,7 @@ Supported hooks:
 
 - `hooks.after_create`
 - `hooks.before_run`
+- `hooks.before_terminal`
 - `hooks.after_run`
 - `hooks.before_remove`
 
@@ -888,6 +909,8 @@ Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
+- `before_terminal` failure or timeout blocks terminal acceptance; the claim and workspace remain
+  available for recovery and MUST NOT be removed by a concurrent or startup cleanup path.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 
@@ -1975,6 +1998,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - OPTIONAL workspace population/synchronization errors are surfaced
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
+- `before_terminal` hook receives the refreshed terminal issue snapshot; success permits workspace
+  cleanup and claim release, while failure preserves both across reconciliation, retry lookup, and
+  startup cleanup paths
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
@@ -2090,7 +2116,7 @@ Use the same validation profiles as Section 17:
 - Polling orchestrator with single-authority mutable state
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
-- Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
+- Workspace lifecycle hooks (`after_create`, `before_run`, `before_terminal`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)

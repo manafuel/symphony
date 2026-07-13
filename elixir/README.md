@@ -136,6 +136,17 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Use `hooks.before_terminal` for read-only acceptance checks that must pass before Symphony
+  removes a terminal issue's workspace and releases its claim. A nonzero exit or timeout preserves
+  both for recovery. The gate also applies when terminal state is observed by reconciliation,
+  retry lookup, or startup cleanup.
+- Issue-aware hooks receive `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`,
+  `SYMPHONY_ISSUE_TITLE`, `SYMPHONY_ISSUE_DESCRIPTION`, `SYMPHONY_ISSUE_LABELS`,
+  `SYMPHONY_ISSUE_STATE`, and `SYMPHONY_ISSUE_UPDATED_AT`. The timestamp is the ISO 8601
+  tracker snapshot used for that hook.
+- Local hooks use Git Bash on Windows when it is installed alongside Git, preserving the hook
+  shell-script contract; they fall back to PowerShell when Git Bash is unavailable. POSIX hosts
+  use `sh`, and remote SSH hooks use the remote POSIX shell.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

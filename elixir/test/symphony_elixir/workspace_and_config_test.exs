@@ -687,6 +687,143 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "before_terminal hook receives the terminal issue snapshot before cleanup" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-terminal-hook-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      snapshot_path = Path.join(test_root, "terminal-snapshot.txt")
+      hook_script = Path.join(test_root, "terminal-snapshot.exs")
+
+      File.mkdir_p!(workspace_root)
+
+      File.write!(hook_script, """
+      values = [
+        System.get_env("SYMPHONY_ISSUE_ID"),
+        System.get_env("SYMPHONY_ISSUE_IDENTIFIER"),
+        System.get_env("SYMPHONY_ISSUE_TITLE"),
+        System.get_env("SYMPHONY_ISSUE_DESCRIPTION"),
+        System.get_env("SYMPHONY_ISSUE_LABELS"),
+        System.get_env("SYMPHONY_ISSUE_STATE"),
+        System.get_env("SYMPHONY_ISSUE_UPDATED_AT")
+      ]
+      File.write!(#{inspect(snapshot_path)}, Enum.join(values, "\\n") <> "\\n")
+      """)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_terminal: "elixir \"#{hook_script}\""
+      )
+
+      issue = %Issue{
+        id: "issue-terminal-snapshot",
+        identifier: "MT-TERMINAL-SNAPSHOT",
+        title: "Verify terminal proof",
+        description: "Evidence is complete.",
+        labels: ["symphony", "proof-ready"],
+        state: "Done",
+        updated_at: ~U[2026-07-13 12:34:56.123456Z]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert :ok = Workspace.remove_terminal_issue_workspaces(issue)
+      refute File.exists?(workspace)
+
+      assert String.split(String.trim(File.read!(snapshot_path)), "\n") == [
+               "issue-terminal-snapshot",
+               "MT-TERMINAL-SNAPSHOT",
+               "Verify terminal proof",
+               "Evidence is complete.",
+               "symphony,proof-ready",
+               "Done",
+               "2026-07-13T12:34:56.123456Z"
+             ]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "before_terminal hook failure preserves the workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-terminal-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      hook_script = Path.join(test_root, "terminal-block.exs")
+      File.mkdir_p!(workspace_root)
+
+      File.write!(hook_script, "System.halt(17)\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_terminal: "elixir \"#{hook_script}\""
+      )
+
+      issue = %Issue{
+        id: "issue-terminal-block",
+        identifier: "MT-TERMINAL-BLOCK",
+        title: "Blocked terminal cleanup",
+        state: "Done",
+        updated_at: ~U[2026-07-13 12:34:56Z]
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+      assert {:error, {:workspace_hook_failed, "before_terminal", 17, _output}} =
+               Workspace.remove_terminal_issue_workspaces(issue)
+
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "before_terminal validates workspace containment before running the hook" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-terminal-containment-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      outside_workspace = Path.join(test_root, "outside")
+      hook_marker = Path.join(test_root, "hook-ran.log")
+      hook_script = Path.join(test_root, "terminal-marker.exs")
+
+      File.mkdir_p!(workspace_root)
+      File.mkdir_p!(outside_workspace)
+      File.write!(hook_script, "File.write!(#{inspect(hook_marker)}, \"ran\\n\")\n")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_terminal: "elixir \"#{hook_script}\""
+      )
+
+      issue = %Issue{
+        id: "issue-terminal-containment",
+        identifier: "MT-TERMINAL-CONTAINMENT",
+        state: "Done",
+        updated_at: ~U[2026-07-13 12:34:56Z]
+      }
+
+      assert {:error, {:workspace_outside_root, _workspace, _root}} =
+               Workspace.remove_terminal_issue_workspace(outside_workspace, issue)
+
+      assert File.dir?(outside_workspace)
+      refute File.exists?(hook_marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace remove continues when before_remove hook fails" do
     test_root =
       Path.join(
@@ -1343,16 +1480,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         workspace_root: workspace_root,
         worker_ssh_hosts: ["worker-01:2200"],
         hook_before_run: "echo before-run",
+        hook_before_terminal: "echo before-terminal",
         hook_after_run: "echo after-run",
         hook_before_remove: "echo before-remove"
       )
 
+      issue = %Issue{
+        id: "issue-ssh-workspace",
+        identifier: "MT-SSH-WS",
+        title: "Remote hook snapshot",
+        description: "Verify remote issue context.",
+        labels: ["symphony", "remote"],
+        state: "Done",
+        updated_at: ~U[2026-07-13 14:00:00.123456Z]
+      }
+
       assert Config.settings!().worker.ssh_hosts == ["worker-01:2200"]
       assert Config.settings!().workspace.root == workspace_root
-      assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
-      assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
+      assert {:ok, ^workspace_path} = Workspace.create_for_issue(issue, "worker-01:2200")
+      assert :ok = Workspace.run_before_run_hook(workspace_path, issue, "worker-01:2200")
+      assert :ok = Workspace.run_after_run_hook(workspace_path, issue, "worker-01:2200")
+      assert :ok = Workspace.remove_terminal_issue_workspace(workspace_path, issue, "worker-01:2200")
 
       trace = File.read!(trace_file)
       assert trace =~ "-p 2200 worker-01 bash -lc"
@@ -1360,8 +1508,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "~/.symphony-remote-workspaces/MT-SSH-WS"
       assert trace =~ "${workspace#~/}"
       assert trace =~ "echo before-run"
+      assert trace =~ "echo before-terminal"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
+      assert trace =~ "export SYMPHONY_ISSUE_ID='issue-ssh-workspace'"
+      assert trace =~ "export SYMPHONY_ISSUE_IDENTIFIER='MT-SSH-WS'"
+      assert trace =~ "export SYMPHONY_ISSUE_STATE='Done'"
+      assert trace =~ "export SYMPHONY_ISSUE_UPDATED_AT='2026-07-13T14:00:00.123456Z'"
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path
     after
