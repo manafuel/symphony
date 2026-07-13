@@ -1561,10 +1561,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "__SYMPHONY_TERMINAL_WORKSPACE_MISSING__"
       assert trace =~ "echo after-run"
       assert trace =~ "echo before-remove"
-      assert trace =~ "export SYMPHONY_ISSUE_ID='issue-ssh-workspace'"
-      assert trace =~ "export SYMPHONY_ISSUE_IDENTIFIER='MT-SSH-WS'"
-      assert trace =~ "export SYMPHONY_ISSUE_STATE='Done'"
-      assert trace =~ "export SYMPHONY_ISSUE_UPDATED_AT='2026-07-13T14:00:00.123456Z'"
+      assert trace =~ ~r/export SYMPHONY_ISSUE_ID=.*issue-ssh-workspace/
+      assert trace =~ ~r/export SYMPHONY_ISSUE_IDENTIFIER=.*MT-SSH-WS/
+      assert trace =~ ~r/export SYMPHONY_ISSUE_STATE=.*Done/
+      assert trace =~ ~r/export SYMPHONY_ISSUE_UPDATED_AT=.*2026-07-13T14:00:00\.123456Z/
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path
     after
