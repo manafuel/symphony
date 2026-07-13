@@ -72,30 +72,13 @@ defmodule SymphonyElixir.AgentMemory do
 
       true ->
         with_completion_lock(ledger_path, completion_key, fn ->
-          case completion_ledger_state(ledger_path, completion_key, opts) do
-            {:ok, _memory_id} ->
-              {:ok, :already_recorded}
-
-            {:pending, memory_id} ->
-              resume_pending_completion(
-                issue,
-                base_url,
-                ledger_path,
-                completion_key,
-                memory_id,
-                opts
-              )
-
-            :intent ->
-              recover_completion_intent(issue, base_url, ledger_path, completion_key, opts)
-
-            :none ->
-              start_completion(issue, base_url, ledger_path, completion_key, opts)
-
-            {:error, _reason} ->
-              Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=ledger_read_failed")
-              {:error, :agentmemory_completion_failed}
-          end
+          remember_completion_from_ledger(
+            issue,
+            base_url,
+            ledger_path,
+            completion_key,
+            opts
+          )
         end)
     end
   rescue
@@ -108,6 +91,33 @@ defmodule SymphonyElixir.AgentMemory do
       Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=#{kind}")
 
       {:error, :agentmemory_completion_failed}
+  end
+
+  defp remember_completion_from_ledger(issue, base_url, ledger_path, completion_key, opts) do
+    case completion_ledger_state(ledger_path, completion_key, opts) do
+      {:ok, _memory_id} ->
+        {:ok, :already_recorded}
+
+      {:pending, memory_id} ->
+        resume_pending_completion(
+          issue,
+          base_url,
+          ledger_path,
+          completion_key,
+          memory_id,
+          opts
+        )
+
+      :intent ->
+        recover_completion_intent(issue, base_url, ledger_path, completion_key, opts)
+
+      :none ->
+        start_completion(issue, base_url, ledger_path, completion_key, opts)
+
+      {:error, _reason} ->
+        Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=ledger_read_failed")
+        {:error, :agentmemory_completion_failed}
+    end
   end
 
   defp with_completion_lock(ledger_path, completion_key, operation) do
