@@ -687,6 +687,83 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "before_terminal hook receives the immutable issue snapshot and fails closed" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-before-terminal-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    workspace = Path.join(test_root, "MAN-176")
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_before_terminal:
+          "printf '%s' \"$SYMPHONY_ISSUE_ID|$SYMPHONY_ISSUE_IDENTIFIER|$SYMPHONY_ISSUE_TITLE|$SYMPHONY_ISSUE_DESCRIPTION|$SYMPHONY_ISSUE_LABELS|$SYMPHONY_ISSUE_STATE|$SYMPHONY_ISSUE_UPDATED_AT\" > terminal.env"
+      )
+
+      updated_at = DateTime.from_naive!(~N[2026-07-13 12:34:56.123456], "Etc/UTC")
+
+      issue = %SymphonyElixir.Linear.Issue{
+        id: "issue-176",
+        identifier: "MAN-176",
+        title: "SEO proof",
+        description: "Bind the snapshot",
+        labels: ["codex-agent-ready", "owner:growth-marketing-system"],
+        state: "Done",
+        updated_at: updated_at
+      }
+
+      assert :ok = Workspace.run_before_terminal_hook(workspace, issue)
+
+      assert File.read!(Path.join(workspace, "terminal.env")) ==
+               "issue-176|MAN-176|SEO proof|Bind the snapshot|codex-agent-ready,owner:growth-marketing-system|Done|2026-07-13T12:34:56.123456Z"
+
+      exact_fetcher = fn ["issue-176"] -> {:ok, [issue]} end
+
+      assert :ok =
+               Workspace.verify_before_terminal(
+                 workspace,
+                 issue,
+                 nil,
+                 exact_fetcher
+               )
+
+      drifted_issue = %{issue | updated_at: DateTime.add(updated_at, 1, :microsecond)}
+      drifted_fetcher = fn ["issue-176"] -> {:ok, [drifted_issue]} end
+
+      assert {:error, :issue_updated_after_hook} =
+               Workspace.verify_before_terminal(
+                 workspace,
+                 issue,
+                 nil,
+                 drifted_fetcher
+               )
+
+      assert {:ok, derived_workspace} = Workspace.existing_issue_workspace(issue)
+      assert Path.expand(derived_workspace) == Path.expand(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_before_terminal: "exit 23"
+      )
+
+      assert {:error, reason} = Workspace.run_before_terminal_hook(workspace, issue)
+
+      assert reason in [:hook_failed, :hook_task_exit] or
+               match?({:hook_exit, _status}, reason)
+
+      File.rm_rf!(workspace)
+      assert :missing = Workspace.existing_issue_workspace(issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace remove continues when before_remove hook fails" do
     test_root =
       Path.join(

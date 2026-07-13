@@ -17,6 +17,25 @@ defmodule SymphonyElixir.AgentRunner do
     continue_with_issue?(issue, issue_state_fetcher)
   end
 
+  @doc false
+  @spec verify_terminal_state_for_test(
+          Path.t(),
+          Issue.t(),
+          pid() | nil,
+          worker_host(),
+          ([String.t()] -> term())
+        ) ::
+          :ok | {:error, term()}
+  def verify_terminal_state_for_test(
+        workspace,
+        %Issue{} = issue,
+        recipient \\ nil,
+        worker_host \\ nil,
+        issue_state_fetcher \\ &Tracker.fetch_issue_states_by_ids/1
+      ) do
+    verify_terminal_state(workspace, issue, recipient, worker_host, issue_state_fetcher)
+  end
+
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
@@ -90,14 +109,14 @@ defmodule SymphonyElixir.AgentRunner do
 
     with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, worker_host, 1, max_turns)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, worker_host, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
@@ -120,6 +139,7 @@ defmodule SymphonyElixir.AgentRunner do
             codex_update_recipient,
             opts,
             issue_state_fetcher,
+            worker_host,
             turn_number + 1,
             max_turns
           )
@@ -129,8 +149,18 @@ defmodule SymphonyElixir.AgentRunner do
 
           :ok
 
-        {:done, _refreshed_issue} ->
-          :ok
+        {:done, refreshed_issue} ->
+          if terminal_issue_state?(refreshed_issue.state) do
+            verify_terminal_state(
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              worker_host,
+              issue_state_fetcher
+            )
+          else
+            :ok
+          end
 
         {:error, reason} ->
           {:error, reason}
@@ -162,7 +192,7 @@ defmodule SymphonyElixir.AgentRunner do
         end
 
       {:ok, []} ->
-        {:done, issue}
+        {:error, {:issue_state_missing, issue.id}}
 
       {:error, reason} ->
         {:error, {:issue_state_refresh_failed, reason}}
@@ -170,6 +200,49 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp verify_terminal_state(
+         workspace,
+         %Issue{} = issue,
+         recipient,
+         worker_host,
+         issue_state_fetcher
+       ) do
+    case Workspace.verify_before_terminal(workspace, issue, worker_host, issue_state_fetcher) do
+      :ok ->
+        notify_terminal_state_pass(recipient, issue)
+
+      {:error, reason} ->
+        safe_reason = Workspace.sanitize_terminal_verification_reason(reason)
+        notify_terminal_state_block(recipient, issue, safe_reason)
+    end
+  end
+
+  defp notify_terminal_state_pass(recipient, %Issue{id: issue_id} = issue)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:terminal_state_verification_passed, issue_id, issue})
+    :ok
+  end
+
+  defp notify_terminal_state_pass(_recipient, _issue), do: :ok
+
+  defp notify_terminal_state_block(recipient, %Issue{id: issue_id} = issue, reason)
+       when is_pid(recipient) and is_binary(issue_id) do
+    send(recipient, {:terminal_state_verification_failed, issue_id, issue, reason})
+    :ok
+  end
+
+  defp notify_terminal_state_block(_recipient, _issue, reason),
+    do: {:error, {:terminal_state_verification_failed, reason}}
+
+  defp terminal_issue_state?(state_name) when is_binary(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+
+    Config.settings!().tracker.terminal_states
+    |> Enum.any?(fn terminal_state -> normalize_issue_state(terminal_state) == normalized_state end)
+  end
+
+  defp terminal_issue_state?(_state_name), do: false
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)

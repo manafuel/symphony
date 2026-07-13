@@ -322,6 +322,8 @@ defmodule SymphonyElixir.CoreTest do
             ref: nil,
             identifier: issue_identifier,
             issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            worker_host: nil,
+            workspace_path: workspace,
             started_at: DateTime.utc_now()
           }
         },
@@ -350,7 +352,466 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "missing running issues stop active agents without cleaning the workspace" do
+  test "terminal reconciliation defers configured verification to the live agent" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-block-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-block"
+    issue_identifier = "MT-TERM-BLOCK"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+        hook_before_terminal: "exit 19"
+      )
+
+      File.mkdir_p!(workspace)
+
+      agent_pid =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: nil,
+            identifier: issue_identifier,
+            issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+            worker_host: nil,
+            workspace_path: workspace,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          seconds_running: 0
+        },
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        title: "Done",
+        description: "Missing terminal proof",
+        labels: []
+      }
+
+      updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+
+      assert Map.has_key?(updated_state.running, issue_id)
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      refute Map.has_key?(updated_state.blocked, issue_id)
+      assert Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+      assert updated_state.running[issue_id].terminal_state_observed
+      Process.exit(agent_pid, :kill)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "matching terminal polls preserve an agent PASS while changed snapshots invalidate it" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      hook_before_terminal: "true",
+      tracker_terminal_states: ["Closed", "Cancelled"]
+    )
+
+    issue_id = "issue-terminal-pass-race"
+    updated_at = DateTime.utc_now()
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TERM-PASS",
+      state: "Closed",
+      updated_at: updated_at
+    }
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: self(),
+          ref: nil,
+          identifier: issue.identifier,
+          issue: issue,
+          started_at: updated_at
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, passed_state} =
+             Orchestrator.handle_info(
+               {:terminal_state_verification_passed, issue_id, issue},
+               state
+             )
+
+    same_snapshot_state = Orchestrator.reconcile_issue_states_for_test([issue], passed_state)
+    assert same_snapshot_state.running[issue_id].terminal_state_verification_passed
+
+    changed_issue = %{
+      issue
+      | updated_at: DateTime.add(updated_at, 1, :microsecond)
+    }
+
+    changed_snapshot_state =
+      Orchestrator.reconcile_issue_states_for_test([changed_issue], same_snapshot_state)
+
+    refute Map.get(
+             changed_snapshot_state.running[issue_id],
+             :terminal_state_verification_passed
+           )
+  end
+
+  test "agent runner reports terminal verifier failure before accepting done" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-terminal-block-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    workspace = Path.join(test_root, "MT-AGENT-TERM")
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        hook_before_terminal: "exit 29"
+      )
+
+      issue = %Issue{
+        id: "issue-agent-terminal",
+        identifier: "MT-AGENT-TERM",
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      assert :ok =
+               AgentRunner.verify_terminal_state_for_test(workspace, issue, self())
+
+      assert_receive {:terminal_state_verification_failed, "issue-agent-terminal", %Issue{id: "issue-agent-terminal"}, reason}
+
+      assert reason in [:hook_failed, :hook_task_exit] or
+               match?({:hook_exit, _status}, reason)
+
+      assert {:error, {:terminal_state_verification_failed, direct_reason}} =
+               AgentRunner.verify_terminal_state_for_test(workspace, issue)
+
+      assert direct_reason in [:hook_failed, :hook_task_exit] or
+               match?({:hook_exit, _status}, direct_reason)
+
+      refute inspect(reason) =~ "workspace_hook_failed"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "terminal verifier failure blocks normal agent completion and preserves claim and workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-terminal-down-block-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    issue_id = "issue-agent-terminal-down"
+    issue_identifier = "MT-AGENT-TERM-DOWN"
+    workspace = Path.join(test_root, issue_identifier)
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :finish -> :ok
+        end
+      end)
+
+    ref = Process.monitor(agent_pid)
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        hook_before_terminal: "exit 31"
+      )
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      state = %Orchestrator.State{
+        running: %{
+          issue_id => %{
+            pid: agent_pid,
+            ref: ref,
+            identifier: issue_identifier,
+            issue: %{terminal_issue | state: "In Progress"},
+            worker_host: nil,
+            workspace_path: workspace,
+            started_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        codex_totals: %{
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0,
+          seconds_running: 0
+        },
+        retry_attempts: %{}
+      }
+
+      assert :ok =
+               AgentRunner.verify_terminal_state_for_test(
+                 workspace,
+                 terminal_issue,
+                 self()
+               )
+
+      assert_receive {:terminal_state_verification_failed, ^issue_id, ^terminal_issue, reason}
+
+      assert {:noreply, failed_state} =
+               Orchestrator.handle_info(
+                 {:terminal_state_verification_failed, issue_id, terminal_issue, reason},
+                 state
+               )
+
+      send(agent_pid, :finish)
+      assert_receive {:DOWN, ^ref, :process, ^agent_pid, :normal} = down_message
+      assert {:noreply, blocked_state} = Orchestrator.handle_info(down_message, failed_state)
+
+      refute Map.has_key?(blocked_state.running, issue_id)
+      assert MapSet.member?(blocked_state.claimed, issue_id)
+      assert Map.has_key?(blocked_state.blocked, issue_id)
+      assert blocked_state.blocked[issue_id].workspace_path == workspace
+      assert File.dir?(workspace)
+    after
+      if Process.alive?(agent_pid), do: Process.exit(agent_pid, :kill)
+      Process.demonitor(ref, [:flush])
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "blocked terminal retry preserves failure state and releases only after a fresh PASS" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-blocked-terminal-retry-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-blocked-terminal-retry"
+    issue_identifier = "MT-BLOCKED-TERM-RETRY"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        hook_before_terminal: "exit 37"
+      )
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+
+      state = %Orchestrator.State{
+        blocked: %{
+          issue_id => %{
+            issue_id: issue_id,
+            identifier: issue_identifier,
+            issue: terminal_issue,
+            worker_host: nil,
+            workspace_path: workspace,
+            error: "prior terminal verifier failure",
+            blocked_at: DateTime.utc_now()
+          }
+        },
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      failed_state =
+        Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+
+      assert MapSet.member?(failed_state.claimed, issue_id)
+      assert Map.has_key?(failed_state.blocked, issue_id)
+      assert File.dir?(workspace)
+
+      passing_issue = %{
+        terminal_issue
+        | updated_at: DateTime.add(terminal_issue.updated_at, 1, :microsecond)
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [passing_issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        hook_before_terminal: "true"
+      )
+
+      passed_state =
+        Orchestrator.reconcile_blocked_issue_states_for_test([passing_issue], failed_state)
+
+      refute MapSet.member?(passed_state.claimed, issue_id)
+      refute Map.has_key?(passed_state.blocked, issue_id)
+      refute File.exists?(workspace)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "scheduled terminal retry blocks and preserves workspace when the verifier fails" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-scheduled-terminal-block-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    issue_id = "issue-scheduled-terminal-block"
+    issue_identifier = "MT-SCHEDULED-TERM-BLOCK"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      File.mkdir_p!(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        hook_before_terminal: "exit 41"
+      )
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      updated_state =
+        Orchestrator.handle_retry_issue_for_test(
+          state,
+          issue_id,
+          1,
+          %{
+            identifier: issue_identifier,
+            issue_url: "https://linear.example/scheduled-terminal-block",
+            worker_host: nil,
+            workspace_path: workspace
+          },
+          fn [^issue_id] -> {:ok, [terminal_issue]} end
+        )
+
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert Map.has_key?(updated_state.blocked, issue_id)
+      refute Map.has_key?(updated_state.retry_attempts, issue_id)
+      assert updated_state.blocked[issue_id].workspace_path == workspace
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "startup terminal cleanup preserves a failed workspace and removes it after PASS" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-startup-terminal-cleanup-#{System.unique_integer([:positive])}"
+      )
+      |> String.replace("\\", "/")
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_identifier = "MT-STARTUP-TERM-CLEANUP"
+    workspace = Path.join(test_root, issue_identifier)
+    attempt_marker = Path.join(workspace, "startup-terminal-attempted")
+
+    try do
+      File.mkdir_p!(workspace)
+
+      terminal_issue = %Issue{
+        id: "issue-startup-terminal-cleanup",
+        identifier: issue_identifier,
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        poll_interval_ms: 60_000,
+        hook_before_terminal: "printf attempted > startup-terminal-attempted && exit 43"
+      )
+
+      assert {:ok, failed_cleanup_state} = Orchestrator.init([])
+      Process.cancel_timer(failed_cleanup_state.tick_timer_ref)
+
+      assert :ok = wait_until(fn -> File.exists?(attempt_marker) end)
+      assert File.dir?(workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_terminal_states: ["Closed", "Cancelled"],
+        poll_interval_ms: 60_000,
+        hook_before_terminal: "true"
+      )
+
+      assert {:ok, passed_cleanup_state} = Orchestrator.init([])
+      Process.cancel_timer(passed_cleanup_state.tick_timer_ref)
+
+      assert :ok = wait_until(fn -> not File.exists?(workspace) end)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "omitted running issues preserve active agents, claims, and workspaces" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -418,10 +879,144 @@ defmodule SymphonyElixir.CoreTest do
       Process.sleep(100)
       state = :sys.get_state(pid)
 
-      refute Map.has_key?(state.running, issue_id)
-      refute MapSet.member?(state.claimed, issue_id)
-      refute Process.alive?(agent_pid)
+      assert Map.has_key?(state.running, issue_id)
+      assert MapSet.member?(state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
       assert File.exists?(workspace)
+      Process.exit(agent_pid, :kill)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "omitted blocked issues preserve the block, claim, and workspace metadata" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "In Review"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+    )
+
+    issue_id = "issue-blocked-omitted"
+    workspace = Path.join(System.tmp_dir!(), "blocked-omitted-workspace")
+
+    blocked_entry = %{
+      issue_id: issue_id,
+      identifier: "MT-BLOCKED-OMITTED",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-BLOCKED-OMITTED",
+        state: "In Progress"
+      },
+      workspace_path: workspace,
+      worker_host: nil,
+      error: "existing block"
+    }
+
+    state = %Orchestrator.State{
+      blocked: %{issue_id => blocked_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    updated_state = Orchestrator.reconcile_blocked_issue_refresh_for_test([], state)
+
+    assert updated_state.blocked[issue_id].workspace_path == workspace
+    assert MapSet.member?(updated_state.claimed, issue_id)
+  end
+
+  test "omitted exact-id retry refresh preserves the claim, workspace, and schedules retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_retry_backoff_ms: 300_000)
+
+    issue_id = "issue-retry-omitted"
+    workspace = Path.join(System.tmp_dir!(), "retry-omitted-workspace")
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{}
+    }
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(
+        nil,
+        state,
+        issue_id,
+        2,
+        %{
+          identifier: "MT-RETRY-OMITTED",
+          issue_url: "https://linear.example/issue",
+          worker_host: nil,
+          workspace_path: workspace
+        }
+      )
+
+    assert MapSet.member?(updated_state.claimed, issue_id)
+    assert updated_state.retry_attempts[issue_id].attempt == 3
+    assert updated_state.retry_attempts[issue_id].workspace_path == workspace
+    assert updated_state.retry_attempts[issue_id].error == "exact-id retry refresh omitted issue"
+    Process.cancel_timer(updated_state.retry_attempts[issue_id].timer_ref)
+  end
+
+  test "retry uses an exact-id fetcher so terminal issues remain observable" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-exact-retry-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-terminal-exact-retry"
+    issue_identifier = "MT-TERMINAL-EXACT-RETRY"
+    workspace = Path.join(test_root, issue_identifier)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress"],
+        tracker_terminal_states: ["Closed", "Cancelled"]
+      )
+
+      terminal_issue = %Issue{
+        id: issue_id,
+        identifier: issue_identifier,
+        state: "Closed",
+        updated_at: DateTime.utc_now()
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [terminal_issue])
+      File.mkdir_p!(workspace)
+
+      assert {:ok, [%Issue{id: ^issue_id}]} = Tracker.fetch_issue_states_by_ids([issue_id])
+
+      test_pid = self()
+
+      exact_id_fetcher = fn requested_ids ->
+        send(test_pid, {:exact_retry_fetch, requested_ids})
+        {:ok, [terminal_issue]}
+      end
+
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      updated_state =
+        Orchestrator.handle_retry_issue_for_test(
+          state,
+          issue_id,
+          1,
+          %{
+            identifier: issue_identifier,
+            issue_url: "https://linear.example/terminal",
+            worker_host: nil,
+            workspace_path: workspace
+          },
+          exact_id_fetcher
+        )
+
+      assert_receive {:exact_retry_fetch, [^issue_id]}
+      refute MapSet.member?(updated_state.claimed, issue_id)
+      refute Map.has_key?(updated_state.retry_attempts, issue_id)
     after
       restore_app_env(:memory_tracker_issues, previous_memory_issues)
       File.rm_rf(test_root)
@@ -883,6 +1478,19 @@ defmodule SymphonyElixir.CoreTest do
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp wait_until(fun, attempts \\ 500)
+
+  defp wait_until(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(fun, attempts - 1)
+    end
+  end
+
+  defp wait_until(_fun, 0), do: {:error, :timeout}
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
