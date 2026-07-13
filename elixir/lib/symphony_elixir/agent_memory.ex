@@ -32,6 +32,7 @@ defmodule SymphonyElixir.AgentMemory do
             requester,
             String.trim_trailing(base_url, "/") <> "/agentmemory/smart-search",
             json: %{query: query, limit: @max_results},
+            headers: agentmemory_headers(opts),
             connect_options: [timeout: connect_timeout_ms],
             receive_timeout: receive_timeout_ms,
             retry: false
@@ -68,11 +69,31 @@ defmodule SymphonyElixir.AgentMemory do
 
         {:error, :agentmemory_completion_failed}
 
-      completion_recorded?(ledger_path, completion_key) ->
-        {:ok, :already_recorded}
-
       true ->
-        do_remember_completion(issue, base_url, ledger_path, completion_key, opts)
+        case completion_ledger_state(ledger_path, completion_key) do
+          {:ok, _memory_id} ->
+            {:ok, :already_recorded}
+
+          {:pending, memory_id} ->
+            resume_pending_completion(
+              issue,
+              base_url,
+              ledger_path,
+              completion_key,
+              memory_id,
+              opts
+            )
+
+          :intent ->
+            recover_completion_intent(issue, base_url, ledger_path, completion_key, opts)
+
+          :none ->
+            start_completion(issue, base_url, ledger_path, completion_key, opts)
+
+          {:error, _reason} ->
+            Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} error=ledger_read_failed")
+            {:error, :agentmemory_completion_failed}
+        end
     end
   rescue
     exception ->
@@ -86,35 +107,224 @@ defmodule SymphonyElixir.AgentMemory do
       {:error, :agentmemory_completion_failed}
   end
 
-  defp do_remember_completion(issue, base_url, ledger_path, completion_key, opts) do
+  defp start_completion(issue, base_url, ledger_path, completion_key, opts) do
+    content = completion_content(issue, completion_key)
+    started_at = System.monotonic_time(:millisecond)
+
+    case write_completion_ledger(
+           issue,
+           ledger_path,
+           completion_key,
+           0,
+           "intent",
+           %{
+             operation: "prepared",
+             saved_content_tokens: estimate_tokens(content)
+           },
+           opts
+         ) do
+      :ok ->
+        remember_new_completion(
+          issue,
+          content,
+          base_url,
+          ledger_path,
+          completion_key,
+          started_at,
+          opts
+        )
+
+      {:error, _reason} ->
+        {:error, :agentmemory_completion_failed}
+    end
+  end
+
+  defp remember_new_completion(
+         issue,
+         content,
+         base_url,
+         ledger_path,
+         completion_key,
+         started_at,
+         opts
+       ) do
+    timeout_ms = timeout_ms(opts)
+    request_timeout_ms = max(div(timeout_ms, 3), 1)
+    post_requester = Keyword.get(opts, :post_requester, &Req.post/2)
+    request_options = completion_request_options(request_timeout_ms, opts)
+
+    case save_completion_memory(
+           issue,
+           content,
+           base_url,
+           request_options,
+           post_requester
+         ) do
+      {:ok, memory_id} ->
+        duration_ms = System.monotonic_time(:millisecond) - started_at
+
+        case write_completion_ledger(
+               issue,
+               ledger_path,
+               completion_key,
+               duration_ms,
+               "pending",
+               %{
+                 operation: "remembered",
+                 saved_memory_id: memory_id,
+                 saved_content_tokens: estimate_tokens(content)
+               },
+               opts
+             ) do
+          :ok ->
+            verify_pending_completion(
+              issue,
+              content,
+              base_url,
+              ledger_path,
+              completion_key,
+              memory_id,
+              started_at,
+              opts
+            )
+
+          {:error, _reason} ->
+            completion_failure(
+              issue,
+              ledger_path,
+              completion_key,
+              started_at,
+              "pending_ledger",
+              "ledger_write_failed",
+              opts
+            )
+        end
+
+      {:error, operation, error} ->
+        completion_failure(
+          issue,
+          ledger_path,
+          completion_key,
+          started_at,
+          operation,
+          error,
+          opts
+        )
+    end
+  end
+
+  defp resume_pending_completion(
+         issue,
+         base_url,
+         ledger_path,
+         completion_key,
+         memory_id,
+         opts
+       ) do
+    verify_pending_completion(
+      issue,
+      completion_content(issue, completion_key),
+      base_url,
+      ledger_path,
+      completion_key,
+      memory_id,
+      System.monotonic_time(:millisecond),
+      opts
+    )
+  end
+
+  defp recover_completion_intent(issue, base_url, ledger_path, completion_key, opts) do
+    timeout_ms = timeout_ms(opts)
+    request_timeout_ms = max(div(timeout_ms, 3), 1)
+    post_requester = Keyword.get(opts, :post_requester, &Req.post/2)
+    request_options = completion_request_options(request_timeout_ms, opts)
+    started_at = System.monotonic_time(:millisecond)
+
+    case find_completion_memory(
+           issue,
+           completion_key,
+           base_url,
+           request_options,
+           post_requester
+         ) do
+      {:ok, memory_id} when is_binary(memory_id) ->
+        duration_ms = System.monotonic_time(:millisecond) - started_at
+
+        case write_completion_ledger(
+               issue,
+               ledger_path,
+               completion_key,
+               duration_ms,
+               "pending",
+               %{
+                 operation: "recovered",
+                 saved_memory_id: memory_id,
+                 saved_content_tokens: 0
+               },
+               opts
+             ) do
+          :ok ->
+            resume_pending_completion(
+              issue,
+              base_url,
+              ledger_path,
+              completion_key,
+              memory_id,
+              opts
+            )
+
+          {:error, _reason} ->
+            {:error, :agentmemory_completion_failed}
+        end
+
+      {:ok, nil} ->
+        completion_failure(
+          issue,
+          ledger_path,
+          completion_key,
+          started_at,
+          "recover_intent",
+          "memory_not_found_for_intent",
+          opts
+        )
+
+      {:error, operation, error} ->
+        completion_failure(
+          issue,
+          ledger_path,
+          completion_key,
+          started_at,
+          operation,
+          error,
+          opts
+        )
+    end
+  end
+
+  defp verify_pending_completion(
+         issue,
+         content,
+         base_url,
+         ledger_path,
+         completion_key,
+         memory_id,
+         started_at,
+         opts
+       ) do
     timeout_ms = timeout_ms(opts)
     request_timeout_ms = max(div(timeout_ms, 3), 1)
     post_requester = Keyword.get(opts, :post_requester, &Req.post/2)
     get_requester = Keyword.get(opts, :get_requester, &Req.get/2)
-    content = completion_content(issue, completion_key)
-    started_at = System.monotonic_time(:millisecond)
+    request_options = completion_request_options(request_timeout_ms, opts)
 
-    with {:ok, memory_id} <-
-           save_completion_memory(
-             issue,
-             content,
-             base_url,
-             request_timeout_ms,
-             post_requester
-           ),
-         :ok <-
-           verify_completion_lookup(
-             memory_id,
-             base_url,
-             request_timeout_ms,
-             get_requester
-           ),
+    with :ok <-
+           verify_completion_lookup(memory_id, base_url, request_options, get_requester),
          :ok <-
            verify_completion_search(
              issue,
              memory_id,
              base_url,
-             request_timeout_ms,
+             request_options,
              post_requester
            ) do
       duration_ms = System.monotonic_time(:millisecond) - started_at
@@ -132,7 +342,8 @@ defmodule SymphonyElixir.AgentMemory do
                search_verified: true,
                concept_count: length(completion_concepts(issue)),
                saved_content_tokens: estimate_tokens(content)
-             }
+             },
+             opts
            ) do
         :ok ->
           {:ok, memory_id}
@@ -142,25 +353,46 @@ defmodule SymphonyElixir.AgentMemory do
       end
     else
       {:error, operation, error} ->
-        duration_ms = System.monotonic_time(:millisecond) - started_at
-
-        _ =
-          write_completion_ledger(
-            issue,
-            ledger_path,
-            completion_key,
-            duration_ms,
-            "error",
-            %{operation: operation, error: error, saved_content_tokens: 0}
-          )
-
-        Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} operation=#{operation} error=#{error}")
-
-        {:error, :agentmemory_completion_failed}
+        completion_failure(
+          issue,
+          ledger_path,
+          completion_key,
+          started_at,
+          operation,
+          error,
+          opts
+        )
     end
   end
 
-  defp save_completion_memory(issue, content, base_url, timeout_ms, requester) do
+  defp completion_failure(
+         issue,
+         ledger_path,
+         completion_key,
+         started_at,
+         operation,
+         error,
+         opts
+       ) do
+    duration_ms = System.monotonic_time(:millisecond) - started_at
+
+    _ =
+      write_completion_ledger(
+        issue,
+        ledger_path,
+        completion_key,
+        duration_ms,
+        "error",
+        %{operation: operation, error: error, saved_content_tokens: 0},
+        opts
+      )
+
+    Logger.warning("AgentMemory completion save failed for #{issue_identifier(issue)} operation=#{operation} error=#{error}")
+
+    {:error, :agentmemory_completion_failed}
+  end
+
+  defp save_completion_memory(issue, content, base_url, request_options, requester) do
     payload = %{
       content: content,
       type: "workflow",
@@ -172,7 +404,7 @@ defmodule SymphonyElixir.AgentMemory do
       safe_request(
         requester,
         String.trim_trailing(base_url, "/") <> "/agentmemory/remember",
-        [json: payload] ++ completion_request_options(timeout_ms)
+        [json: payload] ++ request_options
       )
 
     case result do
@@ -193,13 +425,47 @@ defmodule SymphonyElixir.AgentMemory do
     end
   end
 
-  defp verify_completion_lookup(memory_id, base_url, timeout_ms, requester) do
+  defp find_completion_memory(
+         issue,
+         completion_key,
+         base_url,
+         request_options,
+         requester
+       ) do
+    result =
+      safe_request(
+        requester,
+        String.trim_trailing(base_url, "/") <> "/agentmemory/smart-search",
+        [
+          json: %{
+            query: "MANAfuel Symphony completion #{issue_identifier(issue)} completion key #{completion_key}",
+            limit: @max_results
+          }
+        ] ++ request_options
+      )
+
+    case result do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        {:ok, recovered_completion_id(body, completion_key)}
+
+      {:ok, %{status: status}} ->
+        {:error, "recover_intent", "http_#{status}"}
+
+      {:error, reason} ->
+        {:error, "recover_intent", error_class(reason)}
+
+      other ->
+        {:error, "recover_intent", error_class(other)}
+    end
+  end
+
+  defp verify_completion_lookup(memory_id, base_url, request_options, requester) do
     result =
       safe_request(
         requester,
         String.trim_trailing(base_url, "/") <>
           "/agentmemory/memories/" <> URI.encode_www_form(memory_id),
-        completion_request_options(timeout_ms)
+        request_options
       )
 
     case result do
@@ -221,7 +487,7 @@ defmodule SymphonyElixir.AgentMemory do
     end
   end
 
-  defp verify_completion_search(issue, memory_id, base_url, timeout_ms, requester) do
+  defp verify_completion_search(issue, memory_id, base_url, request_options, requester) do
     result =
       safe_request(
         requester,
@@ -231,12 +497,12 @@ defmodule SymphonyElixir.AgentMemory do
             query: "MANAfuel Symphony completion #{issue_identifier(issue)} #{memory_id}",
             limit: @max_results
           }
-        ] ++ completion_request_options(timeout_ms)
+        ] ++ request_options
       )
 
     case result do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
-        items = list_field(body, "results") ++ list_field(body, "lessons")
+        items = completion_search_items(body)
 
         if Enum.any?(items, &(completion_result_id(&1) == memory_id)) do
           :ok
@@ -255,15 +521,40 @@ defmodule SymphonyElixir.AgentMemory do
     end
   end
 
-  defp completion_request_options(timeout_ms) do
+  defp completion_search_items(body) do
+    list_field(body, "results") ++ list_field(body, "lessons")
+  end
+
+  defp recovered_completion_id(body, completion_key) do
+    body
+    |> completion_search_items()
+    |> Enum.find_value(fn item ->
+      if contains_completion_key?(item, completion_key) do
+        completion_result_id(item)
+      end
+    end)
+  end
+
+  defp completion_request_options(timeout_ms, opts) do
     connect_timeout_ms = min(max(div(timeout_ms, 2), 1), 1_000)
     receive_timeout_ms = max(timeout_ms - connect_timeout_ms, 1)
 
     [
+      headers: agentmemory_headers(opts),
       connect_options: [timeout: connect_timeout_ms],
       receive_timeout: receive_timeout_ms,
       retry: false
     ]
+  end
+
+  defp agentmemory_headers(opts) do
+    secret = Keyword.get(opts, :secret, System.get_env("AGENTMEMORY_SECRET"))
+
+    if is_binary(secret) and String.trim(secret) != "" do
+      [{"authorization", "Bearer " <> secret}]
+    else
+      []
+    end
   end
 
   defp completion_content(issue, completion_key) do
@@ -303,29 +594,62 @@ defmodule SymphonyElixir.AgentMemory do
     end
   end
 
-  defp completion_recorded?(path, completion_key) do
+  defp completion_ledger_state(path, completion_key) do
     if File.regular?(path) do
       path
       |> File.stream!([], :line)
-      |> Enum.any?(&completion_record_matches?(&1, completion_key))
+      |> Enum.reduce(:none, &completion_record_state(&1, &2, completion_key))
     else
-      false
+      :none
     end
   rescue
-    _exception -> false
+    _exception -> {:error, :ledger_read_failed}
   end
 
-  defp completion_record_matches?(line, completion_key) do
+  defp completion_record_state(_line, {:error, _reason} = state, _completion_key), do: state
+
+  defp completion_record_state(line, state, completion_key) do
     case Jason.decode(line) do
       {:ok, record} ->
-        record["event"] == "remember_completion" and
-          record["status"] == "ok" and
-          record["completion_key"] == completion_key
+        if record["event"] == "remember_completion" and
+             record["completion_key"] == completion_key do
+          completion_state_transition(state, record)
+        else
+          state
+        end
 
       {:error, _reason} ->
-        false
+        {:error, :invalid_ledger_record}
     end
   end
+
+  defp completion_state_transition({:ok, _memory_id} = state, _record), do: state
+
+  defp completion_state_transition(_state, %{
+         "status" => "ok",
+         "saved_memory_id" => memory_id
+       })
+       when is_binary(memory_id) and memory_id != "",
+       do: {:ok, memory_id}
+
+  defp completion_state_transition(_state, %{"status" => "ok"}),
+    do: {:error, :invalid_success_record}
+
+  defp completion_state_transition(state, %{
+         "status" => "pending",
+         "saved_memory_id" => memory_id
+       })
+       when is_binary(memory_id) and memory_id != "" do
+    case state do
+      :none -> {:pending, memory_id}
+      :intent -> {:pending, memory_id}
+      {:pending, _prior_memory_id} -> {:pending, memory_id}
+      other -> other
+    end
+  end
+
+  defp completion_state_transition(:none, %{"status" => "intent"}), do: :intent
+  defp completion_state_transition(state, _record), do: state
 
   defp write_completion_ledger(
          issue,
@@ -333,7 +657,8 @@ defmodule SymphonyElixir.AgentMemory do
          completion_key,
          duration_ms,
          status,
-         extra
+         extra,
+         opts
        ) do
     recorded_at = DateTime.utc_now()
 
@@ -355,7 +680,17 @@ defmodule SymphonyElixir.AgentMemory do
       }
       |> Map.merge(extra)
 
-    append_json_line(path, record)
+    ledger_writer = Keyword.get(opts, :ledger_writer, &append_json_line/2)
+
+    ledger_writer.(path, record)
+  rescue
+    exception ->
+      Logger.warning("Unable to append AgentMemory completion ledger error=#{error_class(exception)}")
+      {:error, :ledger_write_failed}
+  catch
+    kind, _reason ->
+      Logger.warning("Unable to append AgentMemory completion ledger error=#{kind}")
+      {:error, :ledger_write_failed}
   end
 
   defp completion_memory_id(body) when is_map(body) do
@@ -384,6 +719,20 @@ defmodule SymphonyElixir.AgentMemory do
   end
 
   defp map_id(_value, _keys), do: nil
+
+  defp contains_completion_key?(value, completion_key) when is_binary(value) do
+    String.contains?(value, completion_key)
+  end
+
+  defp contains_completion_key?(value, completion_key) when is_map(value) do
+    Enum.any?(Map.values(value), &contains_completion_key?(&1, completion_key))
+  end
+
+  defp contains_completion_key?(value, completion_key) when is_list(value) do
+    Enum.any?(value, &contains_completion_key?(&1, completion_key))
+  end
+
+  defp contains_completion_key?(_value, _completion_key), do: false
 
   @spec append_context(String.t(), String.t() | nil) :: String.t()
   def append_context(prompt, nil) when is_binary(prompt), do: prompt
@@ -605,7 +954,7 @@ defmodule SymphonyElixir.AgentMemory do
 
     :global.trans({__MODULE__, expanded_path}, fn ->
       with :ok <- File.mkdir_p(Path.dirname(expanded_path)),
-           :ok <- File.write(expanded_path, Jason.encode!(record) <> "\n", [:append]) do
+           :ok <- File.write(expanded_path, Jason.encode!(record) <> "\n", [:append, :sync]) do
         :ok
       else
         {:error, reason} ->

@@ -322,6 +322,15 @@ defmodule SymphonyElixir.CoreTest do
     issue_identifier = "MT-556"
     workspace = Path.join(test_root, issue_identifier)
 
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> {:ok, "mem_terminal_cleanup"} end
+    )
+
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: test_root,
@@ -371,6 +380,7 @@ defmodule SymphonyElixir.CoreTest do
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
     end
   end
 
@@ -520,9 +530,12 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "completion save failure is non-fatal and sanitizes terminal logs" do
+  test "completion save failure blocks closeout and sanitizes terminal logs" do
     previous_saver =
       Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
 
     secret_error = "raw-provider-error-must-not-appear"
     issue_id = "issue-retry-save-failed"
@@ -532,6 +545,15 @@ defmodule SymphonyElixir.CoreTest do
       :symphony_elixir,
       :agentmemory_completion_saver,
       fn _issue -> {:error, secret_error} end
+    )
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_blocker,
+      fn issue, error_class ->
+        send(parent, {:completion_blocked, issue.id, error_class})
+        :ok
+      end
     )
 
     try do
@@ -558,11 +580,120 @@ defmodule SymphonyElixir.CoreTest do
         end)
 
       assert_receive {:failed_save_state, updated_state}
-      refute MapSet.member?(updated_state.claimed, issue_id)
+      assert_receive {:completion_blocked, ^issue_id, :binary}
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert Map.has_key?(updated_state.blocked, issue_id)
       assert log =~ "error_class=binary"
       refute log =~ secret_error
     after
       restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+    end
+  end
+
+  test "default completion blocker moves the ticket to Human Review" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    previous_recipient =
+      Application.get_env(:symphony_elixir, :memory_tracker_recipient)
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+
+    issue_id = "issue-completion-human-review"
+    Application.delete_env(:symphony_elixir, :agentmemory_completion_blocker)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_saver,
+      fn _issue -> {:error, :agentmemory_completion_failed} end
+    )
+
+    try do
+      state = %Orchestrator.State{
+        claimed: MapSet.new([issue_id]),
+        retry_attempts: %{}
+      }
+
+      issue = %Issue{
+        id: issue_id,
+        identifier: "MT-COMPLETION-HUMAN-REVIEW",
+        state: "Done",
+        updated_at: ~U[2026-07-13 15:03:00Z]
+      }
+
+      updated_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+          identifier: issue.identifier
+        })
+
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
+      assert_receive {:memory_tracker_comment, ^issue_id, comment}
+      assert comment =~ "symphony:agentmemory-completion-block"
+      refute comment =~ "raw"
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert Map.has_key?(updated_state.blocked, issue_id)
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
+      restore_app_env(:memory_tracker_recipient, previous_recipient)
+    end
+  end
+
+  test "disabled and unexpected completion outcomes remain blocked" do
+    previous_saver =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_saver)
+
+    previous_blocker =
+      Application.get_env(:symphony_elixir, :agentmemory_completion_blocker)
+
+    parent = self()
+
+    Application.put_env(
+      :symphony_elixir,
+      :agentmemory_completion_blocker,
+      fn issue, error_class ->
+        send(parent, {:completion_outcome_blocked, issue.id, error_class})
+        :ok
+      end
+    )
+
+    try do
+      for {suffix, outcome, expected_class} <- [
+            {"disabled", :disabled, :disabled},
+            {"unexpected", {:unexpected, "raw-result-must-not-log"}, :unexpected}
+          ] do
+        issue_id = "issue-completion-#{suffix}"
+        Application.put_env(:symphony_elixir, :agentmemory_completion_saver, fn _issue -> outcome end)
+
+        state = %Orchestrator.State{
+          claimed: MapSet.new([issue_id]),
+          retry_attempts: %{}
+        }
+
+        issue = %Issue{
+          id: issue_id,
+          identifier: "MT-#{String.upcase(suffix)}",
+          state: "Done",
+          updated_at: ~U[2026-07-13 15:03:00Z]
+        }
+
+        updated_state =
+          Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue_id, 1, %{
+            identifier: issue.identifier
+          })
+
+        assert_receive {:completion_outcome_blocked, ^issue_id, ^expected_class}
+        assert MapSet.member?(updated_state.claimed, issue_id)
+        assert Map.has_key?(updated_state.blocked, issue_id)
+      end
+    after
+      restore_app_env(:agentmemory_completion_saver, previous_saver)
+      restore_app_env(:agentmemory_completion_blocker, previous_blocker)
     end
   end
 

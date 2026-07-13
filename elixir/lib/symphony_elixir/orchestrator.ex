@@ -429,8 +429,13 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        maybe_remember_completion(issue)
-        terminate_running_issue(state, issue.id, true)
+        case maybe_remember_completion(issue) do
+          result when result in [:ok, :skip] ->
+            terminate_running_issue(state, issue.id, true)
+
+          {:error, error_class} ->
+            block_running_completion(state, issue, error_class)
+        end
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -464,9 +469,15 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
-        maybe_remember_completion(issue)
-        cleanup_issue_workspace(issue.identifier, blocked_issue_worker_host(state, issue.id))
-        release_issue_claim(state, issue.id)
+
+        case maybe_remember_completion(issue) do
+          result when result in [:ok, :skip] ->
+            cleanup_issue_workspace(issue.identifier, blocked_issue_worker_host(state, issue.id))
+            release_issue_claim(state, issue.id)
+
+          {:error, error_class} ->
+            retain_blocked_completion(state, issue, error_class)
+        end
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
@@ -900,6 +911,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminal_issue_state?(_state_name, _terminal_states), do: false
 
+  @spec maybe_remember_completion(Issue.t()) :: :ok | :skip | {:error, atom()}
   defp maybe_remember_completion(%Issue{} = issue) do
     if completion_issue_state?(issue.state) do
       saver =
@@ -912,22 +924,29 @@ defmodule SymphonyElixir.Orchestrator do
       case safe_remember_completion(saver, issue) do
         {:ok, :already_recorded} ->
           Logger.debug("AgentMemory completion already recorded for #{issue_context(issue)} state=#{issue.state}")
+          :ok
 
-        {:ok, memory_id} ->
+        {:ok, memory_id} when is_binary(memory_id) and memory_id != "" ->
           Logger.info("AgentMemory completion saved for #{issue_context(issue)} state=#{issue.state} memory_id=#{memory_id}")
+          :ok
 
         :disabled ->
           Logger.warning("AgentMemory completion save disabled for #{issue_context(issue)} state=#{issue.state}")
+          {:error, :disabled}
 
         {:error, reason} ->
-          Logger.warning("AgentMemory completion save failed for #{issue_context(issue)} state=#{issue.state} error_class=#{completion_save_result_class(reason)}")
+          error_class = completion_save_result_class(reason)
+          Logger.warning("AgentMemory completion save failed for #{issue_context(issue)} state=#{issue.state} error_class=#{error_class}")
+          {:error, error_class}
 
         other ->
-          Logger.warning("AgentMemory completion save returned unexpected result for #{issue_context(issue)} result_class=#{completion_save_result_class(other)}")
+          result_class = completion_save_result_class(other)
+          Logger.warning("AgentMemory completion save returned unexpected result for #{issue_context(issue)} result_class=#{result_class}")
+          {:error, result_class}
       end
+    else
+      :skip
     end
-
-    :ok
   end
 
   defp completion_issue_state?(state_name) when is_binary(state_name) do
@@ -951,6 +970,128 @@ defmodule SymphonyElixir.Orchestrator do
   defp completion_save_result_class(value) when is_list(value), do: :list
   defp completion_save_result_class(value) when is_number(value), do: :number
   defp completion_save_result_class(_value), do: :unexpected
+
+  defp block_running_completion(%State{} = state, %Issue{} = issue, error_class) do
+    route_completion_blocker(issue, error_class)
+
+    case Map.get(state.running, issue.id) do
+      %{pid: _pid} = running_entry ->
+        error = completion_memory_blocker_error(error_class)
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue.id, running_entry, error)
+
+      _ ->
+        block_completion_from_metadata(state, issue, %{}, error_class)
+    end
+  end
+
+  defp retain_blocked_completion(%State{} = state, %Issue{} = issue, error_class) do
+    route_completion_blocker(issue, error_class)
+    error = completion_memory_blocker_error(error_class)
+
+    blocked_entry =
+      state.blocked
+      |> Map.get(issue.id, %{})
+      |> Map.merge(%{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        issue: issue,
+        error: error,
+        blocked_at: DateTime.utc_now()
+      })
+
+    %{
+      state
+      | claimed: MapSet.put(state.claimed, issue.id),
+        blocked: Map.put(state.blocked, issue.id, blocked_entry)
+    }
+  end
+
+  defp block_completion_from_metadata(
+         %State{} = state,
+         %Issue{} = issue,
+         metadata,
+         error_class
+       ) do
+    route_completion_blocker(issue, error_class)
+
+    blocked_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      error: completion_memory_blocker_error(error_class),
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id),
+        blocked: Map.put(state.blocked, issue.id, blocked_entry)
+    }
+  end
+
+  defp route_completion_blocker(%Issue{} = issue, error_class) do
+    blocker =
+      Application.get_env(
+        :symphony_elixir,
+        :agentmemory_completion_blocker,
+        &move_completion_to_human_review/2
+      )
+
+    case safe_route_completion_blocker(blocker, issue, error_class) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to route AgentMemory completion blocker for #{issue_context(issue)} error_class=#{completion_save_result_class(reason)}")
+        {:error, :completion_blocker_failed}
+    end
+  end
+
+  defp safe_route_completion_blocker(blocker, issue, error_class) do
+    blocker.(issue, error_class)
+  rescue
+    _exception -> {:error, :completion_blocker_raised}
+  catch
+    kind, _reason -> {:error, {:completion_blocker_exited, kind}}
+  end
+
+  defp move_completion_to_human_review(%Issue{id: issue_id} = issue, error_class)
+       when is_binary(issue_id) do
+    case Tracker.update_issue_state(issue_id, "Human Review") do
+      :ok ->
+        marker = "<!-- symphony:agentmemory-completion-block:#{issue.identifier || issue_id} -->"
+
+        _ =
+          Tracker.create_comment(
+            issue_id,
+            marker <>
+              "\nAgentMemory completion evidence is not verified (error_class=#{error_class}). " <>
+              "The worker retained a blocker and moved this ticket to Human Review."
+          )
+
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp move_completion_to_human_review(_issue, _error_class),
+    do: {:error, :missing_issue_id}
+
+  defp completion_memory_blocker_error(error_class) do
+    "AgentMemory completion evidence blocked error_class=#{error_class}"
+  end
 
   defp active_issue_state?(state_name, active_states) when is_binary(state_name) do
     MapSet.member?(active_states, normalize_issue_state(state_name))
@@ -1189,9 +1330,14 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
-        maybe_remember_completion(issue)
-        cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
-        {:noreply, release_issue_claim(state, issue_id)}
+        case maybe_remember_completion(issue) do
+          result when result in [:ok, :skip] ->
+            cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+            {:noreply, release_issue_claim(state, issue_id)}
+
+          {:error, error_class} ->
+            {:noreply, block_completion_from_metadata(state, issue, metadata, error_class)}
+        end
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)

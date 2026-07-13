@@ -158,6 +158,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
   test "completion save verifies exact lookup and recall before recording success" do
     ledger_path = temp_ledger_path()
     parent = self()
+    auth_fixture = Enum.join(["fixture", "credential"], "-")
 
     post_requester = fn url, opts ->
       send(parent, {:posted, url, opts})
@@ -195,6 +196,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
                ledger_path: ledger_path,
                post_requester: post_requester,
                get_requester: get_requester,
+               secret: auth_fixture,
                timeout_ms: 500
              )
 
@@ -203,14 +205,17 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert is_list(save_opts[:json].concepts)
     assert "MAN-193" in save_opts[:json].concepts
     refute save_opts[:json].content =~ completion_issue().description
+    assert {"authorization", "Bearer " <> auth_fixture} in save_opts[:headers]
 
     assert_receive {:fetched, "http://127.0.0.1:3111/agentmemory/memories/mem_completion_193", lookup_opts}
 
     refute Keyword.has_key?(lookup_opts, :json)
+    assert {"authorization", "Bearer " <> auth_fixture} in lookup_opts[:headers]
 
     assert_receive {:posted, "http://127.0.0.1:3111/agentmemory/smart-search", search_opts}
     assert search_opts[:json].query =~ "MAN-193"
     refute search_opts[:json].query =~ completion_issue().description
+    assert {"authorization", "Bearer " <> auth_fixture} in search_opts[:headers]
 
     for request_opts <- [save_opts, lookup_opts, search_opts] do
       request_budget_ms =
@@ -220,14 +225,18 @@ defmodule SymphonyElixir.AgentMemoryTest do
       refute request_opts[:retry]
     end
 
-    [record] = read_ledger(ledger_path)
+    records = read_ledger(ledger_path)
+    record = List.last(records)
+    assert Enum.map(records, & &1["status"]) == ["intent", "pending", "ok"]
     assert record["event"] == "remember_completion"
     assert record["status"] == "ok"
     assert record["saved_memory_id"] == "mem_completion_193"
     assert record["exact_lookup_verified"]
     assert record["search_verified"]
     assert record["completion_key"] == "issue-man-193:2026-07-13T15:00:00Z"
+    assert Enum.all?(records, &(not Map.has_key?(&1, "content")))
     refute File.read!(ledger_path) =~ completion_issue().description
+    refute File.read!(ledger_path) =~ auth_fixture
 
     assert {:ok, :already_recorded} =
              AgentMemory.remember_completion(completion_issue(),
@@ -241,7 +250,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
                end
              )
 
-    assert length(read_ledger(ledger_path)) == 1
+    assert length(read_ledger(ledger_path)) == 3
   end
 
   test "completion save failure records only a sanitized error class" do
@@ -259,7 +268,8 @@ defmodule SymphonyElixir.AgentMemoryTest do
                end
              )
 
-    [record] = read_ledger(ledger_path)
+    [intent, record] = read_ledger(ledger_path)
+    assert intent["status"] == "intent"
     assert record["event"] == "remember_completion"
     assert record["status"] == "error"
     assert record["operation"] == "remember"
@@ -287,28 +297,97 @@ defmodule SymphonyElixir.AgentMemoryTest do
                end
              )
 
-    [record] = read_ledger(ledger_path)
+    [intent, pending, record] = read_ledger(ledger_path)
+    assert intent["status"] == "intent"
+    assert pending["status"] == "pending"
     assert record["status"] == "error"
     assert record["operation"] == "exact_lookup"
     assert record["error"] == "http_404"
     refute Map.has_key?(record, "saved_memory_id")
   end
 
-  test "completion save requires smart-search recall of the exact memory id" do
+  test "completion retry survives smart-search failure without another remember POST" do
     ledger_path = temp_ledger_path()
+    parent = self()
+    {:ok, search_attempt} = Agent.start_link(fn -> 0 end)
 
     post_requester = fn url, _opts ->
       if String.ends_with?(url, "/agentmemory/remember") do
+        send(parent, :remember_posted_before_search_failure)
+
         {:ok,
          %Req.Response{
            status: 201,
            body: %{"memory" => %{"id" => "mem_not_recalled"}}
          }}
       else
+        attempt = Agent.get_and_update(search_attempt, fn count -> {count, count + 1} end)
+
+        recalled_id =
+          if attempt == 0 do
+            "mem_different"
+          else
+            "mem_not_recalled"
+          end
+
         {:ok,
          %Req.Response{
            status: 200,
-           body: %{"results" => [%{"obsId" => "mem_different"}]}
+           body: %{"results" => [%{"obsId" => recalled_id}]}
+         }}
+      end
+    end
+
+    opts = [
+      url: "http://127.0.0.1:3111",
+      ledger_path: ledger_path,
+      post_requester: post_requester,
+      get_requester: fn _url, _opts ->
+        {:ok,
+         %Req.Response{
+           status: 200,
+           body: %{"memory" => %{"id" => "mem_not_recalled"}}
+         }}
+      end
+    ]
+
+    assert {:error, :agentmemory_completion_failed} =
+             AgentMemory.remember_completion(completion_issue(), opts)
+
+    assert_receive :remember_posted_before_search_failure
+    [intent, pending, record] = read_ledger(ledger_path)
+    assert intent["status"] == "intent"
+    assert pending["status"] == "pending"
+    assert record["status"] == "error"
+    assert record["operation"] == "smart_search"
+    assert record["error"] == "memory_not_recalled"
+    refute Map.has_key?(record, "saved_memory_id")
+
+    assert {:ok, "mem_not_recalled"} =
+             AgentMemory.remember_completion(completion_issue(), opts)
+
+    refute_receive :remember_posted_before_search_failure
+    assert List.last(read_ledger(ledger_path))["status"] == "ok"
+  end
+
+  test "completion retry resumes the pending remote id without another remember POST" do
+    ledger_path = temp_ledger_path()
+    parent = self()
+
+    post_requester = fn url, _opts ->
+      if String.ends_with?(url, "/agentmemory/remember") do
+        send(parent, :remember_posted)
+
+        {:ok,
+         %Req.Response{
+           status: 201,
+           body: %{"memory" => %{"id" => "mem_pending_retry"}}
+         }}
+      else
+        {:ok,
+         %Req.Response{
+           status: 200,
+           body: %{"results" => [%{"obsId" => "mem_pending_retry"}]}
          }}
       end
     end
@@ -319,19 +398,133 @@ defmodule SymphonyElixir.AgentMemoryTest do
                ledger_path: ledger_path,
                post_requester: post_requester,
                get_requester: fn _url, _opts ->
+                 {:ok, %Req.Response{status: 404, body: %{}}}
+               end
+             )
+
+    assert_receive :remember_posted
+
+    assert {:ok, "mem_pending_retry"} =
+             AgentMemory.remember_completion(completion_issue(),
+               url: "http://127.0.0.1:3111",
+               ledger_path: ledger_path,
+               post_requester: post_requester,
+               get_requester: fn _url, _opts ->
                  {:ok,
                   %Req.Response{
                     status: 200,
-                    body: %{"memory" => %{"id" => "mem_not_recalled"}}
+                    body: %{"memory" => %{"id" => "mem_pending_retry"}}
                   }}
                end
              )
 
-    [record] = read_ledger(ledger_path)
+    refute_receive :remember_posted
+    assert Enum.count(read_ledger(ledger_path), &(&1["status"] == "intent")) == 1
+    assert Enum.count(read_ledger(ledger_path), &(&1["status"] == "pending")) == 1
+    assert List.last(read_ledger(ledger_path))["status"] == "ok"
+  end
+
+  test "process restart recovers a remote id after pending ledger failure without duplicate POST" do
+    ledger_path = temp_ledger_path()
+    parent = self()
+    {:ok, pending_failure} = Agent.start_link(fn -> true end)
+
+    ledger_writer = fn path, record ->
+      fail_pending =
+        record.status == "pending" and
+          Agent.get_and_update(pending_failure, fn should_fail -> {should_fail, false} end)
+
+      if fail_pending do
+        {:error, :ledger_write_failed}
+      else
+        append_test_record(path, record)
+      end
+    end
+
+    post_requester = fn url, _opts ->
+      cond do
+        String.ends_with?(url, "/agentmemory/remember") ->
+          send(parent, :remember_posted_after_intent)
+
+          {:ok,
+           %Req.Response{
+             status: 201,
+             body: %{"memory" => %{"id" => "mem_recovered_after_restart"}}
+           }}
+
+        String.ends_with?(url, "/agentmemory/smart-search") ->
+          {:ok,
+           %Req.Response{
+             status: 200,
+             body: %{
+               "results" => [
+                 %{
+                   "obsId" => "mem_recovered_after_restart",
+                   "content" => "Completion key issue-man-193:2026-07-13T15:00:00Z"
+                 }
+               ]
+             }
+           }}
+      end
+    end
+
+    opts = [
+      url: "http://127.0.0.1:3111",
+      ledger_path: ledger_path,
+      ledger_writer: ledger_writer,
+      post_requester: post_requester,
+      get_requester: fn _url, _opts ->
+        {:ok,
+         %Req.Response{
+           status: 200,
+           body: %{"memory" => %{"id" => "mem_recovered_after_restart"}}
+         }}
+      end
+    ]
+
+    assert {:error, :agentmemory_completion_failed} =
+             AgentMemory.remember_completion(completion_issue(), opts)
+
+    assert_receive :remember_posted_after_intent
+
+    assert {:ok, "mem_recovered_after_restart"} =
+             AgentMemory.remember_completion(completion_issue(), opts)
+
+    refute_receive :remember_posted_after_intent
+    assert Enum.count(read_ledger(ledger_path), &(&1["status"] == "intent")) == 1
+    assert List.last(read_ledger(ledger_path))["status"] == "ok"
+  end
+
+  test "an unresolved prior intent blocks instead of risking a duplicate remember POST" do
+    ledger_path = temp_ledger_path()
+
+    :ok =
+      append_test_record(ledger_path, %{
+        event: "remember_completion",
+        status: "intent",
+        completion_key: "issue-man-193:2026-07-13T15:00:00Z"
+      })
+
+    assert {:error, :agentmemory_completion_failed} =
+             AgentMemory.remember_completion(completion_issue(),
+               url: "http://127.0.0.1:3111",
+               ledger_path: ledger_path,
+               post_requester: fn url, _opts ->
+                 if String.ends_with?(url, "/agentmemory/remember") do
+                   flunk("ambiguous intent must never create a second remote memory")
+                 end
+
+                 {:ok, %Req.Response{status: 200, body: %{"results" => []}}}
+               end,
+               get_requester: fn _url, _opts ->
+                 flunk("lookup must not run without a recovered remote id")
+               end
+             )
+
+    record = List.last(read_ledger(ledger_path))
     assert record["status"] == "error"
-    assert record["operation"] == "smart_search"
-    assert record["error"] == "memory_not_recalled"
-    refute Map.has_key?(record, "saved_memory_id")
+    assert record["operation"] == "recover_intent"
+    assert record["error"] == "memory_not_found_for_intent"
   end
 
   defp issue do
@@ -375,5 +568,10 @@ defmodule SymphonyElixir.AgentMemoryTest do
     |> File.read!()
     |> String.split("\n", trim: true)
     |> Enum.map(&Jason.decode!/1)
+  end
+
+  defp append_test_record(path, record) do
+    File.mkdir_p!(Path.dirname(path))
+    File.write(path, Jason.encode!(record) <> "\n", [:append, :sync])
   end
 end
