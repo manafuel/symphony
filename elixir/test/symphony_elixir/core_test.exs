@@ -631,8 +631,8 @@ defmodule SymphonyElixir.CoreTest do
           identifier: issue.identifier
         })
 
-      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
       assert_receive {:memory_tracker_comment, ^issue_id, comment}
+      assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}
       assert comment =~ "symphony:agentmemory-completion-block"
       refute comment =~ "raw"
       assert MapSet.member?(updated_state.claimed, issue_id)

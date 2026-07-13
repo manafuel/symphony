@@ -1067,22 +1067,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp move_completion_to_human_review(%Issue{id: issue_id} = issue, error_class)
        when is_binary(issue_id) do
-    case Tracker.update_issue_state(issue_id, "Human Review") do
+    marker = "<!-- symphony:agentmemory-completion-block:#{issue.identifier || issue_id} -->"
+
+    comment =
+      marker <>
+        "\nAgentMemory completion evidence is not verified (error_class=#{error_class}). " <>
+        "The worker retained a blocker and moved this ticket to Human Review."
+
+    case Tracker.create_comment(issue_id, comment) do
       :ok ->
-        marker = "<!-- symphony:agentmemory-completion-block:#{issue.identifier || issue_id} -->"
-
-        _ =
-          Tracker.create_comment(
-            issue_id,
-            marker <>
-              "\nAgentMemory completion evidence is not verified (error_class=#{error_class}). " <>
-              "The worker retained a blocker and moved this ticket to Human Review."
-          )
-
-        :ok
+        Tracker.update_issue_state(issue_id, "Human Review")
 
       {:error, reason} ->
-        {:error, reason}
+        {:error, {:completion_blocker_comment_failed, reason}}
     end
   end
 
