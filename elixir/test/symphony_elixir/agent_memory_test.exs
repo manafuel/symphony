@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
 
   alias SymphonyElixir.{AgentMemory, AgentRunner}
   alias SymphonyElixir.Linear.Issue
+  @completion_key "issue:issue-man-193"
 
   test "recall is disabled without a configured URL" do
     issue = issue()
@@ -233,7 +234,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert record["saved_memory_id"] == "mem_completion_193"
     assert record["exact_lookup_verified"]
     assert record["search_verified"]
-    assert record["completion_key"] == "issue-man-193:2026-07-13T15:00:00Z"
+    assert record["completion_key"] == @completion_key
     assert Enum.all?(records, &(not Map.has_key?(&1, "content")))
     refute File.read!(ledger_path) =~ completion_issue().description
     refute File.read!(ledger_path) =~ auth_fixture
@@ -306,7 +307,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
     refute Map.has_key?(record, "saved_memory_id")
   end
 
-  test "completion retry survives smart-search failure without another remember POST" do
+  test "completion retry survives search failure and timestamp change without another remember POST" do
     ledger_path = temp_ledger_path()
     parent = self()
     {:ok, search_attempt} = Agent.start_link(fn -> 0 end)
@@ -363,8 +364,10 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert record["error"] == "memory_not_recalled"
     refute Map.has_key?(record, "saved_memory_id")
 
+    routed_issue = %{completion_issue() | updated_at: ~U[2026-07-13 16:00:00Z]}
+
     assert {:ok, "mem_not_recalled"} =
-             AgentMemory.remember_completion(completion_issue(), opts)
+             AgentMemory.remember_completion(routed_issue, opts)
 
     refute_receive :remember_posted_before_search_failure
     assert List.last(read_ledger(ledger_path))["status"] == "ok"
@@ -460,7 +463,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
                "results" => [
                  %{
                    "obsId" => "mem_recovered_after_restart",
-                   "content" => "Completion key issue-man-193:2026-07-13T15:00:00Z"
+                   "content" => "Completion key #{@completion_key}"
                  }
                ]
              }
@@ -502,7 +505,7 @@ defmodule SymphonyElixir.AgentMemoryTest do
       append_test_record(ledger_path, %{
         event: "remember_completion",
         status: "intent",
-        completion_key: "issue-man-193:2026-07-13T15:00:00Z"
+        completion_key: @completion_key
       })
 
     assert {:error, :agentmemory_completion_failed} =
@@ -525,6 +528,99 @@ defmodule SymphonyElixir.AgentMemoryTest do
     assert record["status"] == "error"
     assert record["operation"] == "recover_intent"
     assert record["error"] == "memory_not_found_for_intent"
+  end
+
+  test "bounded tail lookup tolerates unrelated corruption and finds the current completion" do
+    ledger_path = temp_ledger_path()
+    parent = self()
+
+    unrelated =
+      Enum.map_join(1..64, "\n", fn index ->
+        Jason.encode!(%{
+          event: "unrelated",
+          sequence: index,
+          payload: String.duplicate("x", 32)
+        })
+      end)
+
+    File.mkdir_p!(Path.dirname(ledger_path))
+    File.write!(ledger_path, unrelated <> "\n{malformed unrelated record}\n")
+
+    :ok =
+      append_test_record(ledger_path, %{
+        event: "remember_completion",
+        status: "ok",
+        completion_key: @completion_key,
+        saved_memory_id: "mem_bounded_tail"
+      })
+
+    assert {:ok, :already_recorded} =
+             AgentMemory.remember_completion(completion_issue(),
+               url: "http://127.0.0.1:3111",
+               ledger_path: ledger_path,
+               ledger_scan_bytes: 256,
+               post_requester: fn _url, _opts ->
+                 send(parent, :unexpected_bounded_tail_post)
+                 {:error, :unexpected_request}
+               end,
+               get_requester: fn _url, _opts ->
+                 send(parent, :unexpected_bounded_tail_lookup)
+                 {:error, :unexpected_request}
+               end
+             )
+
+    refute_receive :unexpected_bounded_tail_post
+    refute_receive :unexpected_bounded_tail_lookup
+  end
+
+  test "bounded index resumes an intent outside the ledger tail without another remember POST" do
+    ledger_path = temp_ledger_path()
+    parent = self()
+
+    assert {:error, :agentmemory_completion_failed} =
+             AgentMemory.remember_completion(completion_issue(),
+               url: "http://127.0.0.1:3111",
+               ledger_path: ledger_path,
+               ledger_scan_bytes: 256,
+               post_requester: fn _url, _opts ->
+                 {:error, %Req.TransportError{reason: :timeout}}
+               end,
+               get_requester: fn _url, _opts ->
+                 flunk("lookup must not run after the initial remember timeout")
+               end
+             )
+
+    unrelated =
+      Enum.map_join(1..64, "\n", fn index ->
+        Jason.encode!(%{
+          event: "unrelated",
+          sequence: index,
+          payload: String.duplicate("y", 32)
+        })
+      end)
+
+    File.write!(ledger_path, unrelated <> "\n", [:append])
+
+    assert {:error, :agentmemory_completion_failed} =
+             AgentMemory.remember_completion(completion_issue(),
+               url: "http://127.0.0.1:3111",
+               ledger_path: ledger_path,
+               ledger_scan_bytes: 256,
+               post_requester: fn url, _opts ->
+                 if String.ends_with?(url, "/agentmemory/remember") do
+                   send(parent, :unexpected_out_of_window_remember)
+                 end
+
+                 {:ok, %Req.Response{status: 200, body: %{"results" => []}}}
+               end,
+               get_requester: fn _url, _opts ->
+                 send(parent, :unexpected_out_of_window_lookup)
+                 {:error, :unexpected_request}
+               end
+             )
+
+    refute_receive :unexpected_out_of_window_remember
+    refute_receive :unexpected_out_of_window_lookup
   end
 
   defp issue do

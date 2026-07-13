@@ -7,6 +7,7 @@ defmodule SymphonyElixir.AgentMemory do
 
   @default_timeout_ms 8_000
   @max_timeout_ms 8_000
+  @completion_ledger_scan_bytes 1_048_576
   @max_results 5
   @max_item_chars 800
   @max_context_chars 4_000
@@ -70,7 +71,7 @@ defmodule SymphonyElixir.AgentMemory do
         {:error, :agentmemory_completion_failed}
 
       true ->
-        case completion_ledger_state(ledger_path, completion_key) do
+        case completion_ledger_state(ledger_path, completion_key, opts) do
           {:ok, _memory_id} ->
             {:ok, :already_recorded}
 
@@ -575,15 +576,7 @@ defmodule SymphonyElixir.AgentMemory do
 
   defp completion_key(%Issue{} = issue) do
     issue_key = issue.id || issue.identifier || "unknown"
-
-    updated_at =
-      case issue.updated_at do
-        %DateTime{} = value -> DateTime.to_iso8601(value)
-        value when is_binary(value) and value != "" -> value
-        _ -> "state:#{safe_query_part(issue.state, 80)}"
-      end
-
-    "#{issue_key}:#{updated_at}"
+    "issue:#{safe_query_part(issue_key, 200) || "unknown"}"
   end
 
   defp completion_ledger_path(opts) do
@@ -594,16 +587,116 @@ defmodule SymphonyElixir.AgentMemory do
     end
   end
 
-  defp completion_ledger_state(path, completion_key) do
-    if File.regular?(path) do
-      path
-      |> File.stream!([], :line)
-      |> Enum.reduce(:none, &completion_record_state(&1, &2, completion_key))
-    else
-      :none
+  defp completion_ledger_state(path, completion_key, opts) do
+    case read_completion_index(path, completion_key) do
+      {:ok, state} ->
+        if File.regular?(path), do: state, else: {:error, :ledger_missing_for_index}
+
+      :missing ->
+        if File.regular?(path) do
+          read_completion_ledger_tail(path, completion_key, opts)
+        else
+          :none
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   rescue
     _exception -> {:error, :ledger_read_failed}
+  end
+
+  defp read_completion_index(path, completion_key) do
+    index_path = completion_index_path(path, completion_key)
+
+    if File.regular?(index_path) do
+      with {:ok, encoded} <- File.read(index_path),
+           {:ok, record} <- Jason.decode(encoded),
+           true <- valid_completion_index_record?(record, completion_key),
+           state when state != :none <- completion_state_transition(:none, record) do
+        {:ok, state}
+      else
+        _other -> {:error, :invalid_completion_index}
+      end
+    else
+      :missing
+    end
+  end
+
+  defp valid_completion_index_record?(record, completion_key) do
+    is_map(record) and record["event"] == "remember_completion" and
+      record["completion_key"] == completion_key
+  end
+
+  defp read_completion_ledger_tail(path, completion_key, opts) do
+    scan_bytes = completion_ledger_scan_bytes(opts)
+
+    with {:ok, %File.Stat{size: size}} <- File.stat(path),
+         {:ok, device} <- :file.open(String.to_charlist(path), [:read, :binary]) do
+      try do
+        start_offset = max(size - scan_bytes, 0)
+
+        with {:ok, _position} <- :file.position(device, start_offset),
+             {:ok, data} <- read_completion_tail(device, scan_bytes) do
+          truncated? = start_offset > 0
+
+          data
+          |> completion_tail_payload(truncated?)
+          |> completion_tail_state(completion_key, truncated?)
+          |> cache_completion_tail_state(path, completion_key)
+        end
+      after
+        :file.close(device)
+      end
+    else
+      _error -> {:error, :ledger_read_failed}
+    end
+  end
+
+  defp read_completion_tail(device, scan_bytes) do
+    case :file.read(device, scan_bytes) do
+      {:ok, data} -> {:ok, data}
+      :eof -> {:ok, ""}
+      {:error, _reason} -> {:error, :ledger_read_failed}
+    end
+  end
+
+  defp completion_tail_payload(data, false), do: data
+
+  defp completion_tail_payload(data, true) do
+    case :binary.match(data, "\n") do
+      {position, 1} ->
+        remaining = byte_size(data) - position - 1
+        binary_part(data, position + 1, remaining)
+
+      :nomatch ->
+        ""
+    end
+  end
+
+  defp completion_tail_state(data, completion_key, truncated?) do
+    state =
+      data
+      |> String.split("\n", trim: true)
+      |> Enum.reduce(:none, &completion_record_state(&1, &2, completion_key))
+
+    if state == :none and truncated? do
+      {:error, :completion_state_outside_scan_window}
+    else
+      state
+    end
+  end
+
+  defp cache_completion_tail_state({:error, _reason} = error, _path, _completion_key),
+    do: error
+
+  defp cache_completion_tail_state(:none, _path, _completion_key), do: :none
+
+  defp cache_completion_tail_state(state, path, completion_key) do
+    case write_completion_index_state(path, completion_key, state) do
+      :ok -> state
+      {:error, _reason} = error -> error
+    end
   end
 
   defp completion_record_state(_line, {:error, _reason} = state, _completion_key), do: state
@@ -619,7 +712,11 @@ defmodule SymphonyElixir.AgentMemory do
         end
 
       {:error, _reason} ->
-        {:error, :invalid_ledger_record}
+        if String.contains?(line, completion_key) do
+          {:error, :invalid_current_completion_record}
+        else
+          state
+        end
     end
   end
 
@@ -650,6 +747,99 @@ defmodule SymphonyElixir.AgentMemory do
 
   defp completion_state_transition(:none, %{"status" => "intent"}), do: :intent
   defp completion_state_transition(state, _record), do: state
+
+  defp completion_ledger_scan_bytes(opts) do
+    opts
+    |> Keyword.get(:ledger_scan_bytes, @completion_ledger_scan_bytes)
+    |> normalize_completion_scan_bytes()
+  end
+
+  defp normalize_completion_scan_bytes(value) when is_integer(value) do
+    value |> max(128) |> min(@completion_ledger_scan_bytes)
+  end
+
+  defp normalize_completion_scan_bytes(_value), do: @completion_ledger_scan_bytes
+
+  defp completion_index_path(path, completion_key) do
+    digest =
+      :sha256
+      |> :crypto.hash(completion_key)
+      |> Base.encode16(case: :lower)
+
+    Path.join(path <> ".completion-index", digest <> ".json")
+  end
+
+  defp update_completion_index(path, completion_key, record) do
+    current_state =
+      case read_completion_index(path, completion_key) do
+        {:ok, state} -> state
+        :missing -> :none
+        {:error, _reason} = error -> error
+      end
+
+    case current_state do
+      {:error, _reason} = error ->
+        error
+
+      state ->
+        next_state = completion_state_transition(state, stringify_record_keys(record))
+
+        if next_state == state do
+          :ok
+        else
+          write_completion_index_state(path, completion_key, next_state)
+        end
+    end
+  end
+
+  defp stringify_record_keys(record) do
+    Map.new(record, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp write_completion_index_state(path, completion_key, state) do
+    index_path = completion_index_path(path, completion_key)
+    record = completion_index_record(completion_key, state)
+
+    :global.trans({__MODULE__, index_path}, fn ->
+      with :ok <- File.mkdir_p(Path.dirname(index_path)),
+           :ok <- File.write(index_path, Jason.encode!(record) <> "\n", [:write, :sync]) do
+        :ok
+      else
+        {:error, _reason} -> {:error, :completion_index_write_failed}
+      end
+    end)
+  rescue
+    _exception -> {:error, :completion_index_write_failed}
+  end
+
+  defp completion_index_record(completion_key, :intent) do
+    %{
+      schema_version: 1,
+      event: "remember_completion",
+      completion_key: completion_key,
+      status: "intent"
+    }
+  end
+
+  defp completion_index_record(completion_key, {:pending, memory_id}) do
+    %{
+      schema_version: 1,
+      event: "remember_completion",
+      completion_key: completion_key,
+      status: "pending",
+      saved_memory_id: memory_id
+    }
+  end
+
+  defp completion_index_record(completion_key, {:ok, memory_id}) do
+    %{
+      schema_version: 1,
+      event: "remember_completion",
+      completion_key: completion_key,
+      status: "ok",
+      saved_memory_id: memory_id
+    }
+  end
 
   defp write_completion_ledger(
          issue,
@@ -682,7 +872,13 @@ defmodule SymphonyElixir.AgentMemory do
 
     ledger_writer = Keyword.get(opts, :ledger_writer, &append_json_line/2)
 
-    ledger_writer.(path, record)
+    with :ok <- ledger_writer.(path, record),
+         :ok <- update_completion_index(path, completion_key, record) do
+      :ok
+    else
+      {:error, _reason} = error -> error
+      _other -> {:error, :ledger_write_failed}
+    end
   rescue
     exception ->
       Logger.warning("Unable to append AgentMemory completion ledger error=#{error_class(exception)}")
