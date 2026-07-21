@@ -197,7 +197,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server injects MANAfuel local shell and hosted shell fallback instructions at thread start" do
+  test "app server advertises hosted sandboxed shell and issue-local clone instructions at thread start" do
     payload =
       AppServer.thread_start_payload("C:/workspaces/MT-1002", %{
         approval_policy: "never",
@@ -205,31 +205,31 @@ defmodule SymphonyElixir.AppServerTest do
       })
 
     instructions = get_in(payload, ["params", "developerInstructions"])
+    dynamic_tools = get_in(payload, ["params", "dynamicTools"])
 
     assert payload["method"] == "thread/start"
     assert get_in(payload, ["params", "approvalPolicy"]) == "never"
     assert get_in(payload, ["params", "sandbox"]) == "workspace-write"
     assert get_in(payload, ["params", "cwd"]) == "C:/workspaces/MT-1002"
-    assert is_list(get_in(payload, ["params", "dynamicTools"]))
+    assert Enum.map(dynamic_tools, & &1["name"]) == ["linear_graphql", "write_run_artifact"]
     assert is_binary(instructions)
-    assert instructions =~ "Prefer the dynamic `local_shell` tool"
-    assert instructions =~ "hosted `shell_command` is a fallback only"
-    assert instructions =~ "`local_shell` must still be simple"
+    refute instructions =~ "local_shell"
+    assert instructions =~ "Use hosted sandboxed `shell_command` for all local command work"
     assert instructions =~ "direct PowerShell read/navigation cmdlets"
     assert instructions =~ "Get-ChildItem"
-    assert instructions =~ "cmd.exe /d /c dir /b"
-    assert instructions =~ "Use `write_run_artifact` for required plan"
-    assert instructions =~ "`write_run_artifact` for run evidence"
-    assert instructions =~ "apply_patch for product/repo file edits"
-    assert instructions =~ "bulk-generate files through shell_command"
-    assert instructions =~ "issue at most one hosted shell_command tool call per assistant turn"
-    assert instructions =~ "Do not move a ticket to Human Review solely"
+    assert instructions =~ "current issue workspace `runs/` directory"
+    assert instructions =~ "`write_run_artifact` for issue-local run evidence"
+    assert instructions =~ "apply_patch for repository edits"
+    assert instructions =~ "Issue at most one hosted `shell_command` tool call per assistant turn"
+    assert instructions =~ "do not move a ticket to Human Review solely"
     assert instructions =~ "has already applied packaged MANAfuel skill orientation"
     assert instructions =~ "Do not use hosted shell_command to read packaged SKILL.md"
     assert instructions =~ "manafuel-codex:* skill files"
     assert instructions =~ "current cwd is a scratch Symphony issue workspace"
     assert instructions =~ "Before reading or editing product repository files"
-    assert instructions =~ "manafuel.implementation_root/<repo>"
+    assert instructions =~ "issue-local normal clone"
+    assert instructions =~ "based on current `origin/main`"
+    assert instructions =~ "Do not use a linked Git worktree"
   end
 
   test "app server wraps local Windows app-server launch with hidden stdio launcher" do

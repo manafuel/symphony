@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
   alias SymphonyElixir.Codex.DynamicTool
 
-  test "tool_specs advertises the dynamic input contracts" do
+  test "tool_specs advertises only the default dynamic input contracts" do
     specs = DynamicTool.tool_specs()
 
     assert %{
@@ -20,20 +20,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert linear_description =~ "Linear"
 
-    assert %{
-             "description" => shell_description,
-             "inputSchema" => %{
-               "properties" => %{
-                 "command" => _,
-                 "timeout_ms" => _,
-                 "workdir" => _
-               },
-               "required" => ["command"],
-               "type" => "object"
-             }
-           } = Enum.find(specs, &(&1["name"] == "local_shell"))
-
-    assert shell_description =~ "local shell"
+    refute Enum.any?(specs, &(&1["name"] == "local_shell"))
 
     assert %{
              "description" => artifact_description,
@@ -48,7 +35,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
              }
            } = Enum.find(specs, &(&1["name"] == "write_run_artifact"))
 
-    assert artifact_description =~ "run artifacts"
+    assert artifact_description =~ "issue workspace runs directory"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -59,7 +46,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql", "local_shell", "write_run_artifact"]
+               "supportedTools" => ["linear_graphql", "write_run_artifact"]
              }
            }
 
@@ -71,7 +58,59 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
            ]
   end
 
-  test "local_shell runs a bounded command from the issue workspace" do
+  test "local_shell is denied by default without executing the command" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-denied-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      marker = Path.join(workspace, "must-not-exist")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"command" => "git init must-not-exist"},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+
+      assert Jason.decode!(response["output"]) == %{
+               "error" => %{
+                 "message" => "`local_shell` is disabled for issue agents; use hosted sandboxed `shell_command`."
+               }
+             }
+
+      refute File.exists?(marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell cannot be enabled through tool arguments" do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-local-shell-tool-args-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      marker = Path.join(workspace, "must-not-exist")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "local_shell",
+          %{"allow_local_shell" => true, "command" => "git init must-not-exist"},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+      refute File.exists?(marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "local_shell runs only with the explicit internal host capability" do
     test_root = Path.join(System.tmp_dir!(), "symphony-local-shell-#{System.unique_integer([:positive])}")
 
     try do
@@ -82,7 +121,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo local-shell-ok", "timeout_ms" => 10_000},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == true
@@ -109,7 +149,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo empty-launcher-ok", "timeout_ms" => 10_000},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == true
@@ -136,7 +177,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo trusted-launcher-ok", "timeout_ms" => 10_000},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == true
@@ -160,7 +202,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo no > out.txt"},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == false
@@ -189,7 +232,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo no", "workdir" => outside},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == false
@@ -216,7 +260,8 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "local_shell",
           %{"command" => "echo no", "workdir" => coordination_one},
-          workspace: workspace
+          workspace: workspace,
+          allow_local_shell: true
         )
 
       assert response["success"] == false
@@ -258,15 +303,12 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     end
   end
 
-  test "write_run_artifact writes under the MANAfuel control run root from an issue workspace" do
-    test_root =
-      Path.join(System.tmp_dir!(), "symphony-control-run-artifact-#{System.unique_integer([:positive])}")
+  test "write_run_artifact rejects absolute paths even under the issue runs directory" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-absolute-run-artifact-#{System.unique_integer([:positive])}")
 
     try do
-      manafuel_root = Path.join(test_root, "manafuel")
-      workspace = Path.join([manafuel_root, "worktrees", "symphony", "MAN-118"])
-      control_runs = Path.join([manafuel_root, "development", ".codex", "runs"])
-      artifact_path = Path.join([control_runs, "2026-07-04-man-118", "handoff.md"])
+      workspace = Path.join(test_root, "workspace")
+      artifact_path = Path.join([workspace, "runs", "handoff.md"])
       File.mkdir_p!(workspace)
 
       response =
@@ -279,14 +321,14 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
           workspace: workspace
         )
 
-      assert response["success"] == true
-      assert File.read!(artifact_path) == "handoff\n"
+      assert response["success"] == false
+      refute File.exists?(artifact_path)
     after
       File.rm_rf(test_root)
     end
   end
 
-  test "write_run_artifact rejects paths outside run roots" do
+  test "write_run_artifact rejects relative traversal outside issue runs" do
     test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-outside-#{System.unique_integer([:positive])}")
 
     try do
@@ -297,7 +339,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
         DynamicTool.execute(
           "write_run_artifact",
           %{
-            "path" => Path.join(test_root, "outside.md"),
+            "path" => Path.join("..", "outside.md"),
             "content" => "no\n"
           },
           workspace: workspace
@@ -306,10 +348,64 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       assert response["success"] == false
 
       assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
-               "`write_run_artifact.path` must stay under the issue workspace runs directory or MANAfuel control .codex/runs."
+               "`write_run_artifact.path` must stay under the issue workspace `runs` directory."
 
       refute File.exists?(Path.join(test_root, "outside.md"))
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact rejects cross-issue workspace paths" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-cross-issue-#{System.unique_integer([:positive])}")
+
+    try do
+      issue_root = Path.join(test_root, "issues")
+      workspace = Path.join(issue_root, "MAN-118")
+      other_workspace = Path.join(issue_root, "MAN-119")
+      other_artifact = Path.join([other_workspace, "runs", "proof.md"])
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(other_workspace)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => Path.join(["..", "MAN-119", "runs", "proof.md"]),
+            "content" => "no\n"
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+      refute File.exists?(other_artifact)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact rejects a runs-root directory reparse escape" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-reparse-#{System.unique_integer([:positive])}")
+    workspace = Path.join(test_root, "workspace")
+    runs_root = Path.join(workspace, "runs")
+    outside = Path.join(test_root, "outside")
+
+    try do
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(outside)
+      assert :ok = create_directory_link(outside, runs_root)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{"path" => "runs/proof.md", "content" => "no\n"},
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+      refute File.exists?(Path.join(outside, "proof.md"))
+    after
+      remove_directory_link(runs_root)
       File.rm_rf(test_root)
     end
   end
@@ -610,4 +706,32 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
     assert response["output"] == ":ok"
   end
+
+  defp create_directory_link(target, link_path) do
+    if windows?() do
+      case System.cmd(
+             "cmd.exe",
+             ["/d", "/c", "mklink", "/J", windows_path(link_path), windows_path(target)],
+             stderr_to_stdout: true
+           ) do
+        {_output, 0} -> :ok
+        {output, status} -> {:error, {status, output}}
+      end
+    else
+      File.ln_s(target, link_path)
+    end
+  end
+
+  defp remove_directory_link(link_path) do
+    if File.exists?(link_path) do
+      if windows?() do
+        System.cmd("cmd.exe", ["/d", "/c", "rmdir", windows_path(link_path)], stderr_to_stdout: true)
+      else
+        File.rm(link_path)
+      end
+    end
+  end
+
+  defp windows?, do: match?({:win32, _}, :os.type())
+  defp windows_path(path), do: String.replace(path, "/", "\\")
 end

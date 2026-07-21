@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   """
 
   alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.PathSafety
 
   @linear_graphql_tool "linear_graphql"
   @local_shell_tool "local_shell"
@@ -33,30 +34,8 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       }
     }
   }
-  @local_shell_description """
-  Run one bounded local shell command for Symphony issue work when hosted shell_command is unavailable. Prefer this for read, status, test, git, and checked-in script commands. The command runs from the issue workspace by default and may use explicit workdir only under the MANAfuel workspace roots.
-  """
-  @local_shell_input_schema %{
-    "type" => "object",
-    "additionalProperties" => false,
-    "required" => ["command"],
-    "properties" => %{
-      "command" => %{
-        "type" => "string",
-        "description" => "One non-interactive shell command. Do not send inline scripts, redirection, pipes, or multi-command orchestration."
-      },
-      "workdir" => %{
-        "type" => ["string", "null"],
-        "description" => "Optional working directory. Relative values resolve under the issue workspace."
-      },
-      "timeout_ms" => %{
-        "type" => ["integer", "null"],
-        "description" => "Optional timeout in milliseconds, capped at 300000."
-      }
-    }
-  }
   @write_run_artifact_description """
-  Write bounded text evidence for Symphony run artifacts. Use this for plan, discovery, validation, handoff, proof JSON, and other non-secret run-folder files when apply_patch cannot write from the child app-server workspace. Targets must stay under the issue workspace runs directory or the MANAfuel control .codex/runs directory.
+  Write bounded text evidence under the current Symphony issue workspace runs directory.
   """
   @write_run_artifact_input_schema %{
     "type" => "object",
@@ -65,7 +44,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     "properties" => %{
       "path" => %{
         "type" => "string",
-        "description" => "Relative or absolute output path under runs/ or the control .codex/runs root."
+        "description" => "Relative output path under the current issue workspace runs/ directory."
       },
       "content" => %{
         "type" => "string",
@@ -85,7 +64,11 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         execute_linear_graphql(arguments, opts)
 
       @local_shell_tool ->
-        execute_local_shell(arguments, opts)
+        if Keyword.get(opts, :allow_local_shell) == true do
+          execute_local_shell(arguments, opts)
+        else
+          failure_response(local_shell_error_payload(:local_shell_disabled))
+        end
 
       @write_run_artifact_tool ->
         execute_write_run_artifact(arguments, opts)
@@ -107,11 +90,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "name" => @linear_graphql_tool,
         "description" => @linear_graphql_description,
         "inputSchema" => @linear_graphql_input_schema
-      },
-      %{
-        "name" => @local_shell_tool,
-        "description" => @local_shell_description,
-        "inputSchema" => @local_shell_input_schema
       },
       %{
         "name" => @write_run_artifact_tool,
@@ -211,15 +189,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     workspace = Keyword.get(opts, :workspace) || File.cwd!()
 
     with {:ok, path, content, overwrite?} <- normalize_write_run_artifact_arguments(arguments),
-         {:ok, artifact_path} <- normalize_write_run_artifact_path(path, workspace),
-         :ok <- validate_write_run_artifact_path(artifact_path, workspace),
+         {:ok, artifact_path, runs_root} <- normalize_write_run_artifact_path(path, workspace),
+         :ok <- validate_write_run_artifact_path(artifact_path, runs_root),
          :ok <- validate_write_run_artifact_content(content),
-         existed? = File.exists?(artifact_path),
-         :ok <- write_run_artifact_file(artifact_path, content, overwrite?) do
+         {:ok, written_path, existed?} <-
+           write_run_artifact_file(artifact_path, runs_root, content, overwrite?) do
       dynamic_tool_response(
         true,
         encode_payload(%{
-          "path" => artifact_path,
+          "path" => written_path,
           "bytes" => byte_size(content),
           "overwritten" => existed?
         })
@@ -268,21 +246,47 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   defp normalize_write_run_artifact_path(path, workspace) do
-    expanded =
-      if Path.type(path) == :absolute do
-        path
-      else
-        Path.join(workspace, path)
-      end
-      |> Path.expand()
+    if Path.type(path) == :relative do
+      expanded_workspace = Path.expand(workspace)
+      runs_root = Path.expand(Path.join(expanded_workspace, "runs"))
+      artifact_path = Path.expand(path, expanded_workspace)
 
-    {:ok, expanded}
+      with :ok <- validate_write_run_artifact_path(artifact_path, runs_root),
+           {:ok, canonical_workspace} <- canonicalize_write_run_artifact_path(expanded_workspace),
+           expected_runs_root = Path.expand(Path.join(canonical_workspace, "runs")),
+           {:ok, canonical_runs_root} <- canonicalize_write_run_artifact_path(runs_root),
+           :ok <- validate_write_run_artifact_runs_root(canonical_runs_root, expected_runs_root),
+           {:ok, canonical_artifact_path} <- canonicalize_write_run_artifact_path(artifact_path),
+           :ok <- validate_write_run_artifact_path(canonical_artifact_path, canonical_runs_root) do
+        {:ok, canonical_artifact_path, canonical_runs_root}
+      end
+    else
+      {:error, {:run_artifact_path_must_be_relative, path}}
+    end
   end
 
-  defp validate_write_run_artifact_path(artifact_path, workspace) do
+  defp canonicalize_write_run_artifact_path(path) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} ->
+        {:ok, canonical_path}
+
+      {:error, reason} ->
+        {:error, {:run_artifact_path_unreadable, path, reason}}
+    end
+  end
+
+  defp validate_write_run_artifact_runs_root(canonical_runs_root, expected_runs_root) do
+    if same_path?(canonical_runs_root, expected_runs_root) do
+      :ok
+    else
+      {:error, {:run_artifact_runs_root_reparse, canonical_runs_root}}
+    end
+  end
+
+  defp validate_write_run_artifact_path(artifact_path, runs_root) do
     cond do
-      not allowed_write_run_artifact_path?(artifact_path, workspace) ->
-        {:error, {:run_artifact_path_outside_allowed_roots, artifact_path}}
+      not path_descendant?(artifact_path, runs_root) ->
+        {:error, {:run_artifact_path_outside_issue_runs, artifact_path}}
 
       File.dir?(artifact_path) ->
         {:error, {:run_artifact_path_is_directory, artifact_path}}
@@ -292,29 +296,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp allowed_write_run_artifact_path?(artifact_path, workspace) do
-    allowed_write_run_artifact_roots(workspace)
-    |> Enum.any?(&path_within?(artifact_path, &1))
+  defp path_descendant?(path, root) do
+    normalized_path = normalize_path_for_compare(path)
+    normalized_root = normalize_path_for_compare(root)
+
+    String.starts_with?(normalized_path, normalized_root <> "/")
   end
 
-  defp allowed_write_run_artifact_roots(workspace) do
-    workspace = Path.expand(workspace)
-
-    workspace_roots = [
-      Path.join(workspace, "runs"),
-      Path.join([workspace, ".codex", "runs"])
-    ]
-
-    control_roots =
-      case manafuel_root_for_workspace(workspace) do
-        nil -> []
-        root -> [Path.join([root, "development", ".codex", "runs"])]
-      end
-
-    (workspace_roots ++ control_roots)
-    |> Enum.map(&Path.expand/1)
-    |> Enum.uniq()
-  end
+  defp same_path?(left, right),
+    do: normalize_path_for_compare(left) == normalize_path_for_compare(right)
 
   defp validate_write_run_artifact_content(content) do
     cond do
@@ -329,11 +319,20 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     end
   end
 
-  defp write_run_artifact_file(path, content, overwrite?) do
+  defp write_run_artifact_file(path, runs_root, content, overwrite?) do
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- write_run_artifact_contents(path, content, overwrite?) do
-      :ok
+         {:ok, current_runs_root} <- canonicalize_write_run_artifact_path(runs_root),
+         :ok <- validate_write_run_artifact_runs_root(current_runs_root, runs_root),
+         {:ok, safe_path} <- canonicalize_write_run_artifact_path(path),
+         :ok <- validate_write_run_artifact_path(safe_path, current_runs_root),
+         existed? = File.exists?(safe_path),
+         :ok <- write_run_artifact_contents(safe_path, content, overwrite?) do
+      {:ok, safe_path, existed?}
     else
+      {:error, {:run_artifact_path_unreadable, _path, _reason} = reason} -> {:error, reason}
+      {:error, {:run_artifact_runs_root_reparse, _path} = reason} -> {:error, reason}
+      {:error, {:run_artifact_path_outside_issue_runs, _path} = reason} -> {:error, reason}
+      {:error, {:run_artifact_path_is_directory, _path} = reason} -> {:error, reason}
       {:error, reason} -> {:error, {:run_artifact_write_failed, reason}}
     end
   end
@@ -750,6 +749,14 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
+  defp local_shell_error_payload(:local_shell_disabled) do
+    %{
+      "error" => %{
+        "message" => "`local_shell` is disabled for issue agents; use hosted sandboxed `shell_command`."
+      }
+    }
+  end
+
   defp local_shell_error_payload(:missing_local_shell_command) do
     %{
       "error" => %{
@@ -861,11 +868,39 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
-  defp write_run_artifact_error_payload({:run_artifact_path_outside_allowed_roots, artifact_path}) do
+  defp write_run_artifact_error_payload({:run_artifact_path_must_be_relative, artifact_path}) do
     %{
       "error" => %{
-        "message" => "`write_run_artifact.path` must stay under the issue workspace runs directory or MANAfuel control .codex/runs.",
+        "message" => "`write_run_artifact.path` must be relative to the issue workspace.",
         "path" => artifact_path
+      }
+    }
+  end
+
+  defp write_run_artifact_error_payload({:run_artifact_path_outside_issue_runs, artifact_path}) do
+    %{
+      "error" => %{
+        "message" => "`write_run_artifact.path` must stay under the issue workspace `runs` directory.",
+        "path" => artifact_path
+      }
+    }
+  end
+
+  defp write_run_artifact_error_payload({:run_artifact_runs_root_reparse, artifact_path}) do
+    %{
+      "error" => %{
+        "message" => "The issue workspace `runs` directory must not be a reparse escape.",
+        "path" => artifact_path
+      }
+    }
+  end
+
+  defp write_run_artifact_error_payload({:run_artifact_path_unreadable, artifact_path, reason}) do
+    %{
+      "error" => %{
+        "message" => "`write_run_artifact.path` could not be canonicalized safely.",
+        "path" => artifact_path,
+        "reason" => inspect(reason)
       }
     }
   end
