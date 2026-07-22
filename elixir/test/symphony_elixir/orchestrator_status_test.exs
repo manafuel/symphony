@@ -3,7 +3,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
   defmodule BlockingLinearClient do
     def fetch_candidate_issues, do: {:ok, []}
-    def fetch_issues_by_states(_states), do: {:ok, []}
+
+    def fetch_issues_by_states(_states) do
+      case Application.get_env(:symphony_elixir, :blocking_cleanup_recipient) do
+        recipient when is_pid(recipient) ->
+          send(recipient, {:terminal_workspace_cleanup_started, self()})
+
+          receive do
+            :release_terminal_workspace_cleanup -> {:ok, []}
+          end
+
+        _ ->
+          {:ok, []}
+      end
+    end
+
     def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
 
     def graphql(query, variables) do
@@ -240,6 +254,62 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
       assert_receive {:state_after_refresh_timeout, state_after_timeout}, 6_500
       assert Process.alive?(pid)
+      assert state_after_timeout.poll_interval_ms == state_before_timeout.poll_interval_ms
+      assert state_after_timeout.max_concurrent_agents == state_before_timeout.max_concurrent_agents
+      assert state_after_timeout.max_issue_tokens == state_before_timeout.max_issue_tokens
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "poll cycle skips dispatch while the workflow store remains unavailable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_concurrent_agents: 3,
+      max_issue_tokens: 321,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :UnavailablePollCycleOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue = %Issue{
+      id: "issue-unavailable-poll-cycle",
+      identifier: "MT-UNAVAILABLE-POLL-CYCLE",
+      title: "Do not dispatch without current workflow state",
+      state: "Todo",
+      url: "https://example.org/issues/MT-UNAVAILABLE-POLL-CYCLE"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    state_before_timeout = :sys.get_state(pid)
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, :run_poll_cycle)
+
+      parent = self()
+      spawn(fn -> send(parent, {:state_after_unavailable_poll, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_unavailable_poll, state_after_timeout}, 6_500
+      assert Process.alive?(pid)
+      assert state_after_timeout.running == %{}
+      refute MapSet.member?(state_after_timeout.claimed, issue.id)
       assert state_after_timeout.poll_interval_ms == state_before_timeout.poll_interval_ms
       assert state_after_timeout.max_concurrent_agents == state_before_timeout.max_concurrent_agents
       assert state_after_timeout.max_issue_tokens == state_before_timeout.max_issue_tokens
@@ -1546,6 +1616,57 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert startup_elapsed_ms < 750
     assert %{polling: %{poll_interval_ms: 60_000}} = GenServer.call(pid, :snapshot)
     assert wait_until(fn -> not File.exists?(workspace) end, 5_000)
+    assert wait_until(fn -> is_nil(:sys.get_state(pid).terminal_workspace_cleanup) end, 1_000)
+  end
+
+  test "blocked startup cleanup cannot survive an orchestrator crash or graceful restart stop" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+    Application.put_env(:symphony_elixir, :blocking_cleanup_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+      Application.delete_env(:symphony_elixir, :blocking_cleanup_recipient)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :OwnedStartupCleanupOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert_receive {:terminal_workspace_cleanup_started, cleanup_pid}, 1_000
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+      if Process.alive?(cleanup_pid), do: Process.exit(cleanup_pid, :kill)
+    end)
+
+    assert %Task{pid: ^cleanup_pid} = :sys.get_state(pid).terminal_workspace_cleanup
+
+    owner_ref = Process.monitor(pid)
+    cleanup_ref = Process.monitor(cleanup_pid)
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:DOWN, ^cleanup_ref, :process, ^cleanup_pid, _reason}, 1_000
+
+    {:ok, restarted_pid} = Orchestrator.start_link(name: orchestrator_name)
+    assert_receive {:terminal_workspace_cleanup_started, restarted_cleanup_pid}, 1_000
+    refute restarted_cleanup_pid == cleanup_pid
+
+    on_exit(fn ->
+      if Process.alive?(restarted_pid), do: Process.exit(restarted_pid, :kill)
+      if Process.alive?(restarted_cleanup_pid), do: Process.exit(restarted_cleanup_pid, :kill)
+    end)
+
+    restarted_cleanup_ref = Process.monitor(restarted_cleanup_pid)
+    :ok = GenServer.stop(restarted_pid, :normal)
+
+    assert_receive {:DOWN, ^restarted_cleanup_ref, :process, ^restarted_cleanup_pid, _reason}, 1_000
   end
 
   test "owned worker task exits when its orchestrator is killed" do

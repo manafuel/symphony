@@ -1633,8 +1633,27 @@ defmodule SymphonyElixir.AppServerTest do
                )
              )
 
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("rg -g '*.ex' --files", clone_subdir),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("git --no-pager status --short --branch", clone),
+                 workspace
+               )
+             )
+
       blocked_cases = [
         payload.("git status --short --branch", workspace),
+        payload.("git -C . worktree list", workspace),
+        payload.("git --no-pager worktree list", workspace),
+        payload.("rg -g '*.ex' --files", workspace),
+        payload.("cmd.exe /d /c git --no-pager worktree list", workspace),
+        payload.("powershell.exe -NoProfile -Command \"rg -g '*.ex' --files\"", workspace),
         payload.("git status --short --branch", Path.join(workspace, "runs")),
         payload.("git status --short --branch", fake_clone),
         payload.("git status --short --branch", unknown_clone),
@@ -1645,6 +1664,7 @@ defmodule SymphonyElixir.AppServerTest do
         payload.("git status --short --branch", linked_worktree),
         payload.("git status --short --branch", Path.join([clone, "..", "one"])),
         payload.("git -C .. status --short --branch", clone),
+        payload.("git -C#{other_issue_clone} status --short --branch", clone),
         payload.("git --git-dir=../.git status --short --branch", clone),
         payload.("git --work-tree=#{other_issue_clone} status --short --branch", clone),
         payload.("$env:GIT_DIR='#{Path.join(other_issue_clone, ".git")}'; git status --short --branch", clone),

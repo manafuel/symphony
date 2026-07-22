@@ -1185,20 +1185,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp repository_discovery_command?(command) when is_binary(command) do
-    broad_repository_discovery_command?(command) or
-      Regex.match?(~r/\bgit(?:\.exe)?\b.*\bstatus(?:\s|$)/, command)
+    broad_repository_discovery_command?(command)
   end
 
   defp repository_discovery_command?(_command), do: false
 
   defp git_worktree_list_command?(command) when is_binary(command) do
-    Regex.match?(~r/\bgit(?:\.exe)?\s+worktree\s+list(?:\s|$)/, command)
+    Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\bworktree\s+list(?:\s|$)/, command)
   end
 
   defp repository_scope_override_command?(command) when is_binary(command) do
     repository_discovery_command?(command) and
       (raw_parent_path_segment?(command) or
-         Regex.match?(~r/\bgit(?:\.exe)?\s+-c(?:\s|$)/, command) or
+         git_scope_override_command?(command) or
          Regex.match?(~r/(?:--git-dir|--work-tree)(?:=|\s)/, command) or
          Regex.match?(~r/\bgit_[a-z0-9_]+\s*=/, command) or
          rg_files_positional_path?(command))
@@ -1211,8 +1210,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp raw_parent_path_segment?(_path), do: false
 
+  defp git_scope_override_command?(command) do
+    Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\s-c(?:\S*)?(?=\s|$)/, command)
+  end
+
   defp rg_files_positional_path?(command) do
-    case Regex.run(~r/\brg(?:\.exe)?\s+--files\b(.*)$/, command, capture: :all_but_first) do
+    case Regex.run(
+           ~r/\brg(?:\.exe)?\b[^\r\n;&|]*?--files(?:\s|$)([^\r\n;&|]*)/,
+           command,
+           capture: :all_but_first
+         ) do
       [suffix] ->
         suffix
         |> String.trim(~s("'{}))
@@ -1266,12 +1273,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp broad_repository_discovery_command?(command) when is_binary(command) do
-    Regex.match?(~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?rg(?:\.exe)?\s+--files(?:\s|$)/, command) ||
-      Regex.match?(
-        ~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?git(?:\.exe)?\s+worktree\s+list(?:\s|$)/,
-        command
-      ) ||
-      Regex.match?(~r/(?:^|[;&|(\{\r\n])\s*(?:&\s*)?(?:\{\s*)?git(?:\.exe)?\s+status(?:\s|$)/, command)
+    Regex.match?(~r/\brg(?:\.exe)?\b[^\r\n;&|]*?--files(?:\s|$)/, command) ||
+      git_worktree_list_command?(command) ||
+      Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\bstatus(?:\s|$)/, command)
   end
 
   defp single_quoted_powershell_generation?(normalized) when is_binary(normalized) do

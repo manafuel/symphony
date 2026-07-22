@@ -44,6 +44,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :terminal_workspace_cleanup,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -79,7 +80,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    start_terminal_workspace_cleanup()
+    state = start_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -91,9 +92,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:EXIT, pid, _reason}, state) when is_pid(pid) do
-    # Issue tasks are linked to this process so they cannot outlive an
-    # orchestrator crash. Their monitors remain authoritative for completion,
-    # retry, and accounting.
+    # Owned tasks are linked to this process so they cannot outlive an
+    # orchestrator crash. Their monitors remain authoritative for lifecycle
+    # state, retry, and accounting.
     {:noreply, state}
   end
 
@@ -133,13 +134,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(:run_poll_cycle, state) do
-    state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
+    state = execute_poll_cycle(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, pid, reason},
+        %{terminal_workspace_cleanup: %Task{pid: pid, ref: ref}} = state
+      ) do
+    Logger.info("Startup terminal workspace cleanup finished: reason=#{inspect(reason)}")
+    {:noreply, %{state | terminal_workspace_cleanup: nil}}
   end
 
   def handle_info(
@@ -231,6 +239,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def terminate(reason, %State{} = state) do
+    case state.terminal_workspace_cleanup do
+      %Task{pid: pid, ref: ref} ->
+        Logger.info("Stopping startup terminal workspace cleanup because orchestrator is terminating: reason=#{inspect(reason)}")
+        stop_running_task(pid, ref)
+
+      _ ->
+        :ok
+    end
+
     Enum.each(state.running, fn {issue_id, running_entry} ->
       Logger.info("Stopping tracked agent task because orchestrator is terminating: issue_id=#{issue_id} reason=#{inspect(reason)}")
 
@@ -1211,16 +1228,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp start_terminal_workspace_cleanup do
-    case Task.Supervisor.start_child(
-           SymphonyElixir.TaskSupervisor,
-           &run_terminal_workspace_cleanup/0
-         ) do
-      {:ok, _pid} ->
-        :ok
+  defp start_terminal_workspace_cleanup(%State{} = state) do
+    case start_owned_task(&run_terminal_workspace_cleanup/0) do
+      {:ok, %Task{} = task} ->
+        %{state | terminal_workspace_cleanup: task}
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to start cleanup task: #{inspect(reason)}")
+        state
     end
   end
 
@@ -1664,7 +1679,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp record_session_completion_totals(state, _running_entry), do: state
 
+  defp execute_poll_cycle(%State{} = state) do
+    with_workflow_store_fallback(state, fn ->
+      state
+      |> load_runtime_config()
+      |> maybe_dispatch()
+    end)
+  end
+
   defp refresh_runtime_config(%State{} = state) do
+    with_workflow_store_fallback(state, fn -> load_runtime_config(state) end)
+  end
+
+  defp load_runtime_config(%State{} = state) do
     config = Config.settings!()
 
     %{
@@ -1673,6 +1700,10 @@ defmodule SymphonyElixir.Orchestrator do
         max_concurrent_agents: config.agent.max_concurrent_agents,
         max_issue_tokens: config.agent.max_issue_tokens || 0
     }
+  end
+
+  defp with_workflow_store_fallback(%State{} = state, operation) when is_function(operation, 0) do
+    operation.()
   catch
     :exit, {reason, {GenServer, :call, [WorkflowStore, :current | _]}} = call_exit
     when reason in [:timeout, :noproc] ->
