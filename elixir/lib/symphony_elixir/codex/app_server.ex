@@ -1149,15 +1149,44 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp unsafe_repository_discovery_reason(_commands, _cwd, _workspace), do: nil
 
   defp shell_command_candidates(command) when is_binary(command) do
-    command
-    |> wrapped_shell_command_candidates()
-    |> Enum.map(&trim_shell_command_edges/1)
+    [command]
+    |> expand_shell_command_candidates(MapSet.new(), [])
+    |> Enum.map(fn candidate ->
+      raw = trim_shell_command_edges(candidate)
+      %{raw: raw, argv: split_shell_argv(raw), compound?: compound_shell_command?(raw)}
+    end)
     |> Enum.uniq()
+  end
+
+  defp expand_shell_command_candidates([], _seen, candidates), do: Enum.reverse(candidates)
+
+  defp expand_shell_command_candidates([candidate | rest], seen, candidates) do
+    normalized = trim_shell_command_edges(candidate)
+
+    if normalized == "" or MapSet.member?(seen, normalized) do
+      expand_shell_command_candidates(rest, seen, candidates)
+    else
+      expansions =
+        wrapped_shell_command_candidates(normalized) ++
+          nested_shell_command_candidates(normalized) ++ shell_command_segments(normalized)
+
+      expand_shell_command_candidates(
+        rest ++ expansions,
+        MapSet.put(seen, normalized),
+        [normalized | candidates]
+      )
+    end
+  end
+
+  defp split_shell_argv(command) do
+    OptionParser.split(command)
+  rescue
+    RuntimeError -> nil
   end
 
   defp wrapped_shell_command_candidates(command) do
     cmd_wrapped =
-      case Regex.run(~r/\bcmd(?:\.exe)?(?:\s+\/d)?\s+\/c\s+(.+)$/, command, capture: :all_but_first) do
+      case Regex.run(~r/\bcmd(?:\.exe)?(?:\s+\/[a-z]+)*\s+\/c\s+(.+)$/, command, capture: :all_but_first) do
         [inner] -> [inner]
         _ -> []
       end
@@ -1168,40 +1197,173 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> []
       end
 
-    [command | cmd_wrapped ++ powershell_wrapped]
+    parsed_wrapped =
+      command
+      |> split_shell_argv()
+      |> wrapped_shell_argv_candidate()
+
+    cmd_wrapped ++ powershell_wrapped ++ parsed_wrapped
+  end
+
+  defp nested_shell_command_candidates(command) do
+    command = Regex.replace(~r/'[^']*'/, command, "")
+
+    ~r/\$\(([^()]*)\)/
+    |> Regex.scan(command, capture: :all_but_first)
+    |> List.flatten()
+  end
+
+  defp wrapped_shell_argv_candidate([executable | arguments]) do
+    executable_name =
+      executable
+      |> String.replace("\\", "/")
+      |> Path.basename()
+
+    marker =
+      case executable_name do
+        name when name in ["cmd", "cmd.exe"] -> "/c"
+        name when name in ["powershell", "powershell.exe", "pwsh", "pwsh.exe"] -> ["-command", "-c"]
+        _other -> nil
+      end
+
+    case split_after_wrapper_marker(arguments, marker) do
+      [] -> []
+      inner_argv -> [Enum.join(inner_argv, " ")]
+    end
+  end
+
+  defp wrapped_shell_argv_candidate(_argv), do: []
+
+  defp split_after_wrapper_marker(_arguments, nil), do: []
+
+  defp split_after_wrapper_marker(arguments, markers) do
+    markers = List.wrap(markers)
+
+    case Enum.split_while(arguments, &(&1 not in markers)) do
+      {_options, [_marker | inner_argv]} -> inner_argv
+      _marker_missing -> []
+    end
   end
 
   defp trim_shell_command_edges(command) do
-    command
-    |> String.trim()
-    |> String.trim_leading("&")
-    |> String.trim()
-    |> String.trim_leading("{")
-    |> String.trim_trailing("}")
-    |> String.trim()
-    |> String.trim(~s("))
-    |> String.trim("'")
-    |> String.trim()
+    Enum.reduce(1..3, command, fn _pass, candidate ->
+      candidate
+      |> String.trim()
+      |> trim_enclosing_shell_quotes()
+      |> String.trim()
+      |> String.trim_leading("&")
+      |> String.trim()
+      |> String.trim_leading("{")
+      |> String.trim_trailing("}")
+      |> String.trim()
+      |> trim_enclosing_shell_quotes()
+      |> String.trim()
+    end)
   end
 
-  defp repository_discovery_command?(command) when is_binary(command) do
-    broad_repository_discovery_command?(command)
+  defp trim_enclosing_shell_quotes(<<quote, rest::binary>> = command) when quote in [?", ?'] do
+    case :binary.match(rest, <<quote>>) do
+      {closing_index, 1} when closing_index == byte_size(rest) - 1 ->
+        binary_part(rest, 0, closing_index)
+
+      _not_one_enclosing_pair ->
+        command
+    end
+  end
+
+  defp trim_enclosing_shell_quotes(command), do: command
+
+  defp compound_shell_command?(command) do
+    case shell_command_segments(command) do
+      [_single] -> false
+      _multiple_or_empty -> true
+    end
+  end
+
+  defp shell_command_segments(command) when is_binary(command) do
+    command
+    |> String.graphemes()
+    |> split_shell_command_segments(nil, false, [], [])
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp split_shell_command_segments([], _quote, _escaped, current, segments) do
+    Enum.reverse([current |> Enum.reverse() |> Enum.join() | segments])
+  end
+
+  defp split_shell_command_segments([character | rest], quote, true, current, segments) do
+    split_shell_command_segments(rest, quote, false, [character | current], segments)
+  end
+
+  defp split_shell_command_segments([character | rest], quote, false, current, segments)
+       when character in ["\\", "`"] do
+    split_shell_command_segments(rest, quote, true, [character | current], segments)
+  end
+
+  defp split_shell_command_segments([character | rest], nil, false, current, segments)
+       when character in ["'", "\""] do
+    split_shell_command_segments(rest, character, false, [character | current], segments)
+  end
+
+  defp split_shell_command_segments([character | rest], character, false, current, segments)
+       when character in ["'", "\""] do
+    split_shell_command_segments(rest, nil, false, [character | current], segments)
+  end
+
+  defp split_shell_command_segments([character | rest], nil, false, current, segments)
+       when character in [";", "&", "|", "\r", "\n"] do
+    segment = current |> Enum.reverse() |> Enum.join()
+    split_shell_command_segments(rest, nil, false, [], [segment | segments])
+  end
+
+  defp split_shell_command_segments([character | rest], quote, false, current, segments) do
+    split_shell_command_segments(rest, quote, false, [character | current], segments)
+  end
+
+  defp repository_discovery_command?(%{raw: raw, argv: argv, compound?: compound?}) do
+    case repository_cli_argv(argv) do
+      {:git, arguments} -> git_repository_discovery_argv?(arguments)
+      {:rg, arguments} -> rg_files_suffix(arguments) != :no_files_switch
+      :not_repository_cli when is_nil(argv) or compound? -> broad_repository_discovery_command?(raw)
+      :not_repository_cli -> false
+    end
   end
 
   defp repository_discovery_command?(_command), do: false
 
-  defp git_worktree_list_command?(command) when is_binary(command) do
-    Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\bworktree\s+list(?:\s|$)/, command)
+  defp git_worktree_list_command?(%{raw: raw, argv: argv, compound?: compound?}) do
+    case repository_cli_argv(argv) do
+      {:git, arguments} -> git_worktree_list_argv?(arguments)
+      {:rg, _arguments} -> false
+      :not_repository_cli when is_nil(argv) or compound? -> git_worktree_list_command?(raw)
+      :not_repository_cli -> false
+    end
   end
 
-  defp repository_scope_override_command?(command) when is_binary(command) do
-    repository_discovery_command?(command) and
-      (raw_parent_path_segment?(command) or
-         git_scope_override_command?(command) or
-         Regex.match?(~r/(?:--git-dir|--work-tree)(?:=|\s)/, command) or
-         Regex.match?(~r/\bgit_[a-z0-9_]+\s*=/, command) or
-         rg_files_positional_path?(command))
+  defp git_worktree_list_command?(command) when is_binary(command) do
+    command = shell_command_without_quoted_contents(command)
+
+    Regex.match?(
+      ~r/(?:^|[;&|\r\n])\s*(?:&\s*)?(?:[^\s;&|]*[\\\/])?git(?:\.exe)?\s+[^\r\n;&|]*?\bworktree\s+list(?:\s|$)/,
+      command
+    )
   end
+
+  defp repository_scope_override_command?(%{raw: raw, argv: argv, compound?: compound?} = candidate) do
+    scope_raw = if compound?, do: shell_command_without_quoted_contents(raw), else: raw
+
+    repository_discovery_command?(candidate) and
+      (raw_parent_path_segment?(scope_raw) or
+         git_scope_override_command?(scope_raw) or
+         git_scope_override_argv?(argv) or
+         Regex.match?(~r/(?:--git-dir|--work-tree)(?:=|\s)/, scope_raw) or
+         Regex.match?(~r/\bgit_[a-z0-9_]+\s*=/, scope_raw) or
+         rg_files_positional_path?(scope_raw) or
+         rg_files_positional_path_argv?(argv))
+  end
+
+  defp repository_scope_override_command?(_command), do: false
 
   defp raw_parent_path_segment?(path) when is_binary(path) do
     Regex.match?(~r{(?:^|[\\/])\.\.(?:[\\/]|$)}, path) or
@@ -1212,6 +1374,22 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp git_scope_override_command?(command) do
     Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\s-c(?:\S*)?(?=\s|$)/, command)
+  end
+
+  defp git_scope_override_argv?(argv) do
+    case repository_cli_argv(argv) do
+      {:git, arguments} ->
+        Enum.any?(arguments, fn argument ->
+          argument == "-c" or String.starts_with?(argument, "-c") or
+            argument in ["--git-dir", "--work-tree", "--config-env"] or
+            String.starts_with?(argument, "--git-dir=") or
+            String.starts_with?(argument, "--work-tree=") or
+            String.starts_with?(argument, "--config-env=")
+        end)
+
+      _not_git ->
+        false
+    end
   end
 
   defp rg_files_positional_path?(command) do
@@ -1231,10 +1409,149 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp rg_files_positional_path_argv?(argv) do
+    case repository_cli_argv(argv) do
+      {:rg, arguments} ->
+        case rg_files_suffix(arguments) do
+          {:files_suffix, suffix} -> rg_positional_path_argument?(suffix)
+          :no_files_switch -> false
+        end
+
+      _not_rg ->
+        false
+    end
+  end
+
+  defp git_repository_discovery_argv?(arguments) do
+    case git_command_and_arguments(arguments) do
+      {"status", _command_arguments} -> true
+      {"worktree", ["list" | _command_arguments]} -> true
+      _other_command -> false
+    end
+  end
+
+  defp git_worktree_list_argv?(arguments) do
+    match?({"worktree", ["list" | _command_arguments]}, git_command_and_arguments(arguments))
+  end
+
+  defp git_command_and_arguments([option, _value | rest])
+       when option in ["-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"] do
+    git_command_and_arguments(rest)
+  end
+
+  defp git_command_and_arguments([option | rest]) do
+    cond do
+      git_global_flag?(option) ->
+        git_command_and_arguments(rest)
+
+      git_inline_global_option?(option) ->
+        git_command_and_arguments(rest)
+
+      String.starts_with?(option, "-") ->
+        git_command_and_arguments(rest)
+
+      true ->
+        {option, rest}
+    end
+  end
+
+  defp git_command_and_arguments([]), do: :no_git_command
+
+  defp git_global_flag?(option) do
+    option in [
+      "-p",
+      "--paginate",
+      "--no-pager",
+      "--no-replace-objects",
+      "--bare",
+      "--literal-pathspecs",
+      "--glob-pathspecs",
+      "--noglob-pathspecs",
+      "--icase-pathspecs"
+    ]
+  end
+
+  defp git_inline_global_option?(option) do
+    Enum.any?(
+      [
+        "-c",
+        "--git-dir=",
+        "--work-tree=",
+        "--namespace=",
+        "--super-prefix=",
+        "--config-env=",
+        "--exec-path="
+      ],
+      &String.starts_with?(option, &1)
+    )
+  end
+
+  defp rg_files_suffix(arguments), do: rg_files_suffix(arguments, false)
+
+  defp rg_files_suffix([], _consume_value), do: :no_files_switch
+  defp rg_files_suffix([_value | rest], true), do: rg_files_suffix(rest, false)
+  defp rg_files_suffix(["--" | _rest], false), do: :no_files_switch
+  defp rg_files_suffix(["--files" | suffix], false), do: {:files_suffix, suffix}
+
+  defp rg_files_suffix([option | rest], false) do
+    rg_files_suffix(rest, rg_option_takes_value?(option))
+  end
+
+  defp rg_option_takes_value?(option) do
+    option in [
+      "-e",
+      "--regexp",
+      "-f",
+      "--file",
+      "-g",
+      "--glob",
+      "--iglob",
+      "-t",
+      "--type",
+      "-t-not",
+      "--type-not",
+      "--encoding",
+      "--engine",
+      "--max-depth",
+      "--max-count",
+      "--max-filesize",
+      "--path-separator",
+      "--replace",
+      "--sort",
+      "--sortr",
+      "--threads"
+    ]
+  end
+
+  defp repository_cli_argv([executable | arguments]) do
+    executable_name =
+      executable
+      |> String.replace("\\", "/")
+      |> Path.basename()
+
+    case executable_name do
+      name when name in ["git", "git.exe"] -> {:git, arguments}
+      name when name in ["rg", "rg.exe"] -> {:rg, arguments}
+      _other -> :not_repository_cli
+    end
+  end
+
+  defp repository_cli_argv(_argv), do: :not_repository_cli
+
+  defp shell_command_without_quoted_contents(command) do
+    command = Regex.replace(~r/'[^']*'/, command, "")
+    Regex.replace(~r/"(?:\\.|[^"])*"/, command, "")
+  end
+
   defp rg_positional_path_argument?([]), do: false
 
-  defp rg_positional_path_argument?([option, _value | rest]) when option in ["-g", "--glob"],
-    do: rg_positional_path_argument?(rest)
+  defp rg_positional_path_argument?([option, value | rest]) do
+    cond do
+      rg_option_takes_value?(option) -> rg_positional_path_argument?(rest)
+      String.starts_with?(option, "-") -> rg_positional_path_argument?([value | rest])
+      true -> true
+    end
+  end
 
   defp rg_positional_path_argument?([option | rest]) do
     if String.starts_with?(option, "-"), do: rg_positional_path_argument?(rest), else: true
@@ -1273,9 +1590,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp broad_repository_discovery_command?(command) when is_binary(command) do
-    Regex.match?(~r/\brg(?:\.exe)?\b[^\r\n;&|]*?--files(?:\s|$)/, command) ||
+    command = shell_command_without_quoted_contents(command)
+
+    Regex.match?(
+      ~r/(?:^|[;&|\r\n])\s*(?:&\s*)?(?:[^\s;&|]*[\\\/])?rg(?:\.exe)?\s+[^\r\n;&|]*?--files(?:\s|$)/,
+      command
+    ) ||
       git_worktree_list_command?(command) ||
-      Regex.match?(~r/\bgit(?:\.exe)?\b[^\r\n;&|]*?\bstatus(?:\s|$)/, command)
+      Regex.match?(
+        ~r/(?:^|[;&|\r\n])\s*(?:&\s*)?(?:[^\s;&|]*[\\\/])?git(?:\.exe)?\s+[^\r\n;&|]*?\bstatus(?:\s|$)/,
+        command
+      )
   end
 
   defp single_quoted_powershell_generation?(normalized) when is_binary(normalized) do

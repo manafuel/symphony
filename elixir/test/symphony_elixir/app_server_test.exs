@@ -1682,6 +1682,105 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server normalizes quoted repository-discovery argv before enforcing clone scope" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-quoted-repository-guard-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join([test_root, "workspaces", "MAN-263"])
+      clone = Path.join([workspace, "products", "one"])
+      outside_repo = Path.join([test_root, "outside", "one"])
+
+      init_git_repo!(clone)
+      init_git_repo!(outside_repo)
+
+      payload = fn command, cwd ->
+        %{
+          "method" => "item/commandExecution/requestApproval",
+          "params" => %{"command" => command, "cwd" => cwd}
+        }
+      end
+
+      quoted_cases = [
+        {"quoted git -C", payload.(~s(git "-C" "#{outside_repo}" status --short), clone)},
+        {"quoted git-dir", payload.(~s(git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
+        {"quoted worktree list", payload.(~s(git "worktree" "list"), clone)},
+        {"quoted rg files", payload.(~s(rg "--files"), workspace)},
+        {"PowerShell-wrapped git -C", payload.(~s(powershell.exe -NoProfile -Command 'git "-C" "#{outside_repo}" status --short'), clone)},
+        {"PowerShell call-operator git -C", payload.(~s(powershell.exe -NoProfile -Command '& git "-C" "#{outside_repo}" status --short'), clone)},
+        {"PowerShell quoted command flag git -C", payload.(~s(powershell.exe -NoProfile "-Command" '& git "-C" "#{outside_repo}" status --short'), clone)},
+        {"PowerShell nested git -C", payload.(~s|powershell.exe -NoProfile -Command 'Write-Output $(git "-C" "#{outside_repo}" status --short)'|, clone)},
+        {"PowerShell call-operator rg files", payload.(~s(powershell.exe -NoProfile -Command '& rg "--files"'), workspace)},
+        {"cmd-wrapped git-dir", payload.(~s(cmd.exe /d /c git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
+        {"cmd multi-switch git-dir", payload.(~s(cmd.exe /s /d /c git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
+        {"cmd quoted command flag git-dir", payload.(~s(cmd.exe /s /d "/c" git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
+        {"PowerShell-wrapped worktree list", payload.(~s(powershell.exe -NoProfile -Command 'git "worktree" "list"'), clone)},
+        {"cmd-wrapped rg files", payload.(~s(cmd.exe /d /c rg "--files"), workspace)},
+        {"compound quoted git -C", payload.(~s(echo "checking"; git "-C" "#{outside_repo}" status --short), clone)},
+        {"git config-env worktree override", payload.(~s($env:MF_SCOPE='#{outside_repo}'; git --config-env=core.worktree=MF_SCOPE status --short), clone)}
+      ]
+
+      Enum.each(quoted_cases, fn {name, quoted_payload} ->
+        assert is_binary(AppServer.unsafe_command_block_reason_for_test(quoted_payload, workspace)),
+               "#{name} bypassed repository guard"
+      end)
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg -n 'git "worktree" "list"' README.md), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg -n "git worktree list" README.md), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(echo "git worktree list"), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s|powershell.exe -NoProfile -Command "Write-Output '$(git worktree list)'"|, clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg -e "--files" README.md), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg --files --type elixir), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(git log --grep "status" --oneline), clone),
+                 workspace
+               )
+             )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server blocks unsafe top-level cwd approval before auto approval" do
     test_root =
       Path.join(

@@ -318,6 +318,317 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end
   end
 
+  test "worker DOWN schedules one retry without disturbing another worker during workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkerDownOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    parent = self()
+    dead_issue_id = "issue-worker-down-outage"
+    survivor_issue_id = "issue-worker-down-survivor"
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, dead_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:outage_worker_started, :dead, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      {:ok, survivor_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:outage_worker_started, :survivor, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      send(parent, {:outage_tasks, dead_task, survivor_task})
+
+      running = %{
+        dead_issue_id => %{
+          pid: dead_task.pid,
+          ref: dead_task.ref,
+          identifier: "MT-DOWN-OUTAGE",
+          issue: %Issue{
+            id: dead_issue_id,
+            identifier: "MT-DOWN-OUTAGE",
+            title: "Retry safely after worker failure",
+            state: "In Progress",
+            url: "https://example.org/issues/MT-DOWN-OUTAGE"
+          },
+          started_at: DateTime.utc_now()
+        },
+        survivor_issue_id => %{
+          pid: survivor_task.pid,
+          ref: survivor_task.ref,
+          identifier: "MT-DOWN-SURVIVOR",
+          issue: %Issue{
+            id: survivor_issue_id,
+            identifier: "MT-DOWN-SURVIVOR",
+            title: "Keep unrelated worker alive",
+            state: "In Progress"
+          },
+          started_at: DateTime.utc_now()
+        }
+      }
+
+      %{state | running: running, claimed: MapSet.new(Map.keys(running)), retry_attempts: %{}}
+    end)
+
+    assert_receive {:outage_tasks, %Task{pid: dead_pid}, %Task{pid: survivor_pid}}, 1_000
+    assert_receive {:outage_worker_started, :dead, ^dead_pid}, 1_000
+    assert_receive {:outage_worker_started, :survivor, ^survivor_pid}, 1_000
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      Process.exit(dead_pid, :boom)
+
+      state_task =
+        Task.async(fn ->
+          wait_for_orchestrator_state(pid, fn state ->
+            not Map.has_key?(state.running, dead_issue_id)
+          end)
+        end)
+
+      assert {:ok, state} = Task.yield(state_task, 1_000)
+      assert Process.alive?(pid)
+      refute Process.alive?(dead_pid)
+      assert Process.alive?(survivor_pid)
+      refute Map.has_key?(state.running, dead_issue_id)
+      assert state.running[survivor_issue_id].pid == survivor_pid
+
+      assert %{attempt: 1, timer_ref: retry_timer_ref, retry_token: retry_token} =
+               state.retry_attempts[dead_issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(retry_token)
+      assert map_size(state.retry_attempts) == 1
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "retry timer reschedules exactly once from cached routing during workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      tracker_required_labels: ["symphony"],
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done", "Cancelled"],
+      worker_ssh_hosts: ["worker-a"],
+      worker_max_concurrent_agents_per_host: 1,
+      max_concurrent_agents: 2,
+      max_concurrent_agents_by_state: %{"In Progress" => 2},
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :RetryTimerOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-retry-timer-outage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-RETRY-OUTAGE",
+      title: "Retry from cached routing",
+      state: "In Progress",
+      labels: ["symphony"],
+      url: "https://example.org/issues/MT-RETRY-OUTAGE"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    parent = self()
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, survivor_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:retry_outage_survivor_started, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      send(parent, {:retry_outage_survivor, survivor_task})
+
+      survivor_issue_id = "issue-retry-outage-survivor"
+
+      running_entry = %{
+        pid: survivor_task.pid,
+        ref: survivor_task.ref,
+        identifier: "MT-RETRY-SURVIVOR",
+        worker_host: "worker-a",
+        issue: %Issue{
+          id: survivor_issue_id,
+          identifier: "MT-RETRY-SURVIVOR",
+          title: "Keep host capacity occupied",
+          state: "In Progress"
+        },
+        started_at: DateTime.utc_now()
+      }
+
+      retry_entry = %{
+        attempt: 1,
+        timer_ref: nil,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond),
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "agent exited: :boom",
+        worker_host: "worker-a",
+        workspace_path: nil
+      }
+
+      %{
+        state
+        | running: %{survivor_issue_id => running_entry},
+          claimed: MapSet.new([survivor_issue_id, issue_id]),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    assert_receive {:retry_outage_survivor, %Task{pid: survivor_pid}}, 1_000
+    assert_receive {:retry_outage_survivor_started, ^survivor_pid}, 1_000
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, {:retry_issue, issue_id, retry_token})
+      send(pid, {:retry_issue, issue_id, retry_token})
+
+      state_task =
+        Task.async(fn ->
+          wait_for_orchestrator_state(pid, fn state ->
+            match?(%{attempt: 2}, state.retry_attempts[issue_id])
+          end)
+        end)
+
+      assert {:ok, state} = Task.yield(state_task, 1_000)
+      assert Process.alive?(pid)
+      assert Process.alive?(survivor_pid)
+      assert map_size(state.running) == 1
+      refute Enum.any?(state.running, fn {_id, entry} -> entry.identifier == issue.identifier end)
+
+      assert %{attempt: 2, timer_ref: retry_timer_ref, retry_token: next_retry_token} =
+               state.retry_attempts[issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(next_retry_token)
+      refute next_retry_token == retry_token
+      assert map_size(state.retry_attempts) == 1
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "retry timer preserves one retry when guarded tracker lookup reaches workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: "test-token",
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :GuardedRetryLookupOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-guarded-retry-lookup-outage"
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      retry_entry = %{
+        attempt: 1,
+        timer_ref: nil,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond),
+        identifier: "MT-GUARDED-RETRY",
+        issue_url: "https://example.org/issues/MT-GUARDED-RETRY",
+        error: "agent exited: :boom",
+        worker_host: nil,
+        workspace_path: nil
+      }
+
+      %{
+        state
+        | claimed: MapSet.put(state.claimed, issue_id),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+    Application.delete_env(:symphony_elixir, :linear_client_module)
+    parent = self()
+
+    try do
+      send(pid, {:retry_issue, issue_id, retry_token})
+
+      spawn(fn -> send(parent, {:state_after_guarded_retry_outage, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_guarded_retry_outage, state}, 6_500
+      assert Process.alive?(pid)
+
+      assert %{attempt: 2, timer_ref: retry_timer_ref, retry_token: next_retry_token} =
+               state.retry_attempts[issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(next_retry_token)
+      refute next_retry_token == retry_token
+      assert map_size(state.retry_attempts) == 1
+      assert state.running == %{}
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -2661,6 +2972,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp wait_for_orchestrator_state(pid, predicate) when is_function(predicate, 1) do
+    state = :sys.get_state(pid)
+
+    if predicate.(state) do
+      state
+    else
+      Process.sleep(5)
+      wait_for_orchestrator_state(pid, predicate)
+    end
   end
 
   defp ensure_workflow_store_pid do
