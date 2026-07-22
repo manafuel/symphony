@@ -303,6 +303,125 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     end
   end
 
+  test "write_run_artifact rejects inherited credential values without persisting or echoing them" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-run-artifact-secret-#{System.unique_integer([:positive])}"
+      )
+
+    secret_name = "MANAFUEL_TEST_API_KEY"
+    secret_value = "mf_test_#{System.unique_integer([:positive])}_credential_value"
+    previous_secret = System.get_env(secret_name)
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      artifact_path = Path.join([workspace, "runs", "credential-proof.md"])
+      File.mkdir_p!(Path.dirname(artifact_path))
+      File.write!(artifact_path, "preserved\n")
+      System.put_env(secret_name, secret_value)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{
+            "path" => "runs/credential-proof.md",
+            "content" => "credential=#{secret_value}\n"
+          },
+          workspace: workspace
+        )
+
+      assert response["success"] == false
+      assert File.read!(artifact_path) == "preserved\n"
+      refute response["output"] =~ secret_value
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "code"]) ==
+               "unsafe_run_artifact_content"
+
+      assert get_in(Jason.decode!(response["output"]), ["error", "message"]) ==
+               "`write_run_artifact.content` contains credential material and was rejected; use redacted or presence-only evidence."
+    after
+      if is_binary(previous_secret) do
+        System.put_env(secret_name, previous_secret)
+      else
+        System.delete_env(secret_name)
+      end
+
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact rejects recognized credential forms not present in the environment" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-shapes-#{System.unique_integer([:positive])}")
+
+    credential_forms = [
+      "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----",
+      "AKIAABCDEFGHIJKLMNOP",
+      "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+      "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+      "xoxb-123456789012345678901234",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.signature_value",
+      "Authorization: Bearer fabricated-token-value-123456",
+      "DATABASE_URL=https://user:fabricated-password@example.test/db",
+      "client_secret=fabricated-client-secret-value"
+    ]
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      Enum.with_index(credential_forms, fn credential, index ->
+        artifact_path = Path.join([workspace, "runs", "credential-#{index}.md"])
+
+        response =
+          DynamicTool.execute(
+            "write_run_artifact",
+            %{"path" => "runs/credential-#{index}.md", "content" => credential},
+            workspace: workspace
+          )
+
+        assert response["success"] == false
+        assert get_in(Jason.decode!(response["output"]), ["error", "code"]) == "unsafe_run_artifact_content"
+        refute response["output"] =~ credential
+        refute File.exists?(artifact_path)
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "write_run_artifact accepts redacted references and presence-only evidence" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-run-artifact-safe-#{System.unique_integer([:positive])}")
+
+    safe_content = """
+    LINEAR_API_KEY_PRESENT=true
+    Authorization: Bearer <redacted>
+    api_key=${LINEAR_API_KEY}
+    client_secret=$env:CLIENT_SECRET
+    password=%DATABASE_PASSWORD%
+    endpoint=https://example.test/api
+    commit=0123456789abcdef0123456789abcdef01234567
+    sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    """
+
+    try do
+      workspace = Path.join(test_root, "workspace")
+      File.mkdir_p!(workspace)
+
+      response =
+        DynamicTool.execute(
+          "write_run_artifact",
+          %{"path" => "runs/sanitized-proof.md", "content" => safe_content},
+          workspace: workspace
+        )
+
+      assert response["success"] == true
+      assert File.read!(Path.join([workspace, "runs", "sanitized-proof.md"])) == safe_content
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "write_run_artifact rejects absolute paths even under the issue runs directory" do
     test_root = Path.join(System.tmp_dir!(), "symphony-absolute-run-artifact-#{System.unique_integer([:positive])}")
 

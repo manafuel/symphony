@@ -59,7 +59,9 @@ defmodule SymphonyElixir.Codex.AppServer do
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
+           # `never` suppresses prompts; it is not authorization to cross a
+           # sandbox or human-in-the-loop boundary.
+           auto_approve_requests: false,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -1348,24 +1350,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
-         port,
+         _port,
          "mcpServer/elicitation/request",
-         %{"id" => id, "params" => params} = payload,
-         payload_string,
-         on_message,
-         metadata,
+         %{"id" => _id, "params" => params} = _payload,
+         _payload_string,
+         _on_message,
+         _metadata,
          _tool_executor,
-         true
+         _auto_approve_requests
        ) do
-    maybe_auto_accept_mcp_tool_elicitation(
-      port,
-      id,
-      params,
-      payload,
-      payload_string,
-      on_message,
-      metadata
-    )
+    if mcp_tool_call_approval_elicitation?(params), do: :approval_required, else: :input_required
   end
 
   defp maybe_handle_approval_request(
@@ -1379,31 +1373,6 @@ defmodule SymphonyElixir.Codex.AppServer do
          _auto_approve_requests
        ) do
     :unhandled
-  end
-
-  defp maybe_auto_accept_mcp_tool_elicitation(
-         port,
-         id,
-         params,
-         payload,
-         payload_string,
-         on_message,
-         metadata
-       ) do
-    if mcp_tool_call_approval_elicitation?(params) do
-      send_message(port, %{"id" => id, "result" => %{"action" => "accept", "content" => %{}}})
-
-      emit_message(
-        on_message,
-        :approval_auto_approved,
-        %{payload: payload, raw: payload_string, decision: "accept"},
-        metadata
-      )
-
-      :approved
-    else
-      :input_required
-    end
   end
 
   defp mcp_tool_call_approval_elicitation?(%{
@@ -1495,28 +1464,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp approve_or_require(
-         port,
-         id,
-         decision,
-         payload,
-         payload_string,
-         on_message,
-         metadata,
-         true
-       ) do
-    send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
-
-    emit_message(
-      on_message,
-      :approval_auto_approved,
-      %{payload: payload, raw: payload_string, decision: decision},
-      metadata
-    )
-
-    :approved
-  end
-
-  defp approve_or_require(
          _port,
          _id,
          _decision,
@@ -1524,7 +1471,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          _payload_string,
          _on_message,
          _metadata,
-         false
+         _auto_approve_requests
        ) do
     :approval_required
   end
@@ -1537,20 +1484,11 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          on_message,
          metadata,
-         true
+         _auto_approve_requests
        ) do
     case tool_request_user_input_approval_answers(params) do
-      {:ok, answers, decision} ->
-        send_message(port, %{"id" => id, "result" => %{"answers" => answers}})
-
-        emit_message(
-          on_message,
-          :approval_auto_approved,
-          %{payload: payload, raw: payload_string, decision: decision},
-          metadata
-        )
-
-        :approved
+      {:ok, _answers, _decision} ->
+        :approval_required
 
       :error ->
         reply_with_non_interactive_tool_input_answer(
@@ -1563,27 +1501,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
     end
-  end
-
-  defp maybe_auto_answer_tool_request_user_input(
-         port,
-         id,
-         params,
-         payload,
-         payload_string,
-         on_message,
-         metadata,
-         false
-       ) do
-    reply_with_non_interactive_tool_input_answer(
-      port,
-      id,
-      params,
-      payload,
-      payload_string,
-      on_message,
-      metadata
-    )
   end
 
   defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do

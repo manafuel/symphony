@@ -13,6 +13,21 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   @max_shell_timeout_ms 300_000
   @max_shell_output_chars 120_000
   @max_run_artifact_bytes 1_000_000
+  @credential_env_name_pattern ~r/(?:^|_)(?:api_key|access_key|secret_key|private_key|service_role_key|key|token|secret|password|passwd|passphrase|authorization|bearer|credential|credentials|database_url|postgres_url|redis_url|mongodb_uri|connection_string)(?:$|_)/i
+  @common_credential_patterns [
+    ~r/BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY/,
+    ~r/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+    ~r/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_]{8,}\b/,
+    ~r/\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b/,
+    ~r/\bgh[pousr]_[A-Za-z0-9_]{20,}\b/,
+    ~r/\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+    ~r/\bxox[baprs]-[A-Za-z0-9-]{20,}\b/,
+    ~r/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/,
+    ~r/\bAIza[0-9A-Za-z_-]{20,}\b/,
+    ~r/\bauthorization\s*:\s*(?:bearer|basic)\s+(?!REDACTED\b|<redacted>|example\b|placeholder\b|null\b|\$\{|\$env:|%[A-Za-z_][A-Za-z0-9_]*%)[A-Za-z0-9._~+\/=:-]{8,}/i,
+    ~r/\b(?:https?|postgres(?:ql)?|redis|mongodb(?:\+srv)?)\:\/\/[^\/\s:@]+:[^\/\s@]+@/i,
+    ~r/\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|passphrase|private[_-]?key|service[_-]?role[_-]?key)\b\s*[:=]\s*["']?(?!REDACTED\b|<redacted>|example\b|placeholder\b|null\b|true\b|false\b|\$\{|\$env:|%[A-Za-z_][A-Za-z0-9_]*%)[^\s"']{8,}/i
+  ]
   @hidden_stdio_launcher_name "codex-hidden-stdio-launcher.exe"
   @blocked_product_coordination_checkouts ~w(bob one replicator)
   @linear_graphql_description """
@@ -48,7 +63,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       },
       "content" => %{
         "type" => "string",
-        "description" => "UTF-8 text content to write. Secrets and raw provider credentials are forbidden."
+        "description" => "UTF-8 text content to write. Exact inherited credential values and recognized credential forms are rejected; submit redacted or presence-only evidence."
       },
       "overwrite" => %{
         "type" => ["boolean", "null"],
@@ -314,9 +329,27 @@ defmodule SymphonyElixir.Codex.DynamicTool do
       not String.valid?(content) ->
         {:error, :invalid_run_artifact_content}
 
+      contains_inherited_credential?(content) or contains_common_credential_shape?(content) ->
+        {:error, :unsafe_run_artifact_content}
+
       true ->
         :ok
     end
+  end
+
+  defp contains_inherited_credential?(content) do
+    System.get_env()
+    |> Enum.filter(fn {name, value} ->
+      Regex.match?(@credential_env_name_pattern, name) and is_binary(value) and
+        String.trim(value) != ""
+    end)
+    |> Enum.map(&elem(&1, 1))
+    |> Enum.uniq()
+    |> Enum.any?(&String.contains?(content, &1))
+  end
+
+  defp contains_common_credential_shape?(content) do
+    Enum.any?(@common_credential_patterns, &Regex.match?(&1, content))
   end
 
   defp write_run_artifact_file(path, runs_root, content, overwrite?) do
@@ -920,6 +953,15 @@ defmodule SymphonyElixir.Codex.DynamicTool do
         "message" => "`write_run_artifact.content` exceeds the maximum artifact size.",
         "bytes" => bytes,
         "maxBytes" => @max_run_artifact_bytes
+      }
+    }
+  end
+
+  defp write_run_artifact_error_payload(:unsafe_run_artifact_content) do
+    %{
+      "error" => %{
+        "code" => "unsafe_run_artifact_content",
+        "message" => "`write_run_artifact.content` contains credential material and was rejected; use redacted or presence-only evidence."
       }
     }
   end
