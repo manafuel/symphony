@@ -1186,9 +1186,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp wrapped_shell_command_candidates(command) do
     cmd_wrapped =
-      case Regex.run(~r/\bcmd(?:\.exe)?(?:\s+\/[a-z]+)*\s+\/c\s+(.+)$/, command, capture: :all_but_first) do
-        [inner] -> [inner]
-        _ -> []
+      case cmd_inner_candidate(command) do
+        nil -> []
+        inner -> [normalize_cmd_inner_candidate(inner)]
       end
 
     powershell_wrapped =
@@ -1221,7 +1221,6 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     marker =
       case executable_name do
-        name when name in ["cmd", "cmd.exe"] -> "/c"
         name when name in ["powershell", "powershell.exe", "pwsh", "pwsh.exe"] -> ["-command", "-c"]
         _other -> nil
       end
@@ -1243,6 +1242,97 @@ defmodule SymphonyElixir.Codex.AppServer do
       {_options, [_marker | inner_argv]} -> inner_argv
       _marker_missing -> []
     end
+  end
+
+  defp cmd_inner_candidate(command) do
+    case Regex.run(
+           ~r/^(?:(?:"[^"]*[\\\/])|(?:'[^']*[\\\/])|(?:[^\s"']*[\\\/])|["'])?cmd(?:\.exe)?["']?(\s+.+)$/is,
+           command,
+           capture: :all_but_first
+         ) do
+      [arguments] -> extract_cmd_execution_inner(String.trim_leading(arguments))
+      _not_cmd_wrapper -> nil
+    end
+  end
+
+  defp extract_cmd_execution_inner(arguments) do
+    case Regex.run(~r/^(?:"\/[ckr]"|'\/[ckr]')\s+(.+)$/is, arguments, capture: :all_but_first) do
+      [inner] -> inner
+      _not_exact_quoted_marker -> extract_cmd_quoted_attached_inner(arguments)
+    end
+  end
+
+  defp extract_cmd_quoted_attached_inner(arguments) do
+    case Regex.run(~r/^"\/[ckr]([^"]+)"(.*)$/is, arguments, capture: :all_but_first) do
+      [attached, remainder] -> attached <> remainder
+      _not_double_quoted_marker -> extract_cmd_single_quoted_attached_inner(arguments)
+    end
+  end
+
+  defp extract_cmd_single_quoted_attached_inner(arguments) do
+    case Regex.run(~r/^'\/[ckr]([^']+)'(.*)$/is, arguments, capture: :all_but_first) do
+      [attached, remainder] -> attached <> remainder
+      _not_single_quoted_marker -> extract_cmd_unquoted_inner(arguments)
+    end
+  end
+
+  defp extract_cmd_unquoted_inner(arguments) do
+    case Regex.run(~r/^\/[ckr](.+)$/is, arguments, capture: :all_but_first) do
+      [inner] -> String.trim_leading(inner)
+      _not_execution_marker -> skip_cmd_switch(arguments)
+    end
+  end
+
+  defp skip_cmd_switch(arguments) do
+    case Regex.run(
+           ~r/^(?:"\/[^"]+"|'\/[^']+'|\/\S+)\s+(.+)$/s,
+           arguments,
+           capture: :all_but_first
+         ) do
+      [rest] -> extract_cmd_execution_inner(String.trim_leading(rest))
+      _not_switch -> nil
+    end
+  end
+
+  defp normalize_cmd_inner_candidate(command) do
+    command
+    |> String.trim()
+    |> trim_cmd_outer_command_quotes()
+    |> String.graphemes()
+    |> escape_cmd_carets_for_analysis(false, [])
+    |> Enum.reverse()
+    |> Enum.join()
+  end
+
+  defp trim_cmd_outer_command_quotes(<<"\"", rest::binary>> = command) do
+    if String.ends_with?(rest, "\"") do
+      binary_part(rest, 0, byte_size(rest) - 1)
+    else
+      command
+    end
+  end
+
+  defp trim_cmd_outer_command_quotes(command), do: command
+
+  defp escape_cmd_carets_for_analysis([], _quoted, normalized), do: normalized
+
+  defp escape_cmd_carets_for_analysis(["^", escaped | rest], false, normalized) do
+    quoted_fragment =
+      if escaped == "\"" do
+        ["'", escaped, "'"]
+      else
+        ["\"", escaped, "\""]
+      end
+
+    escape_cmd_carets_for_analysis(rest, false, Enum.reverse(quoted_fragment) ++ normalized)
+  end
+
+  defp escape_cmd_carets_for_analysis(["\"" | rest], quoted, normalized) do
+    escape_cmd_carets_for_analysis(rest, not quoted, ["\"" | normalized])
+  end
+
+  defp escape_cmd_carets_for_analysis([character | rest], quoted, normalized) do
+    escape_cmd_carets_for_analysis(rest, quoted, [character | normalized])
   end
 
   defp trim_shell_command_edges(command) do
@@ -1324,7 +1414,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp repository_discovery_command?(%{raw: raw, argv: argv, compound?: compound?}) do
     case repository_cli_argv(argv) do
       {:git, arguments} -> git_repository_discovery_argv?(arguments)
-      {:rg, arguments} -> rg_files_suffix(arguments) != :no_files_switch
+      {:rg, arguments} -> elem(rg_files_analysis(arguments), 0)
       :not_repository_cli when is_nil(argv) or compound? -> broad_repository_discovery_command?(raw)
       :not_repository_cli -> false
     end
@@ -1394,15 +1484,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp rg_files_positional_path?(command) do
     case Regex.run(
-           ~r/\brg(?:\.exe)?\b[^\r\n;&|]*?--files(?:\s|$)([^\r\n;&|]*)/,
+           ~r/\brg(?:\.exe)?\b([^\r\n;&|]*)/,
            command,
            capture: :all_but_first
          ) do
-      [suffix] ->
-        suffix
-        |> String.trim(~s("'{}))
-        |> String.split(~r/\s+/, trim: true)
-        |> rg_positional_path_argument?()
+      [arguments] ->
+        case split_shell_argv(arguments) do
+          nil -> false
+          argv -> match?({true, true}, rg_files_analysis(argv))
+        end
 
       _no_rg_files ->
         false
@@ -1412,10 +1502,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp rg_files_positional_path_argv?(argv) do
     case repository_cli_argv(argv) do
       {:rg, arguments} ->
-        case rg_files_suffix(arguments) do
-          {:files_suffix, suffix} -> rg_positional_path_argument?(suffix)
-          :no_files_switch -> false
-        end
+        match?({true, true}, rg_files_analysis(arguments))
 
       _not_rg ->
         false
@@ -1486,15 +1573,27 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp rg_files_suffix(arguments), do: rg_files_suffix(arguments, false)
+  defp rg_files_analysis(arguments), do: rg_files_analysis(arguments, false, false)
 
-  defp rg_files_suffix([], _consume_value), do: :no_files_switch
-  defp rg_files_suffix([_value | rest], true), do: rg_files_suffix(rest, false)
-  defp rg_files_suffix(["--" | _rest], false), do: :no_files_switch
-  defp rg_files_suffix(["--files" | suffix], false), do: {:files_suffix, suffix}
+  defp rg_files_analysis([], files_seen, positional_seen), do: {files_seen, positional_seen}
 
-  defp rg_files_suffix([option | rest], false) do
-    rg_files_suffix(rest, rg_option_takes_value?(option))
+  defp rg_files_analysis([argument | rest], files_seen, positional_seen) do
+    cond do
+      rg_option_takes_value?(argument) ->
+        rg_files_analysis(Enum.drop(rest, 1), files_seen, positional_seen)
+
+      argument == "--" ->
+        {files_seen, positional_seen or rest != []}
+
+      argument == "--files" ->
+        rg_files_analysis(rest, true, positional_seen)
+
+      String.starts_with?(argument, "-") ->
+        rg_files_analysis(rest, files_seen, positional_seen)
+
+      true ->
+        rg_files_analysis(rest, files_seen, true)
+    end
   end
 
   defp rg_option_takes_value?(option) do
@@ -1541,20 +1640,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp shell_command_without_quoted_contents(command) do
     command = Regex.replace(~r/'[^']*'/, command, "")
     Regex.replace(~r/"(?:\\.|[^"])*"/, command, "")
-  end
-
-  defp rg_positional_path_argument?([]), do: false
-
-  defp rg_positional_path_argument?([option, value | rest]) do
-    cond do
-      rg_option_takes_value?(option) -> rg_positional_path_argument?(rest)
-      String.starts_with?(option, "-") -> rg_positional_path_argument?([value | rest])
-      true -> true
-    end
-  end
-
-  defp rg_positional_path_argument?([option | rest]) do
-    if String.starts_with?(option, "-"), do: rg_positional_path_argument?(rest), else: true
   end
 
   defp valid_issue_local_normal_clone_cwd?(cwd, workspace)

@@ -1704,6 +1704,29 @@ defmodule SymphonyElixir.AppServerTest do
         }
       end
 
+      cmd_switch_cases =
+        for switch <- [
+              "/A",
+              "/U",
+              "/Q",
+              "/D",
+              "/S",
+              "/X",
+              "/Y",
+              "/E:ON",
+              "/E:OFF",
+              "/F:ON",
+              "/F:OFF",
+              "/V:ON",
+              "/V:OFF",
+              "/T:0A"
+            ] do
+          {
+            "cmd switch #{switch}",
+            payload.(~s(CMD.EXE #{switch} /C g^it -^C "#{outside_repo}" status --short), clone)
+          }
+        end
+
       quoted_cases = [
         {"quoted git -C", payload.(~s(git "-C" "#{outside_repo}" status --short), clone)},
         {"quoted git-dir", payload.(~s(git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
@@ -1717,16 +1740,38 @@ defmodule SymphonyElixir.AppServerTest do
         {"cmd-wrapped git-dir", payload.(~s(cmd.exe /d /c git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
         {"cmd multi-switch git-dir", payload.(~s(cmd.exe /s /d /c git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
         {"cmd quoted command flag git-dir", payload.(~s(cmd.exe /s /d "/c" git "--git-dir" "#{Path.join(outside_repo, ".git")}" status --short), clone)},
+        {"direct rg path before files", payload.(~s(rg #{outside_repo} --files), clone)},
+        {"quoted rg path before files", payload.(~s(rg "#{outside_repo}" "--files"), clone)},
+        {"PowerShell-wrapped rg path before files", payload.(~s(powershell.exe -NoProfile -Command 'rg "#{outside_repo}" "--files"'), clone)},
+        {"rg path between valued option and files", payload.(~s(rg --type elixir "#{outside_repo}" --files), clone)},
+        {"rg path after end-of-options", payload.(~s(rg --files -- "#{outside_repo}"), clone)},
+        {"cmd caret-escaped git executable", payload.(~s(cmd.exe /s /d /c g^it -C "#{outside_repo}" status --short), clone)},
+        {"cmd caret-escaped git scope option", payload.(~s(cmd.exe /s /d /c git -^C "#{outside_repo}" status --short), clone)},
+        {"cmd caret-escaped git scope override", payload.(~s(cmd.exe /s /d /c g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd extension switch caret-escaped scope override", payload.(~s(cmd.exe /e:on /d /c g^it -^C "#{outside_repo}" status --short), clone)},
+        {"uppercase cmd extension and compatibility marker scope override", payload.(~s(CMD.EXE /E:ON /R g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd valued switches unescaped scope override", payload.(~s(cmd.exe /f:on /v:off /t:0a /d /c git -C "#{outside_repo}" status --short), clone)},
+        {"cmd ignored switch caret-escaped scope override", payload.(~s(cmd.exe /z /d /c g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd keep-open marker scope override", payload.(~s(cmd.exe /d /k g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd compatibility marker scope override", payload.(~s(cmd.exe /d /r g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd attached marker scope override", payload.(~s(cmd.exe /d /cg^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd quote-attached marker scope override", payload.(~s(cmd.exe /d /c"g^it -^C #{outside_repo} status --short"), clone)},
+        {"cmd quoted marker caret-escaped git scope override", payload.(~s(cmd.exe /s /d "/c" g^it -^C "#{outside_repo}" status --short), clone)},
+        {"cmd quoted command caret-escaped git scope override", payload.(~s(cmd.exe /s /d /c "g^it -^C #{outside_repo} status --short"), clone)},
         {"PowerShell-wrapped worktree list", payload.(~s(powershell.exe -NoProfile -Command 'git "worktree" "list"'), clone)},
         {"cmd-wrapped rg files", payload.(~s(cmd.exe /d /c rg "--files"), workspace)},
         {"compound quoted git -C", payload.(~s(echo "checking"; git "-C" "#{outside_repo}" status --short), clone)},
         {"git config-env worktree override", payload.(~s($env:MF_SCOPE='#{outside_repo}'; git --config-env=core.worktree=MF_SCOPE status --short), clone)}
       ]
 
-      Enum.each(quoted_cases, fn {name, quoted_payload} ->
-        assert is_binary(AppServer.unsafe_command_block_reason_for_test(quoted_payload, workspace)),
-               "#{name} bypassed repository guard"
-      end)
+      quoted_cases = quoted_cases ++ cmd_switch_cases
+
+      bypasses =
+        for {name, quoted_payload} <- quoted_cases,
+            not is_binary(AppServer.unsafe_command_block_reason_for_test(quoted_payload, workspace)),
+            do: name
+
+      assert bypasses == [], "repository guard bypasses: #{Enum.join(bypasses, ", ")}"
 
       assert is_nil(
                AppServer.unsafe_command_block_reason_for_test(
@@ -1758,6 +1803,34 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert is_nil(
                AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s|powershell.exe -NoProfile -Command "Write-Output 'g^it -^C #{outside_repo} status'"|, clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(cmd.exe /s /d /c echo "g^it -^C #{outside_repo} status"), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(cmd.exe /s /d /c echo safe ^& g^it -^C), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(echo "cmd.exe /s /d /c g^it -^C .. status"), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
                  payload.(~s(rg -e "--files" README.md), clone),
                  workspace
                )
@@ -1766,6 +1839,20 @@ defmodule SymphonyElixir.AppServerTest do
       assert is_nil(
                AppServer.unsafe_command_block_reason_for_test(
                  payload.(~s(rg --files --type elixir), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg --type elixir --files), clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(rg -- --files), clone),
                  workspace
                )
              )
