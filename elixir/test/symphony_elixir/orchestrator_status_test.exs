@@ -119,6 +119,135 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "codex telemetry updates do not synchronously read the workflow store" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_issue_tokens: 1,
+      poll_interval_ms: 60_000
+    )
+
+    issue_id = "issue-telemetry-cache"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TELEMETRY-CACHE",
+      title: "Keep telemetry off the config hot path",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TELEMETRY-CACHE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TelemetryCacheOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{issue_id => running_entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    update_timestamp = DateTime.utc_now()
+
+    workflow_store_pid = ensure_workflow_store_pid()
+
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "x"}},
+           timestamp: update_timestamp
+         }}
+      )
+
+      state_task = Task.async(fn -> :sys.get_state(pid) end)
+      assert {:ok, updated_state} = Task.yield(state_task, 250)
+      assert updated_state.running[issue_id].last_codex_timestamp == update_timestamp
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "runtime config refresh retains the last valid settings when the workflow store times out" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_concurrent_agents: 3,
+      max_issue_tokens: 321,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :RefreshTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    state_before_timeout = :sys.get_state(pid)
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, :tick)
+
+      parent = self()
+      spawn(fn -> send(parent, {:state_after_refresh_timeout, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_refresh_timeout, state_after_timeout}, 6_500
+      assert Process.alive?(pid)
+      assert state_after_timeout.poll_interval_ms == state_before_timeout.poll_interval_ms
+      assert state_after_timeout.max_concurrent_agents == state_before_timeout.max_concurrent_agents
+      assert state_after_timeout.max_issue_tokens == state_before_timeout.max_issue_tokens
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1419,6 +1548,99 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert wait_until(fn -> not File.exists?(workspace) end, 5_000)
   end
 
+  test "owned worker task exits when its orchestrator is killed" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :KilledOwnerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    parent = self()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:owned_worker_started, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      send(parent, {:owned_task, task})
+      state
+    end)
+
+    assert_receive {:owned_task, %Task{pid: worker_pid}}, 1_000
+    assert_receive {:owned_worker_started, ^worker_pid}, 1_000
+    worker_ref = Process.monitor(worker_pid)
+    owner_ref = Process.monitor(pid)
+
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, _reason}, 1_000
+  end
+
+  test "graceful orchestrator termination stops every tracked worker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :GracefulOwnerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-graceful-owner"
+    parent = self()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:tracked_worker_started, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      send(parent, {:tracked_task, task})
+
+      running_entry = %{
+        pid: task.pid,
+        ref: task.ref,
+        identifier: "MT-GRACEFUL-OWNER"
+      }
+
+      %{state | running: %{issue_id => running_entry}}
+    end)
+
+    assert_receive {:tracked_task, %Task{pid: worker_pid}}, 1_000
+    assert_receive {:tracked_worker_started, ^worker_pid}, 1_000
+    worker_ref = Process.monitor(worker_pid)
+
+    :ok = GenServer.stop(pid, :normal)
+
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, _reason}, 1_000
+  end
+
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -2318,6 +2540,19 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp ensure_workflow_store_pid do
+    case Process.whereis(WorkflowStore) do
+      nil ->
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
+          {:ok, store_pid} -> store_pid
+          {:error, {:already_started, store_pid}} -> store_pid
+        end
+
+      store_pid ->
+        store_pid
+    end
   end
 
   defp wait_until(predicate, timeout_ms) when is_function(predicate, 0) do

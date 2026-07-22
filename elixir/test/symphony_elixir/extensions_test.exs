@@ -105,7 +105,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     ensure_workflow_store_running()
     assert {:ok, %{prompt: "You are an agent for this repository."}} = Workflow.current()
 
-    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Second prompt")
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace("You are an agent for this repository.", "Second prompt")
+    |> then(&File.write!(workflow_path, &1))
+
+    cached_state = :sys.get_state(WorkflowStore)
+
+    assert {:reply, {:ok, %{prompt: "You are an agent for this repository."}}, ^cached_state} =
+             WorkflowStore.handle_call(:current, {self(), make_ref()}, cached_state)
+
     send(WorkflowStore, :poll)
 
     assert_eventually(fn ->

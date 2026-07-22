@@ -863,7 +863,7 @@ defmodule SymphonyElixir.AppServerTest do
             if "%COUNT%"=="1" echo {"id":1,"result":{}}
             if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-command-timeout"}}}
             if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-command-timeout"}}}
-            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"rg --files .","cwd":"C:/tmp"}}}
+            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"git --version","cwd":"C:/tmp"}}}
             goto loop
             :end
             """)
@@ -890,7 +890,7 @@ defmodule SymphonyElixir.AppServerTest do
                   ;;
                 4)
                   printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-command-timeout"}}}'
-                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"rg --files .","cwd":"/tmp"}}}'
+                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-hung","type":"commandExecution","command":"git --version","cwd":"/tmp"}}}'
                   ;;
                 *)
                   sleep 1
@@ -956,7 +956,7 @@ defmodule SymphonyElixir.AppServerTest do
             if "%COUNT%"=="1" echo {"id":1,"result":{}}
             if "%COUNT%"=="3" echo {"id":2,"result":{"thread":{"id":"thread-command-complete"}}}
             if "%COUNT%"=="4" echo {"id":3,"result":{"turn":{"id":"turn-command-complete"}}}
-            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"rg --files .","cwd":"C:/tmp"}}}
+            if "%COUNT%"=="4" echo {"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"git --version","cwd":"C:/tmp"}}}
             if "%COUNT%"=="4" echo {"method":"item/completed","params":{"item":{"id":"call-finished","type":"commandExecution"}}}
             goto loop
             :end
@@ -984,7 +984,7 @@ defmodule SymphonyElixir.AppServerTest do
                   ;;
                 4)
                   printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-command-complete"}}}'
-                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"rg --files .","cwd":"/tmp"}}}'
+                  printf '%s\\n' '{"method":"item/started","params":{"item":{"id":"call-finished","type":"commandExecution","command":"git --version","cwd":"/tmp"}}}'
                   printf '%s\\n' '{"method":"item/completed","params":{"item":{"id":"call-finished","type":"commandExecution"}}}'
                   ;;
                 *)
@@ -1359,7 +1359,7 @@ defmodule SymphonyElixir.AppServerTest do
       }
     }
 
-    safe_product_rg_files_payload = %{
+    unsafe_global_product_rg_files_payload = %{
       "method" => "item/commandExecution/requestApproval",
       "params" => %{
         "command" => "rg --files",
@@ -1508,7 +1508,9 @@ defmodule SymphonyElixir.AppServerTest do
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_wrapped_quoted_comparison_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_native_directory_payload))
     assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_ticket_file_script_payload))
-    assert is_nil(AppServer.unsafe_command_block_reason_for_test(safe_product_rg_files_payload))
+
+    assert AppServer.unsafe_command_block_reason_for_test(unsafe_global_product_rg_files_payload) =~
+             "issue-local normal clone"
 
     poller_payload = %{
       "method" => "item/commandExecution/requestApproval",
@@ -1536,6 +1538,128 @@ defmodule SymphonyElixir.AppServerTest do
 
     assert AppServer.unsafe_command_block_reason_for_test(skill_payload) =~
              "packaged skill file"
+  end
+
+  test "app server bounds repository discovery to the current issue normal product clone" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-repository-guard-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MAN-146")
+      clone = Path.join([workspace, "products", "one"])
+      clone_subdir = Path.join(clone, "src")
+      linked_worktree = Path.join([workspace, "products", "replicator"])
+      fake_clone = Path.join([workspace, "products", "bob"])
+      unknown_clone = Path.join([workspace, "products", "marketing"])
+      other_issue_clone = Path.join([workspace_root, "MAN-147", "products", "one"])
+      global_worktree = Path.join([test_root, "worktrees", "one", "MAN-146"])
+      coordination_checkout = Path.join([test_root, "development-production-main", "one"])
+      path_lookalike = Path.join([workspace, "nested", "products", "development"])
+
+      init_git_repo!(clone)
+      File.mkdir_p!(clone_subdir)
+      File.mkdir_p!(Path.join(fake_clone, ".git"))
+      init_git_repo!(unknown_clone)
+      init_git_repo!(other_issue_clone)
+      init_git_repo!(global_worktree)
+      init_git_repo!(coordination_checkout)
+      init_git_repo!(path_lookalike)
+
+      assert {_output, 0} =
+               System.cmd(
+                 git_executable!(),
+                 ["-C", clone, "worktree", "add", "--quiet", "--detach", linked_worktree, "HEAD"],
+                 stderr_to_stdout: true
+               )
+
+      payload = fn command, cwd ->
+        %{
+          "method" => "item/commandExecution/requestApproval",
+          "params" => %{"command" => command, "cwd" => cwd}
+        }
+      end
+
+      wrapped_status_payload = %{
+        "params" => %{
+          "item" => %{
+            "type" => "commandExecution",
+            "command" => "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command 'git status --short --branch'",
+            "cwd" => clone,
+            "commandActions" => [
+              %{"type" => "unknown", "command" => "git status --short --branch"}
+            ]
+          }
+        }
+      }
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("git status --short --branch", clone),
+                 workspace
+               )
+             )
+
+      assert is_nil(AppServer.unsafe_command_block_reason_for_test(wrapped_status_payload, workspace))
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("git status --short --branch", clone_subdir),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("rg --files", clone_subdir),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("rg --files -g '*.ex'", clone_subdir),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("rg --files --glob '*.ex'", clone),
+                 workspace
+               )
+             )
+
+      blocked_cases = [
+        payload.("git status --short --branch", workspace),
+        payload.("git status --short --branch", Path.join(workspace, "runs")),
+        payload.("git status --short --branch", fake_clone),
+        payload.("git status --short --branch", unknown_clone),
+        payload.("git status --short --branch", other_issue_clone),
+        payload.("git status --short --branch", global_worktree),
+        payload.("git status --short --branch", coordination_checkout),
+        payload.("git status --short --branch", path_lookalike),
+        payload.("git status --short --branch", linked_worktree),
+        payload.("git status --short --branch", Path.join([clone, "..", "one"])),
+        payload.("git -C .. status --short --branch", clone),
+        payload.("git --git-dir=../.git status --short --branch", clone),
+        payload.("git --work-tree=#{other_issue_clone} status --short --branch", clone),
+        payload.("$env:GIT_DIR='#{Path.join(other_issue_clone, ".git")}'; git status --short --branch", clone),
+        payload.("rg --files ..", clone),
+        payload.("rg --files -g '*.ex' #{other_issue_clone}", clone),
+        payload.("rg --files #{other_issue_clone}", clone),
+        payload.("git worktree list", clone)
+      ]
+
+      Enum.each(blocked_cases, fn blocked_payload ->
+        assert is_binary(AppServer.unsafe_command_block_reason_for_test(blocked_payload, workspace))
+      end)
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "app server blocks unsafe top-level cwd approval before auto approval" do
@@ -2881,6 +3005,46 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.chmod!(fake_ssh, 0o755)
     end
+  end
+
+  defp init_git_repo!(path) do
+    git = git_executable!()
+    File.mkdir_p!(path)
+
+    assert {_output, 0} =
+             System.cmd(git, ["init", "--quiet", path], stderr_to_stdout: true)
+
+    assert {_output, 0} =
+             System.cmd(
+               git,
+               ["-C", path, "config", "user.email", "symphony-test@example.invalid"],
+               stderr_to_stdout: true
+             )
+
+    assert {_output, 0} =
+             System.cmd(
+               git,
+               ["-C", path, "config", "user.name", "Symphony Test"],
+               stderr_to_stdout: true
+             )
+
+    File.write!(Path.join(path, "README.md"), "# test repository\n")
+
+    assert {_output, 0} =
+             System.cmd(git, ["-C", path, "add", "README.md"], stderr_to_stdout: true)
+
+    assert {_output, 0} =
+             System.cmd(
+               git,
+               ["-C", path, "commit", "--quiet", "-m", "test fixture"],
+               stderr_to_stdout: true
+             )
+
+    path
+  end
+
+  defp git_executable! do
+    System.find_executable("git") || raise "git executable is required for app-server tests"
   end
 
   defp windows? do

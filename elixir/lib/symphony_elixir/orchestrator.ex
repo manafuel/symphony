@@ -7,7 +7,16 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workflow, Workspace}
+  alias SymphonyElixir.{
+    AgentRunner,
+    Config,
+    StatusDashboard,
+    Tracker,
+    Workflow,
+    WorkflowStore,
+    Workspace
+  }
+
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -27,8 +36,10 @@ defmodule SymphonyElixir.Orchestrator do
     """
 
     defstruct [
+      :owner_pid,
       :poll_interval_ms,
       :max_concurrent_agents,
+      :max_issue_tokens,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
       :tick_timer_ref,
@@ -46,17 +57,20 @@ defmodule SymphonyElixir.Orchestrator do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
+    GenServer.start_link(__MODULE__, Keyword.put(opts, :owner_pid, self()), name: name)
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    Process.flag(:trap_exit, true)
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
     state = %State{
+      owner_pid: Keyword.fetch!(opts, :owner_pid),
       poll_interval_ms: config.polling.interval_ms,
       max_concurrent_agents: config.agent.max_concurrent_agents,
+      max_issue_tokens: config.agent.max_issue_tokens || 0,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
       tick_timer_ref: nil,
@@ -72,6 +86,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
+  def handle_info({:EXIT, owner_pid, reason}, %{owner_pid: owner_pid} = state) do
+    {:stop, reason, state}
+  end
+
+  def handle_info({:EXIT, pid, _reason}, state) when is_pid(pid) do
+    # Issue tasks are linked to this process so they cannot outlive an
+    # orchestrator crash. Their monitors remain authoritative for completion,
+    # retry, and accounting.
+    {:noreply, state}
+  end
+
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
     state = refresh_runtime_config(state)
@@ -202,6 +227,20 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  @impl true
+  def terminate(reason, %State{} = state) do
+    Enum.each(state.running, fn {issue_id, running_entry} ->
+      Logger.info("Stopping tracked agent task because orchestrator is terminating: issue_id=#{issue_id} reason=#{inspect(reason)}")
+
+      stop_running_task(
+        Map.get(running_entry, :pid),
+        Map.get(running_entry, :ref)
+      )
+    end)
+
+    :ok
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
@@ -947,12 +986,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
-    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+    case start_owned_task(fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
-      {:ok, pid} ->
-        ref = Process.monitor(pid)
-
+      {:ok, %Task{pid: pid, ref: ref}} ->
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
         running =
@@ -997,6 +1034,18 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  @doc false
+  @spec start_owned_task_for_test((-> term())) :: {:ok, Task.t()} | {:error, term()}
+  def start_owned_task_for_test(fun) when is_function(fun, 0), do: start_owned_task(fun)
+
+  defp start_owned_task(fun) when is_function(fun, 0) do
+    {:ok, Task.Supervisor.async(SymphonyElixir.TaskSupervisor, fun)}
+  rescue
+    exception in RuntimeError -> {:error, {:task_start_failed, Exception.message(exception)}}
+  catch
+    :exit, reason -> {:error, {:task_start_failed, reason}}
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
@@ -1621,8 +1670,15 @@ defmodule SymphonyElixir.Orchestrator do
     %{
       state
       | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
+        max_concurrent_agents: config.agent.max_concurrent_agents,
+        max_issue_tokens: config.agent.max_issue_tokens || 0
     }
+  catch
+    :exit, {reason, {GenServer, :call, [WorkflowStore, :current | _]}} = call_exit
+    when reason in [:timeout, :noproc] ->
+      Logger.warning("Workflow config refresh unavailable; retaining last valid settings: #{inspect(call_exit)}")
+
+      state
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
@@ -1645,7 +1701,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_codex_token_delta(state, _token_delta), do: state
 
   defp maybe_log_token_telemetry_threshold(%State{} = state, issue_id, running_entry) when is_map(running_entry) do
-    max_issue_tokens = Config.settings!().agent.max_issue_tokens || 0
+    max_issue_tokens = state.max_issue_tokens || 0
     guard_tokens = billable_token_count(running_entry)
 
     if max_issue_tokens > 0 and guard_tokens >= max_issue_tokens do

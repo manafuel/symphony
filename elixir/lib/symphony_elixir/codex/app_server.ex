@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @max_dynamic_tool_output_chars 8_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @issue_product_repositories ~w(development one replicator bob)
   @manafuel_developer_instructions """
   MANAfuel Symphony runs use the Windows Codex app-server stdio client. Use hosted sandboxed `shell_command` for all local command work. Use `write_run_artifact` only for bounded non-secret evidence under the current issue workspace `runs/` directory when an existing checked-in script does not generate the artifact. Keep shell calls simple: one read, search, status, test, git, or existing script invocation. Do not send inline PowerShell scripts, loops, here-strings, direct PowerShell read/navigation cmdlets or aliases (Get-ChildItem, Get-Content, Select-Object, Set-Location, dir, ls, cat, type, cd, pwd), filesystem generation, shell redirection file writes, inline JSON payloads, or multi-step orchestration. Use native executables, existing checked-in scripts with short file/path arguments, `write_run_artifact` for issue-local run evidence, or apply_patch for repository edits. Issue at most one hosted `shell_command` tool call per assistant turn, and do not move a ticket to Human Review solely because the current turn's hosted shell budget is exhausted.
 
@@ -114,7 +115,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -491,19 +492,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      workspace
     )
-  end
-
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
-    receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, :turn)
   end
 
   defp receive_loop(
@@ -513,6 +511,28 @@ defmodule SymphonyElixir.Codex.AppServer do
          pending_line,
          tool_executor,
          auto_approve_requests,
+         workspace
+       ) do
+    receive_loop(
+      port,
+      on_message,
+      timeout_ms,
+      pending_line,
+      tool_executor,
+      auto_approve_requests,
+      workspace,
+      :turn
+    )
+  end
+
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         workspace,
          timeout_context
        ) do
     receive_timeout_ms = receive_timeout_ms(timeout_ms, timeout_context)
@@ -528,6 +548,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           tool_executor,
           auto_approve_requests,
+          workspace,
           timeout_context
         )
 
@@ -539,6 +560,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           pending_line <> to_string(chunk),
           tool_executor,
           auto_approve_requests,
+          workspace,
           timeout_context
         )
 
@@ -578,6 +600,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          timeout_ms,
          tool_executor,
          auto_approve_requests,
+         workspace,
          timeout_context
        ) do
     payload_string = to_string(data)
@@ -624,6 +647,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           tool_executor,
           auto_approve_requests,
+          workspace,
           next_timeout_context
         )
 
@@ -645,6 +669,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
+          workspace,
           timeout_context
         )
 
@@ -670,6 +695,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           "",
           tool_executor,
           auto_approve_requests,
+          workspace,
           timeout_context
         )
     end
@@ -697,11 +723,12 @@ defmodule SymphonyElixir.Codex.AppServer do
          timeout_ms,
          tool_executor,
          auto_approve_requests,
+         workspace,
          timeout_context
        ) do
     metadata = metadata_from_message(port, payload)
 
-    case maybe_block_unsafe_command(payload) do
+    case maybe_block_unsafe_command(payload, workspace) do
       {:block, reason} ->
         emit_message(
           on_message,
@@ -741,6 +768,7 @@ defmodule SymphonyElixir.Codex.AppServer do
               "",
               tool_executor,
               auto_approve_requests,
+              workspace,
               timeout_context
             )
 
@@ -784,6 +812,7 @@ defmodule SymphonyElixir.Codex.AppServer do
                 "",
                 tool_executor,
                 auto_approve_requests,
+                workspace,
                 timeout_context
               )
             end
@@ -825,11 +854,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp command_execution_completed_message?(_payload), do: false
 
-  defp maybe_block_unsafe_command(payload) do
+  defp maybe_block_unsafe_command(payload, workspace) do
     payload
     |> command_execution_contexts()
     |> Enum.find_value(:ok, fn context ->
-      case unsafe_command_reason(context) do
+      case unsafe_command_reason(context, workspace) do
         nil -> false
         reason -> {:block, reason}
       end
@@ -839,7 +868,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @doc false
   @spec unsafe_command_block_reason_for_test(map()) :: String.t() | nil
   def unsafe_command_block_reason_for_test(payload) do
-    case maybe_block_unsafe_command(payload) do
+    unsafe_command_block_reason_for_test(payload, nil)
+  end
+
+  @doc false
+  @spec unsafe_command_block_reason_for_test(map(), Path.t() | nil) :: String.t() | nil
+  def unsafe_command_block_reason_for_test(payload, workspace) do
+    case maybe_block_unsafe_command(payload, workspace) do
       {:block, reason} -> reason
       :ok -> nil
     end
@@ -884,7 +919,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp command_action_strings(_actions), do: []
 
-  defp unsafe_command_reason(%{command: command, cwd: cwd, command_actions: command_actions}) do
+  defp unsafe_command_reason(
+         %{command: command, cwd: cwd, command_actions: command_actions},
+         workspace
+       ) do
     [command, cwd | command_actions]
     |> Enum.find_value(fn value ->
       case unsafe_absolute_command_reason(value) do
@@ -902,11 +940,10 @@ defmodule SymphonyElixir.Codex.AppServer do
       Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end) ||
       unsafe_direct_powershell_cmdlet_reason(command) ||
       Enum.find_value(command_actions, fn action -> unsafe_direct_powershell_cmdlet_reason(action) end) ||
-      unsafe_scratch_workspace_discovery_reason(command, cwd) ||
-      Enum.find_value(command_actions, fn action -> unsafe_scratch_workspace_discovery_reason(action, cwd) end)
+      unsafe_repository_discovery_reason([command | command_actions], cwd, workspace)
   end
 
-  defp unsafe_command_reason(_context), do: nil
+  defp unsafe_command_reason(_context, _workspace), do: nil
 
   defp unsafe_absolute_command_reason(command) when is_binary(command) do
     normalized = String.downcase(String.replace(command, "\\", "/"))
@@ -1076,34 +1113,40 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp unsafe_hosted_shell_generation_reason(_command), do: nil
 
-  defp unsafe_scratch_workspace_discovery_reason(command, cwd)
-       when is_binary(command) and is_binary(cwd) do
-    normalized_command =
-      command
-      |> String.trim()
-      |> String.replace("\\", "/")
-      |> String.downcase()
+  defp unsafe_repository_discovery_reason(commands, cwd, workspace)
+       when is_list(commands) and is_binary(cwd) do
+    candidates =
+      commands
+      |> Enum.filter(&is_binary/1)
+      |> Enum.flat_map(fn command ->
+        command
+        |> String.trim()
+        |> String.replace("\\", "/")
+        |> String.downcase()
+        |> shell_command_candidates()
+      end)
+      |> Enum.uniq()
 
-    normalized_cwd =
-      cwd
-      |> String.replace("\\", "/")
-      |> String.downcase()
+    cond do
+      Enum.any?(candidates, &git_worktree_list_command?/1) ->
+        "scratch Symphony workspace git worktree discovery is not allowed"
 
-    scratch_workspace? = Regex.match?(~r{/worktrees/symphony/[^/]+(?:/|$)}, normalized_cwd)
+      not Enum.any?(candidates, &repository_discovery_command?/1) ->
+        nil
 
-    broad_discovery? =
-      normalized_command
-      |> shell_command_candidates()
-      |> Enum.any?(&broad_repository_discovery_command?/1)
+      raw_parent_path_segment?(cwd) or
+          Enum.any?(candidates, &repository_scope_override_command?/1) ->
+        "scratch Symphony workspace repository discovery cannot override the issue-local clone scope"
 
-    if scratch_workspace? && broad_discovery? do
-      "scratch Symphony workspace repository discovery used instead of a named product worktree"
-    else
-      nil
+      valid_issue_local_normal_clone_cwd?(cwd, workspace) ->
+        nil
+
+      true ->
+        "scratch Symphony workspace repository discovery requires a valid issue-local normal clone under products/<repo>"
     end
   end
 
-  defp unsafe_scratch_workspace_discovery_reason(_command, _cwd), do: nil
+  defp unsafe_repository_discovery_reason(_commands, _cwd, _workspace), do: nil
 
   defp shell_command_candidates(command) when is_binary(command) do
     command
@@ -1139,6 +1182,87 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> String.trim(~s("))
     |> String.trim("'")
     |> String.trim()
+  end
+
+  defp repository_discovery_command?(command) when is_binary(command) do
+    broad_repository_discovery_command?(command) or
+      Regex.match?(~r/\bgit(?:\.exe)?\b.*\bstatus(?:\s|$)/, command)
+  end
+
+  defp repository_discovery_command?(_command), do: false
+
+  defp git_worktree_list_command?(command) when is_binary(command) do
+    Regex.match?(~r/\bgit(?:\.exe)?\s+worktree\s+list(?:\s|$)/, command)
+  end
+
+  defp repository_scope_override_command?(command) when is_binary(command) do
+    repository_discovery_command?(command) and
+      (raw_parent_path_segment?(command) or
+         Regex.match?(~r/\bgit(?:\.exe)?\s+-c(?:\s|$)/, command) or
+         Regex.match?(~r/(?:--git-dir|--work-tree)(?:=|\s)/, command) or
+         Regex.match?(~r/\bgit_[a-z0-9_]+\s*=/, command) or
+         rg_files_positional_path?(command))
+  end
+
+  defp raw_parent_path_segment?(path) when is_binary(path) do
+    Regex.match?(~r{(?:^|[\\/])\.\.(?:[\\/]|$)}, path) or
+      Regex.match?(~r{(?:^|[\s"'=])\.\.(?:[\\/]|[\s"']|$)}, path)
+  end
+
+  defp raw_parent_path_segment?(_path), do: false
+
+  defp rg_files_positional_path?(command) do
+    case Regex.run(~r/\brg(?:\.exe)?\s+--files\b(.*)$/, command, capture: :all_but_first) do
+      [suffix] ->
+        suffix
+        |> String.trim(~s("'{}))
+        |> String.split(~r/\s+/, trim: true)
+        |> rg_positional_path_argument?()
+
+      _no_rg_files ->
+        false
+    end
+  end
+
+  defp rg_positional_path_argument?([]), do: false
+
+  defp rg_positional_path_argument?([option, _value | rest]) when option in ["-g", "--glob"],
+    do: rg_positional_path_argument?(rest)
+
+  defp rg_positional_path_argument?([option | rest]) do
+    if String.starts_with?(option, "-"), do: rg_positional_path_argument?(rest), else: true
+  end
+
+  defp valid_issue_local_normal_clone_cwd?(cwd, workspace)
+       when is_binary(cwd) and is_binary(workspace) do
+    with false <- raw_parent_path_segment?(cwd),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         {:ok, canonical_cwd} <- PathSafety.canonicalize(cwd),
+         {:ok, clone_root} <- issue_local_clone_root(canonical_cwd, canonical_workspace),
+         git_dir = Path.join(clone_root, ".git"),
+         true <- File.dir?(git_dir),
+         {:ok, canonical_git_dir} <- PathSafety.canonicalize(git_dir),
+         true <- canonical_git_dir == git_dir,
+         true <- File.regular?(Path.join(git_dir, "HEAD")),
+         true <- File.regular?(Path.join(git_dir, "config")) do
+      true
+    else
+      _reason -> false
+    end
+  end
+
+  defp valid_issue_local_normal_clone_cwd?(_cwd, _workspace), do: false
+
+  defp issue_local_clone_root(cwd, workspace) do
+    relative = Path.relative_to(cwd, workspace)
+
+    case Path.split(relative) do
+      ["products", repo | _rest] when repo in @issue_product_repositories ->
+        {:ok, Path.join([workspace, "products", repo])}
+
+      _segments ->
+        {:error, :not_issue_product_clone}
+    end
   end
 
   defp broad_repository_discovery_command?(command) when is_binary(command) do
