@@ -1366,6 +1366,59 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms >= 0
   end
 
+  test "startup terminal workspace cleanup does not block orchestrator readiness" do
+    identifier = "MT-STARTUP-CLEANUP-#{System.unique_integer([:positive])}"
+
+    issue = %Issue{
+      id: "issue-startup-cleanup",
+      identifier: identifier,
+      title: "Slow startup cleanup",
+      state: "Done"
+    }
+
+    hook_command =
+      case :os.type() do
+        {:win32, _} ->
+          ~s(powershell.exe -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds 1500")
+
+        _ ->
+          "sleep 1.5"
+      end
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-startup-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      workspace_root: workspace_root,
+      hook_before_remove: hook_command,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    assert File.dir?(workspace)
+
+    orchestrator_name = Module.concat(__MODULE__, :AsyncStartupCleanupOrchestrator)
+    started_at_ms = System.monotonic_time(:millisecond)
+    assert {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    startup_elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    assert startup_elapsed_ms < 750
+    assert %{polling: %{poll_interval_ms: 60_000}} = GenServer.call(pid, :snapshot)
+    assert wait_until(fn -> not File.exists?(workspace) end, 5_000)
+  end
+
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -2265,6 +2318,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp wait_until(predicate, timeout_ms) when is_function(predicate, 0) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until(predicate, deadline_ms)
+  end
+
+  defp do_wait_until(predicate, deadline_ms) do
+    cond do
+      predicate.() ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        false
+
+      true ->
+        Process.sleep(10)
+        do_wait_until(predicate, deadline_ms)
+    end
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do

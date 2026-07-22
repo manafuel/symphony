@@ -582,6 +582,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear graphql requests stop at the explicit wall-clock deadline" do
+    parent = self()
+    started_at_ms = System.monotonic_time(:millisecond)
+
+    assert {:error, {:linear_api_request, {:linear_request_timeout, 25}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_timeout_ms: 25,
+               request_fun: fn _payload, _headers ->
+                 send(parent, {:linear_request_started, self()})
+                 Process.sleep(1_000)
+                 {:ok, %{status: 200, body: %{}}}
+               end
+             )
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+    assert_receive {:linear_request_started, request_pid}
+    refute Process.alive?(request_pid)
+    assert elapsed_ms < 500
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",

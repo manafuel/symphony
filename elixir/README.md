@@ -161,6 +161,9 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+- When the HTTP service is enabled, its listener starts before the orchestrator. Terminal-workspace
+  cleanup then runs as a supervised background task, and each Linear request has a 30-second
+  wall-clock deadline, so tracker latency cannot block the control plane from listening.
 
 ## Web dashboard
 

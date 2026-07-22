@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
+  @linear_request_timeout_ms 30_000
 
   @project_poll_query """
   query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
@@ -205,9 +206,11 @@ defmodule SymphonyElixir.Linear.Client do
       when is_binary(query) and is_map(variables) and is_list(opts) do
     payload = build_graphql_payload(query, variables, Keyword.get(opts, :operation_name))
     request_fun = Keyword.get(opts, :request_fun, &post_graphql_request/2)
+    request_timeout_ms = request_timeout_ms(opts)
 
     with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- request_fun.(payload, headers) do
+         {:ok, %{status: 200, body: body}} <-
+           run_request(request_fun, payload, headers, request_timeout_ms) do
       {:ok, body}
     else
       {:ok, response} ->
@@ -493,8 +496,39 @@ defmodule SymphonyElixir.Linear.Client do
     Req.post(Config.settings!().tracker.endpoint,
       headers: headers,
       json: payload,
-      connect_options: [timeout: 30_000]
+      connect_options: [timeout: @linear_request_timeout_ms],
+      receive_timeout: @linear_request_timeout_ms,
+      retry: false
     )
+  end
+
+  defp request_timeout_ms(opts) do
+    case Keyword.get(opts, :request_timeout_ms, @linear_request_timeout_ms) do
+      timeout_ms when is_integer(timeout_ms) and timeout_ms > 0 ->
+        min(timeout_ms, @linear_request_timeout_ms)
+
+      _ ->
+        @linear_request_timeout_ms
+    end
+  end
+
+  defp run_request(request_fun, payload, headers, timeout_ms) do
+    task =
+      Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+        request_fun.(payload, headers)
+      end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, result} ->
+        result
+
+      {:exit, reason} ->
+        {:error, {:request_task_exit, reason}}
+
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, {:linear_request_timeout, timeout_ms}}
+    end
   end
 
   defp decode_linear_response(%{"data" => %{"issues" => %{"nodes" => nodes}}}, assignee_filter) do
