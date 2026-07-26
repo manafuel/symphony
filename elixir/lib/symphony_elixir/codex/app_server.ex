@@ -1135,8 +1135,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         nil
 
       raw_parent_path_segment?(cwd) or
-          Enum.any?(candidates, &repository_scope_override_command?/1) ->
+          Enum.any?(candidates, fn candidate ->
+            repository_scope_override_command?(candidate) and
+                not allowed_issue_local_git_directory_scope?(candidate, cwd, workspace)
+          end) ->
         "scratch Symphony workspace repository discovery cannot override the issue-local clone scope"
+
+      all_repository_discovery_candidates_issue_local_scoped?(candidates, cwd, workspace) ->
+        nil
 
       valid_issue_local_normal_clone_cwd?(cwd, workspace) ->
         nil
@@ -1454,6 +1460,101 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp repository_scope_override_command?(_command), do: false
+
+  defp allowed_issue_local_git_directory_scope?(
+         %{argv: argv, compound?: false},
+         cwd,
+         workspace
+       )
+       when is_binary(cwd) and is_binary(workspace) do
+    with {:git, arguments} <- repository_cli_argv(argv),
+         {:ok, target} <- git_directory_scope_target(arguments),
+         {"status", _command_arguments} <- git_command_and_arguments(arguments),
+         false <- raw_parent_path_segment?(target),
+         :relative <- Path.type(target),
+         {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+         {:ok, canonical_cwd} <- PathSafety.canonicalize(cwd),
+         true <- canonical_cwd == canonical_workspace,
+         {:ok, canonical_target} <-
+           target
+           |> Path.expand(canonical_cwd)
+           |> PathSafety.canonicalize(),
+         {:ok, clone_root} <-
+           issue_local_clone_root(canonical_target, canonical_workspace),
+         true <- canonical_target == clone_root,
+         true <- valid_issue_local_normal_clone_cwd?(canonical_target, canonical_workspace) do
+      true
+    else
+      _reason -> false
+    end
+  end
+
+  defp allowed_issue_local_git_directory_scope?(_candidate, _cwd, _workspace), do: false
+
+  defp all_repository_discovery_candidates_issue_local_scoped?(candidates, cwd, workspace) do
+    discovery_candidates = Enum.filter(candidates, &repository_discovery_command?/1)
+
+    discovery_candidates != [] and
+      Enum.all?(discovery_candidates, fn candidate ->
+        allowed_issue_local_git_directory_scope?(candidate, cwd, workspace)
+      end)
+  end
+
+  defp git_directory_scope_target(arguments) when is_list(arguments),
+    do: git_directory_scope_target(arguments, nil)
+
+  defp git_directory_scope_target(["-c", target | rest], nil)
+       when is_binary(target) and target != "" do
+    if String.contains?(target, "=") do
+      {:error, :unsafe_git_directory_scope}
+    else
+      git_directory_scope_target(rest, target)
+    end
+  end
+
+  defp git_directory_scope_target(["status" | command_arguments], target)
+       when is_binary(target) do
+    if Enum.any?(command_arguments, &git_status_scope_override_argument?/1) do
+      {:error, :unsafe_git_directory_scope}
+    else
+      {:ok, target}
+    end
+  end
+
+  defp git_directory_scope_target([option | rest], target) do
+    if git_global_flag?(option) do
+      git_directory_scope_target(rest, target)
+    else
+      {:error, :unsafe_git_directory_scope}
+    end
+  end
+
+  defp git_directory_scope_target(_arguments, _target),
+    do: {:error, :unsafe_git_directory_scope}
+
+  defp git_status_scope_override_argument?(argument) do
+    argument in [
+      "-c",
+      "--git-dir",
+      "--work-tree",
+      "--config-env",
+      "--namespace",
+      "--super-prefix",
+      "--exec-path"
+    ] or
+      Enum.any?(
+        [
+          "-c",
+          "--git-dir=",
+          "--work-tree=",
+          "--config-env=",
+          "--namespace=",
+          "--super-prefix=",
+          "--exec-path="
+        ],
+        &String.starts_with?(argument, &1)
+      )
+  end
 
   defp raw_parent_path_segment?(path) when is_binary(path) do
     Regex.match?(~r{(?:^|[\\/])\.\.(?:[\\/]|$)}, path) or

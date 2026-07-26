@@ -1596,6 +1596,22 @@ defmodule SymphonyElixir.AppServerTest do
         }
       }
 
+      wrapped_issue_local_scoped_status_payload = %{
+        "params" => %{
+          "item" => %{
+            "type" => "commandExecution",
+            "command" => "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command 'git -C products/one status --short --branch'",
+            "cwd" => workspace,
+            "commandActions" => [
+              %{
+                "type" => "unknown",
+                "command" => "git -C products/one status --short --branch"
+              }
+            ]
+          }
+        }
+      }
+
       assert is_nil(
                AppServer.unsafe_command_block_reason_for_test(
                  payload.("git status --short --branch", clone),
@@ -1604,6 +1620,34 @@ defmodule SymphonyElixir.AppServerTest do
              )
 
       assert is_nil(AppServer.unsafe_command_block_reason_for_test(wrapped_status_payload, workspace))
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("git -C products/one status --short --branch", workspace),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.(~s(git "-C" "products/one" status --short --branch), workspace),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 payload.("git --no-pager -C products/one status --short --branch", workspace),
+                 workspace
+               )
+             )
+
+      assert is_nil(
+               AppServer.unsafe_command_block_reason_for_test(
+                 wrapped_issue_local_scoped_status_payload,
+                 workspace
+               )
+             )
 
       assert is_nil(
                AppServer.unsafe_command_block_reason_for_test(
@@ -1664,6 +1708,15 @@ defmodule SymphonyElixir.AppServerTest do
         payload.("git status --short --branch", linked_worktree),
         payload.("git status --short --branch", Path.join([clone, "..", "one"])),
         payload.("git -C .. status --short --branch", clone),
+        payload.("git -C products/one/src status --short --branch", workspace),
+        payload.("git -C products/bob status --short --branch", workspace),
+        payload.("git -C products/marketing status --short --branch", workspace),
+        payload.("git -C #{clone} status --short --branch", workspace),
+        payload.("git -C products/one -c core.worktree=#{other_issue_clone} status", workspace),
+        payload.("git -C products/one --git-dir=#{Path.join(other_issue_clone, ".git")} status", workspace),
+        payload.("git -C products/one status --work-tree=#{other_issue_clone}", workspace),
+        payload.("git --namespace=escape -C products/one status", workspace),
+        payload.("git -C products/one worktree list", workspace),
         payload.("git -C#{other_issue_clone} status --short --branch", clone),
         payload.("git --git-dir=../.git status --short --branch", clone),
         payload.("git --work-tree=#{other_issue_clone} status --short --branch", clone),
