@@ -2153,8 +2153,7 @@ defmodule SymphonyElixir.AppServerTest do
       delivered =
         event_log
         |> Agent.get(& &1)
-        |> Enum.map(&inspect/1)
-        |> Enum.join("\n")
+        |> Enum.map_join("\n", &inspect/1)
 
       refute delivered =~ "LEAKED_STALE_CONTENT"
     after

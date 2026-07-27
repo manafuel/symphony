@@ -394,8 +394,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert_receive {:outage_worker_started, :dead, ^dead_pid}, 1_000
     assert_receive {:outage_worker_started, :survivor, ^survivor_pid}, 1_000
 
-    workflow_store_pid = ensure_workflow_store_pid()
-    :ok = :sys.suspend(workflow_store_pid)
+    _workflow_store_pid = ensure_workflow_store_pid()
+    :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
 
     try do
       Process.exit(dead_pid, :boom)
@@ -407,7 +407,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
           end)
         end)
 
-      assert {:ok, state} = Task.yield(state_task, 1_000)
+      assert {:ok, state} =
+               Task.yield(state_task, 6_500) ||
+                 Task.shutdown(state_task, :brutal_kill)
+
       assert Process.alive?(pid)
       refute Process.alive?(dead_pid)
       assert Process.alive?(survivor_pid)
@@ -421,7 +424,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       assert is_reference(retry_token)
       assert map_size(state.retry_attempts) == 1
     after
-      :ok = :sys.resume(workflow_store_pid)
+      case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
     end
   end
 

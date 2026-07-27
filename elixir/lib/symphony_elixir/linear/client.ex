@@ -153,15 +153,13 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
 
-    cond do
-      is_nil(tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      true ->
-        with {:ok, poll_target} <- poll_target(tracker),
-             {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(poll_target, tracker.active_states, assignee_filter)
-        end
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      with {:ok, poll_target} <- poll_target(tracker),
+           {:ok, assignee_filter} <- routing_assignee_filter() do
+        do_fetch_by_states(poll_target, tracker.active_states, assignee_filter)
+      end
     end
   end
 
@@ -169,20 +167,19 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_issues_by_states(state_names) when is_list(state_names) do
     normalized_states = Enum.map(state_names, &to_string/1) |> Enum.uniq()
 
-    if normalized_states == [] do
-      {:ok, []}
-    else
-      tracker = Config.settings!().tracker
+    case normalized_states do
+      [] -> {:ok, []}
+      states -> fetch_issues_by_states_with_tracker(states, Config.settings!().tracker)
+    end
+  end
 
-      cond do
-        is_nil(tracker.api_key) ->
-          {:error, :missing_linear_api_token}
+  defp fetch_issues_by_states_with_tracker(_states, %{api_key: nil}) do
+    {:error, :missing_linear_api_token}
+  end
 
-        true ->
-          with {:ok, poll_target} <- poll_target(tracker) do
-            do_fetch_by_states(poll_target, normalized_states, nil)
-          end
-      end
+  defp fetch_issues_by_states_with_tracker(states, tracker) do
+    with {:ok, poll_target} <- poll_target(tracker) do
+      do_fetch_by_states(poll_target, states, nil)
     end
   end
 
