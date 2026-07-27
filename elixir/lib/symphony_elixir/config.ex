@@ -26,9 +26,9 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
-  @spec settings() :: {:ok, Schema.t()} | {:error, term()}
-  def settings do
-    case Workflow.current() do
+  @spec settings(timeout()) :: {:ok, Schema.t()} | {:error, term()}
+  def settings(timeout \\ 5_000) do
+    case Workflow.current(timeout) do
       {:ok, %{config: config}} when is_map(config) ->
         Schema.parse(config)
 
@@ -37,9 +37,9 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  @spec settings!() :: Schema.t()
-  def settings! do
-    case settings() do
+  @spec settings!(timeout()) :: Schema.t()
+  def settings!(timeout \\ 5_000) do
+    case settings(timeout) do
       {:ok, settings} ->
         settings
 

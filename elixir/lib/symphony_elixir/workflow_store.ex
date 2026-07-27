@@ -21,11 +21,11 @@ defmodule SymphonyElixir.WorkflowStore do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @spec current() :: {:ok, Workflow.loaded_workflow()} | {:error, term()}
-  def current do
+  @spec current(timeout()) :: {:ok, Workflow.loaded_workflow()} | {:error, term()}
+  def current(timeout \\ 5_000) do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        GenServer.call(__MODULE__, :current, timeout)
 
       _ ->
         Workflow.load()

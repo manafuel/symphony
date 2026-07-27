@@ -25,6 +25,7 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   @default_max_retry_attempts 3
   @default_max_retry_backoff_ms 300_000
+  @workflow_refresh_timeout_ms 100
   @terminal_retry_min_delay_ms 1_000
   @terminal_retry_max_delay_ms 60_000
   # Slightly above the dashboard render interval so "checking now…" can render.
@@ -2445,7 +2446,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp load_runtime_config(%State{} = state) do
-    config = Config.settings!()
+    config = Config.settings!(@workflow_refresh_timeout_ms)
     cache_runtime_settings(state, config)
   end
 
