@@ -29,6 +29,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
+          model_role: String.t() | nil,
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
@@ -36,7 +39,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put(opts, :issue, issue)) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -48,12 +51,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    issue = Keyword.get(opts, :issue)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, issue),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -65,6 +69,9 @@ defmodule SymphonyElixir.Codex.AppServer do
            auto_approve_requests: false,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
+           model: session_policies.model,
+           reasoning_effort: session_policies.reasoning_effort,
+           model_role: session_policies.model_role,
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host
@@ -85,6 +92,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
+          reasoning_effort: reasoning_effort,
           thread_id: thread_id,
           workspace: workspace
         },
@@ -99,7 +107,16 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, workspace: workspace)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           reasoning_effort
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -276,6 +293,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
+  @spec local_port_spawn_command_for_test(String.t(), [String.t()], Path.t()) ::
+          {:ok, String.t(), [String.t()]} | {:error, term()}
   def local_port_spawn_command_for_test(executable, args, workspace) do
     local_port_spawn_command(executable, args, workspace)
   end
@@ -421,12 +440,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, issue) do
+    Config.codex_runtime_settings(workspace, issue: issue)
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, issue) when is_binary(worker_host) do
+    Config.codex_runtime_settings(workspace, remote: true, issue: issue)
   end
 
   defp do_start_session(port, workspace, session_policies) do
@@ -437,18 +456,26 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
-  @spec thread_start_payload(String.t(), %{approval_policy: term(), thread_sandbox: term()}) :: map()
-  def thread_start_payload(workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
-    %{
-      "method" => "thread/start",
-      "id" => @thread_start_id,
-      "params" => %{
+  @spec thread_start_payload(String.t(), map()) :: map()
+  def thread_start_payload(workspace, session_policies) do
+    approval_policy = session_policies.approval_policy
+    thread_sandbox = session_policies.thread_sandbox
+
+    params =
+      %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "developerInstructions" => @manafuel_developer_instructions,
+        "developerInstructions" => @manafuel_developer_instructions <> routing_developer_instructions(session_policies),
         "dynamicTools" => DynamicTool.tool_specs()
       }
+      |> maybe_put("model", Map.get(session_policies, :model))
+      |> maybe_put("config", thread_config(session_policies))
+
+    %{
+      "method" => "thread/start",
+      "id" => @thread_start_id,
+      "params" => params
     }
   end
 
@@ -467,11 +494,56 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         reasoning_effort
+       ) do
+    send_message(
+      port,
+      turn_start_payload(
+        thread_id,
+        prompt,
+        issue,
+        workspace,
+        approval_policy,
+        turn_sandbox_policy,
+        reasoning_effort
+      )
+    )
+
+    case await_response(port, @turn_start_id) do
+      {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
+      other -> other
+    end
+  end
+
+  @doc false
+  @spec turn_start_payload(
+          String.t(),
+          String.t(),
+          map(),
+          String.t(),
+          term(),
+          map(),
+          String.t() | nil
+        ) :: map()
+  def turn_start_payload(
+        thread_id,
+        prompt,
+        issue,
+        workspace,
+        approval_policy,
+        turn_sandbox_policy,
+        reasoning_effort
+      ) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -484,13 +556,48 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
-    })
+      |> maybe_put("effort", reasoning_effort)
 
-    case await_response(port, @turn_start_id) do
-      {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
-      other -> other
+    %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
+    }
+  end
+
+  defp thread_config(session_policies) do
+    %{}
+    |> maybe_put("model_reasoning_effort", Map.get(session_policies, :reasoning_effort))
+    |> maybe_put("agents", agents_config(Map.get(session_policies, :subagent_defaults)))
+    |> empty_to_nil()
+  end
+
+  defp agents_config(nil), do: nil
+
+  defp agents_config(defaults) do
+    %{
+      "default_subagent_model" => defaults["default_model"],
+      "default_subagent_reasoning_effort" => defaults["default_reasoning_effort"],
+      "max_concurrent_threads_per_session" => defaults["max_concurrent_threads_per_session"]
+    }
+  end
+
+  defp routing_developer_instructions(session_policies) do
+    if is_nil(Map.get(session_policies, :model_role)) do
+      ""
+    else
+      """
+
+      This thread is explicitly routed as #{session_policies.model_role} on #{session_policies.model} with #{session_policies.reasoning_effort} reasoning. Do not inherit the parent model for delegated work. Keep bounded read-only evidence and file gathering on the configured efficient subagent default. Keep implementation in this worker when it is an implementation role; if a separate implementation subagent is required, explicitly select gpt-5.6-terra with medium or high reasoning. Strategic executive and department-head threads must delegate implementation rather than performing it on gpt-5.6-sol. Token telemetry is advisory only: never stop, freeze, defer, or move a task to Human Review because of token usage.
+      """
     end
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp empty_to_nil(map) when map_size(map) == 0, do: nil
+  defp empty_to_nil(map), do: map
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
     receive_loop(

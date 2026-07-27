@@ -451,6 +451,16 @@ fields locally if they want stricter startup checks.
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
+- `model_routing` (object, OPTIONAL)
+  - Omission preserves the targeted Codex app-server's normal model and effort inheritance.
+  - `default_role` names a route in `roles`.
+  - `roles` maps role names to non-blank `model` and supported `reasoning_effort` strings.
+  - `label_roles` maps exact normalized issue labels to role names.
+  - `subagents` supplies `default_model`, `default_reasoning_effort`, and a positive
+    `max_concurrent_threads_per_session`.
+  - Unknown issue labels do not affect routing.
+  - More than one distinct role selected by issue labels MUST fail rather than silently choose a
+    route.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
@@ -597,6 +607,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
+- `codex.model_routing`: optional role/label/model/effort/subagent routing map, default null
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
@@ -946,6 +957,9 @@ Notes:
 - The default command is `codex app-server`.
 - Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
   using fields supported by the targeted Codex app-server version.
+- When `codex.model_routing` is configured, the resolved parent model, reasoning effort, and
+  subagent defaults are supplied through fields/config keys supported by the targeted app-server
+  version. The configured values take precedence over parent-session inheritance.
 
 RECOMMENDED additional process settings:
 
@@ -971,6 +985,9 @@ client to:
 - Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
   protocol supports turn or session titles.
 - Advertise implemented client-side tools using the targeted protocol.
+- When model routing is configured, resolve the issue's exact normalized labels before thread
+  creation, send the selected model at thread start, and send the selected reasoning effort at
+  thread and turn start.
 
 Session identifiers:
 
