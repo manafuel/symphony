@@ -331,6 +331,18 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
+    source_sha = String.duplicate("a", 40)
+    previous_source_sha = System.get_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+    System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", source_sha)
+
+    on_exit(fn ->
+      if is_nil(previous_source_sha) do
+        System.delete_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+      else
+        System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", previous_source_sha)
+      end
+    end)
+
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
 
@@ -353,6 +365,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
+             "source_sha" => source_sha,
+             "max_concurrent_agents" => 10,
              "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
              "running" => [
                %{
@@ -479,6 +493,34 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability state fails closed on invalid runtime source provenance" do
+    previous_source_sha = System.get_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+    System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", "not-a-source-sha")
+
+    on_exit(fn ->
+      if is_nil(previous_source_sha) do
+        System.delete_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+      else
+        System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", previous_source_sha)
+      end
+    end)
+
+    snapshot = static_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :InvalidSourceShaObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert %{"source_sha" => nil, "max_concurrent_agents" => 10} =
+             json_response(get(build_conn(), "/api/v1/state"), 200)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do

@@ -13,6 +13,8 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         %{
           generated_at: generated_at,
+          source_sha: runtime_source_sha(),
+          max_concurrent_agents: Config.settings!().agent.max_concurrent_agents,
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
@@ -256,4 +258,21 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp runtime_source_sha do
+    case System.get_env("MANAFUEL_RUNTIME_SOURCE_SHA") do
+      value when is_binary(value) ->
+        candidate = value |> String.trim() |> String.downcase()
+
+        if byte_size(candidate) in [40, 64] and
+             candidate
+             |> String.to_charlist()
+             |> Enum.all?(&(&1 in ~c"0123456789abcdef")) do
+          candidate
+        end
+
+      _ ->
+        nil
+    end
+  end
 end
