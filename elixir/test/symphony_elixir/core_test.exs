@@ -2658,10 +2658,17 @@ defmodule SymphonyElixir.CoreTest do
     assert FailureSemantics.disposition(:approval_required) == :held
     assert FailureSemantics.disposition(:permanent_contract) == :permanent
 
-    assert {:shutdown, {:classified_failure, :unknown_fail_closed, bounded_reason}} =
+    assert {:shutdown, {:classified_failure, :unknown_fail_closed, safe_reason}} =
              FailureSemantics.exit_reason({:unexpected, String.duplicate("x", 4_000)})
 
-    assert byte_size(bounded_reason) <= 2_000
+    assert safe_reason == "unexpected"
+
+    secret_sentinel = "sk_live_R2_SHOULD_NOT_SURVIVE"
+
+    assert {:shutdown, {:classified_failure, :unknown_fail_closed, "unexpected"}} =
+             FailureSemantics.exit_reason({:unexpected, secret_sentinel})
+
+    refute FailureSemantics.safe_diagnostic({:unexpected, secret_sentinel}) =~ secret_sentinel
   end
 
   test "permanent, approval, and authority failures execute once and enter terminal state" do
@@ -2890,6 +2897,77 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(recovered.retrying, issue.id)
     assert Map.has_key?(recovered.retrying, "issue-restart-transient")
     assert Map.has_key?(recovered.retrying, "issue-restart-continuation")
+  end
+
+  test "execution ledger persists structural identity without issue body or raw failure text" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-redaction-#{System.unique_integer([:positive])}"
+      )
+
+    secret_sentinel = "sk_live_R2_LEDGER_SENTINEL"
+
+    issue = %Issue{
+      id: "issue-ledger-redaction",
+      identifier: "MT-R2-LEDGER-REDACTION",
+      title: "Title #{secret_sentinel}",
+      description: "Description #{secret_sentinel}",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-LEDGER-REDACTION",
+      labels: ["symphony", secret_sentinel],
+      assigned_to_worker: true
+    }
+
+    terminal = %{
+      issue.id => %{
+        issue: issue,
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "transport response #{secret_sentinel}",
+        failure_class: :permanent_contract,
+        terminal_state: :permanent,
+        transition: :terminal,
+        attempt: 1,
+        blocked_at: DateTime.utc_now()
+      }
+    }
+
+    retrying = %{
+      "issue-retry-redaction" => %{
+        identifier: "MT-R2-RETRY-REDACTION",
+        error: "retry response #{secret_sentinel}",
+        attempt: 2,
+        failure_class: :transient_transport,
+        delay_type: :backoff,
+        transition: :retrying,
+        due_at: DateTime.add(DateTime.utc_now(), 60, :second)
+      }
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert {:ok, effects, _prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, terminal, retrying, effects)
+
+    ledger_path = Path.join([root, ".symphony-state", "execution.json"])
+    raw_ledger = File.read!(ledger_path)
+
+    refute raw_ledger =~ secret_sentinel
+    refute raw_ledger =~ "\"description\""
+    refute raw_ledger =~ "\"title\""
+    refute raw_ledger =~ "\"labels\""
+    assert raw_ledger =~ "execution_terminal:permanent_contract"
+    assert raw_ledger =~ "execution_backoff:transient_transport"
+
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    refute inspect(restored) =~ secret_sentinel
+    assert restored.blocked[issue.id].error == "execution_terminal:permanent_contract"
+    assert restored.retrying["issue-retry-redaction"].error ==
+             "execution_backoff:transient_transport"
   end
 
   test "execution ledger falls back only when current is absent and rejects ambiguous input" do

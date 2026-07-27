@@ -263,7 +263,7 @@ defmodule SymphonyElixir.ExecutionLedger do
       issue: issue,
       identifier: Map.get(entry, "identifier") || issue.identifier || issue_id,
       issue_url: Map.get(entry, "issue_url") || issue.url,
-      error: Map.get(entry, "error") || "terminal failure",
+      error: safe_failure_diagnostic(decoded_class, :terminal),
       worker_host: Map.get(entry, "worker_host"),
       workspace_path: Map.get(entry, "workspace_path"),
       session_id: Map.get(entry, "session_id"),
@@ -290,7 +290,7 @@ defmodule SymphonyElixir.ExecutionLedger do
           issue: issue,
           identifier: Map.get(entry, "identifier") || issue.identifier || issue_id,
           issue_url: Map.get(entry, "issue_url") || issue.url,
-          error: Map.get(entry, "error") || "legacy terminal state",
+          error: safe_failure_diagnostic(:unknown_fail_closed, :legacy_terminal),
           worker_host: Map.get(entry, "worker_host"),
           workspace_path: Map.get(entry, "workspace_path"),
           session_id: Map.get(entry, "session_id"),
@@ -334,7 +334,7 @@ defmodule SymphonyElixir.ExecutionLedger do
           attempt: attempt,
           identifier: Map.get(entry, "identifier") || issue_id,
           issue_url: Map.get(entry, "issue_url"),
-          error: Map.get(entry, "error"),
+          error: safe_failure_diagnostic(decoded_class, decode_delay_type(delay_type)),
           worker_host: Map.get(entry, "worker_host"),
           workspace_path: Map.get(entry, "workspace_path"),
           failure_class: decoded_class,
@@ -421,7 +421,11 @@ defmodule SymphonyElixir.ExecutionLedger do
       identifier: bounded_text(Map.get(entry, :identifier)),
       issue_url: bounded_text(Map.get(entry, :issue_url)),
       issue: encode_issue(Map.get(entry, :issue), issue_id),
-      error: bounded_text(Map.get(entry, :error) || "terminal failure"),
+      error:
+        safe_failure_diagnostic(
+          Map.get(entry, :failure_class),
+          Map.get(entry, :block_kind) || :terminal
+        ),
       worker_host: bounded_text(Map.get(entry, :worker_host)),
       workspace_path: bounded_text(Map.get(entry, :workspace_path)),
       session_id: bounded_text(Map.get(entry, :session_id)),
@@ -445,7 +449,11 @@ defmodule SymphonyElixir.ExecutionLedger do
       issue_id: bounded_text(issue_id),
       identifier: bounded_text(Map.get(entry, :identifier)),
       issue_url: bounded_text(Map.get(entry, :issue_url)),
-      error: bounded_text(Map.get(entry, :error)),
+      error:
+        safe_failure_diagnostic(
+          Map.get(entry, :failure_class),
+          Map.get(entry, :delay_type) || :backoff
+        ),
       worker_host: bounded_text(Map.get(entry, :worker_host)),
       workspace_path: bounded_text(Map.get(entry, :workspace_path)),
       attempt: positive_integer(Map.get(entry, :attempt)),
@@ -475,14 +483,8 @@ defmodule SymphonyElixir.ExecutionLedger do
     %{
       id: bounded_text(issue.id || issue_id),
       identifier: bounded_text(issue.identifier),
-      title: bounded_text(issue.title),
-      description: bounded_text(issue.description),
-      priority: issue.priority,
       state: bounded_text(issue.state),
       url: bounded_text(issue.url),
-      assignee_id: bounded_text(issue.assignee_id),
-      labels: sanitize_json(issue.labels),
-      blocked_by: sanitize_json(issue.blocked_by),
       assigned_to_worker: issue.assigned_to_worker
     }
   end
@@ -494,14 +496,8 @@ defmodule SymphonyElixir.ExecutionLedger do
      %Issue{
        id: Map.get(issue, "id") || issue_id,
        identifier: Map.get(issue, "identifier"),
-       title: Map.get(issue, "title"),
-       description: Map.get(issue, "description"),
-       priority: Map.get(issue, "priority"),
        state: Map.get(issue, "state"),
        url: Map.get(issue, "url"),
-       assignee_id: Map.get(issue, "assignee_id"),
-       labels: Map.get(issue, "labels") || [],
-       blocked_by: Map.get(issue, "blocked_by") || [],
        assigned_to_worker: Map.get(issue, "assigned_to_worker") != false
      }}
   end
@@ -556,6 +552,15 @@ defmodule SymphonyElixir.ExecutionLedger do
   defp decode_effect_status("completed"), do: {:ok, :completed}
   defp decode_effect_status(_status), do: {:error, :invalid_effect_status}
 
+  defp safe_failure_diagnostic(class, context) when is_atom(context) do
+    class_label =
+      if FailureSemantics.valid_class?(class),
+        do: Atom.to_string(class),
+        else: "continuation"
+
+    "execution_#{context}:#{class_label}"
+  end
+
   defp decode_known_atom("before_terminal"), do: :before_terminal
   defp decode_known_atom(_value), do: nil
 
@@ -604,15 +609,6 @@ defmodule SymphonyElixir.ExecutionLedger do
       do: {:cont, acc <> grapheme},
       else: {:halt, acc <> "...[truncated]"}
   end
-
-  defp sanitize_json(value) when is_binary(value), do: bounded_text(value)
-  defp sanitize_json(value) when is_list(value), do: Enum.map(value, &sanitize_json/1)
-
-  defp sanitize_json(value) when is_map(value) do
-    Map.new(value, fn {key, nested} -> {key, sanitize_json(nested)} end)
-  end
-
-  defp sanitize_json(value), do: value
 
   defp atomic_write(paths, content) do
     temporary = "#{paths.current}.tmp-#{System.unique_integer([:positive, :monotonic])}"

@@ -107,8 +107,29 @@ defmodule SymphonyElixir.FailureSemantics do
   @spec exit_reason(term()) :: {:shutdown, {:classified_failure, failure_class(), term()}}
   def exit_reason(reason) do
     classification = classify(reason)
-    {:shutdown, {:classified_failure, classification.class, bounded_reason(reason)}}
+    {:shutdown, {:classified_failure, classification.class, safe_diagnostic(reason)}}
   end
+
+  @doc """
+  Returns a bounded structural diagnostic without retaining caller-controlled
+  free text. Diagnostics are evidence only and never control retry.
+  """
+  @spec safe_diagnostic(term()) :: String.t()
+  def safe_diagnostic({:classified_failure, class, _details}) when class in @typed_classes,
+    do: "classified_failure:#{class}"
+
+  def safe_diagnostic({:workspace_hook_failed, hook_name, status}) when is_integer(status),
+    do: "workspace_hook_failed:#{safe_hook_name(hook_name)}:status_#{status}"
+
+  def safe_diagnostic({:workspace_hook_timeout, hook_name, _timeout_ms}),
+    do: "workspace_hook_timeout:#{safe_hook_name(hook_name)}"
+
+  def safe_diagnostic({:port_exit, status}) when is_integer(status),
+    do: "port_exit:status_#{status}"
+
+  def safe_diagnostic({tag, _details}) when is_atom(tag), do: Atom.to_string(tag)
+  def safe_diagnostic(tag) when is_atom(tag), do: Atom.to_string(tag)
+  def safe_diagnostic(_reason), do: "redacted_unstructured_failure"
 
   @spec disposition(failure_class()) :: :retry | :held | :permanent
   def disposition(class) when class in @transient_classes, do: :retry
@@ -128,9 +149,8 @@ defmodule SymphonyElixir.FailureSemantics do
 
   defp classified(_class, reason), do: classified(:unknown_fail_closed, reason)
 
-  defp bounded_reason(reason) do
-    reason
-    |> inspect(limit: 30, printable_limit: 2_000, width: 80)
-    |> String.slice(0, 2_000)
-  end
+  defp safe_hook_name("before_run"), do: "before_run"
+  defp safe_hook_name("before_terminal"), do: "before_terminal"
+  defp safe_hook_name("after_run"), do: "after_run"
+  defp safe_hook_name(_hook_name), do: "unknown_hook"
 end
