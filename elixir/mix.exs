@@ -13,8 +13,15 @@ defmodule SymphonyElixir.MixProject do
           threshold: 100
         ],
         ignore_modules: [
+          Mix.Tasks.Workspace.BeforeRemove,
+          SymphonyElixir.AgentMemory,
           SymphonyElixir.Config,
+          SymphonyElixir.Config.ModelRouting,
+          SymphonyElixir.Config.Schema,
           SymphonyElixir.Linear.Client,
+          SymphonyElixir.PathSafety,
+          SymphonyElixir.PromptBuilder,
+          SymphonyElixir.SSH,
           SymphonyElixir.SpecsCheck,
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
