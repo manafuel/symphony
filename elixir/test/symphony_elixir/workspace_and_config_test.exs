@@ -210,7 +210,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       hook_after_create =
-        if windows?() do
+        if Workspace.local_hook_shell_for_test() == :powershell do
           "Write-Output nope; exit 17"
         else
           "echo nope && exit 17"
@@ -225,6 +225,174 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                Workspace.create_for_issue("MT-FAIL")
     after
       File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Windows local hooks select Git Bash and deliver the complete issue environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-selection-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      bash = Path.join(test_root, "bash.exe")
+      system_bash = Path.join([test_root, "Windows", "System32", "bash.exe"])
+      File.mkdir_p!(Path.dirname(system_bash))
+      File.write!(bash, "fixture")
+      File.write!(system_bash, "wsl-stub-fixture")
+      parent = self()
+
+      issue_context = %{
+        issue_id: "issue-hook-selection",
+        issue_identifier: "MT-HOOK-SELECTION",
+        issue_title: "Select Git Bash",
+        issue_description: "Exercise the production hook router.",
+        issue_labels: ["symphony", "windows"],
+        issue_state: "Ready",
+        issue_updated_at: "2026-07-27T23:45:00Z"
+      }
+
+      assert :ok =
+               Workspace.run_local_hook_for_test(
+                 "printf selected",
+                 test_root,
+                 issue_context,
+                 "before_run",
+                 os_type: {:win32, :nt},
+                 git_bash_candidates: [system_bash, bash],
+                 command_runner: fn executable, args, opts ->
+                   send(parent, {:hook_invocation, executable, args, opts})
+                   {"", 0}
+                 end
+               )
+
+      assert_receive {:hook_invocation, ^bash, ["-lc", "printf selected"], opts}
+      assert Keyword.fetch!(opts, :cd) == test_root
+      assert Keyword.fetch!(opts, :stderr_to_stdout)
+
+      env = Keyword.fetch!(opts, :env) |> Map.new()
+      assert env["SYMPHONY_WORKSPACE"] == test_root
+      assert env["SYMPHONY_ISSUE_ID"] == "issue-hook-selection"
+      assert env["SYMPHONY_ISSUE_IDENTIFIER"] == "MT-HOOK-SELECTION"
+      assert env["SYMPHONY_ISSUE_TITLE"] == "Select Git Bash"
+      assert env["SYMPHONY_ISSUE_DESCRIPTION"] == "Exercise the production hook router."
+      assert env["SYMPHONY_ISSUE_LABELS"] == "symphony,windows"
+      assert env["SYMPHONY_ISSUE_STATE"] == "Ready"
+      assert env["SYMPHONY_ISSUE_UPDATED_AT"] == "2026-07-27T23:45:00Z"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Windows Git Bash hook runner propagates exit status and redacts command output" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-execution-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      sh = System.find_executable("sh")
+      assert is_binary(sh) and File.regular?(sh)
+
+      issue_context = %{
+        issue_id: "issue-hook-execution",
+        issue_identifier: "MT-HOOK-EXECUTION",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "Ready",
+        issue_updated_at: ""
+      }
+
+      command =
+        "printf '%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" > hook-env.txt; " <>
+          "printf 'raw-hook-secret'; exit 17"
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, {:workspace_hook_failed, "before_run", 17}} =
+                   Workspace.run_local_hook_for_test(
+                     command,
+                     test_root,
+                     issue_context,
+                     "before_run",
+                     os_type: {:win32, :nt},
+                     git_bash_candidates: [sh]
+                   )
+        end)
+
+      assert File.read!(Path.join(test_root, "hook-env.txt")) == "MT-HOOK-EXECUTION"
+      assert log =~ "status=17"
+      assert log =~ "output_redacted=true"
+      refute log =~ "raw-hook-secret"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Windows local hooks fall back to noninteractive PowerShell without Git Bash" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      parent = self()
+
+      issue_context = %{
+        issue_id: "issue-hook-fallback",
+        issue_identifier: "MT-HOOK-FALLBACK",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "",
+        issue_updated_at: ""
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, {:workspace_hook_failed, "after_run", 23}} =
+                   Workspace.run_local_hook_for_test(
+                     "Write-Output fallback; exit 23",
+                     test_root,
+                     issue_context,
+                     "after_run",
+                     os_type: {:win32, :nt},
+                     git_bash_candidates: [],
+                     command_runner: fn executable, args, opts ->
+                       send(parent, {:hook_invocation, executable, args, opts})
+                       {"raw-fallback-secret", 23}
+                     end
+                   )
+        end)
+
+      assert_receive {:hook_invocation, "powershell.exe", args, opts}
+
+      assert Enum.take(args, 5) == [
+               "-NoLogo",
+               "-NoProfile",
+               "-NonInteractive",
+               "-ExecutionPolicy",
+               "Bypass"
+             ]
+
+      assert Enum.at(args, 5) == "-Command"
+      assert Enum.at(args, 6) =~ "Write-Output fallback; exit 23"
+
+      assert Keyword.fetch!(opts, :env) |> Map.new() |> Map.fetch!("SYMPHONY_ISSUE_IDENTIFIER") ==
+               "MT-HOOK-FALLBACK"
+
+      assert log =~ "status=23"
+      assert log =~ "output_redacted=true"
+      refute log =~ "raw-fallback-secret"
+    after
+      File.rm_rf(test_root)
     end
   end
 
@@ -798,7 +966,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(workspace_root)
 
       {hook_after_create, hook_before_remove} =
-        if windows?() do
+        if Workspace.local_hook_shell_for_test() == :powershell do
           escaped_counter = powershell_single_quote(after_create_counter)
           escaped_before_remove = powershell_single_quote(before_remove_marker)
 
@@ -1035,8 +1203,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.mkdir_p!(workspace_root)
 
       hook_before_run =
-        case :os.type() do
-          {:win32, _} ->
+        case Workspace.local_hook_shell_for_test() do
+          :powershell ->
             escaped_marker = String.replace(marker, "'", "''")
             "[System.IO.File]::WriteAllText('#{escaped_marker}', $env:SYMPHONY_ISSUE_IDENTIFIER)"
 
