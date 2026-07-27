@@ -127,7 +127,10 @@ defmodule SymphonyElixir.FailureSemantics do
   def safe_diagnostic({:port_exit, status}) when is_integer(status),
     do: "port_exit:status_#{status}"
 
-  def safe_diagnostic({tag, _details}) when is_atom(tag), do: Atom.to_string(tag)
+  def safe_diagnostic(reason)
+      when is_tuple(reason) and tuple_size(reason) > 0 and is_atom(elem(reason, 0)),
+      do: reason |> elem(0) |> Atom.to_string()
+
   def safe_diagnostic(tag) when is_atom(tag), do: Atom.to_string(tag)
   def safe_diagnostic(_reason), do: "redacted_unstructured_failure"
 

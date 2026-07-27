@@ -2966,6 +2966,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, restored} = ExecutionLedger.load(root)
     refute inspect(restored) =~ secret_sentinel
     assert restored.blocked[issue.id].error == "execution_terminal:permanent_contract"
+
     assert restored.retrying["issue-retry-redaction"].error ==
              "execution_backoff:transient_transport"
   end
