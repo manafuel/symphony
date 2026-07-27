@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Config.{ModelRouting, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -103,12 +103,18 @@ defmodule SymphonyElixir.Config do
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
     with {:ok, settings} <- settings() do
       with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts),
+           {:ok, model_route} <-
+             ModelRouting.resolve(settings.codex.model_routing, Keyword.get(opts, :issue)) do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
            thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
+           turn_sandbox_policy: turn_sandbox_policy,
+           model: model_route.model,
+           reasoning_effort: model_route.reasoning_effort,
+           model_role: model_route.model_role,
+           subagent_defaults: model_route.subagent_defaults
          }}
       end
     end

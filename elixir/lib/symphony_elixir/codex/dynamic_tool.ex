@@ -621,7 +621,7 @@ defmodule SymphonyElixir.Codex.DynamicTool do
   end
 
   @doc false
-  @spec hidden_stdio_launcher_executable(Path.t()) :: Path.t() | nil
+  @spec hidden_stdio_launcher_executable(Path.t()) :: String.t() | nil
   def hidden_stdio_launcher_executable(workdir) do
     workdir
     |> hidden_stdio_launcher_candidates()

@@ -127,6 +127,15 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
+- `codex.model_routing` optionally pins the parent model and reasoning effort from exact issue
+  labels. It contains `default_role`, a `roles` map (`model` plus `reasoning_effort`), a
+  `label_roles` map, and required `subagents` defaults (`default_model`,
+  `default_reasoning_effort`, and `max_concurrent_threads_per_session`). Symphony sends the
+  resolved model at `thread/start`, sends the effort both as thread config and at `turn/start`, and
+  sends the subagent defaults in the thread's `agents` config. Without this block, no model or
+  effort override is sent and existing Codex inheritance is preserved.
+- Label selection is exact after trimming and lowercasing. Unknown labels are ignored; two labels
+  that select different roles fail the session instead of choosing one silently.
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
