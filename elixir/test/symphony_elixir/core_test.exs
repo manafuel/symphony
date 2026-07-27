@@ -3001,10 +3001,12 @@ defmodule SymphonyElixir.CoreTest do
         issue,
         1,
         nil
-      )
+    )
 
     assert blocked.running == %{}
-    assert blocked.effects == %{}
+    assert [prepared_effect] = Map.values(blocked.effects)
+    assert prepared_effect.issue_id == issue.id
+    assert prepared_effect.status == :prepared
     assert blocked.execution_ledger_healthy == false
     assert blocked.blocked[issue.id].failure_class == :unknown_fail_closed
     assert blocked.blocked[issue.id].terminal_state == :permanent
