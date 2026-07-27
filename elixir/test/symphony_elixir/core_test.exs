@@ -2971,6 +2971,47 @@ defmodule SymphonyElixir.CoreTest do
              "execution_backoff:transient_transport"
   end
 
+  test "dispatch reservation write failure blocks before any worker starts" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-ledger-write-failure-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-ledger-write-failure",
+      identifier: "MT-R2-LEDGER-WRITE-FAILURE",
+      title: "Do not launch without a durable reservation",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    File.write!(root, "this path is deliberately a file")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    state = %Orchestrator.State{
+      workspace_root: root,
+      execution_ledger_healthy: true,
+      max_retry_attempts: 3
+    }
+
+    blocked =
+      Orchestrator.spawn_issue_on_worker_host_for_test(
+        state,
+        issue,
+        1,
+        nil
+      )
+
+    assert blocked.running == %{}
+    assert blocked.effects == %{}
+    assert blocked.execution_ledger_healthy == false
+    assert blocked.blocked[issue.id].failure_class == :unknown_fail_closed
+    assert blocked.blocked[issue.id].terminal_state == :permanent
+    assert blocked.blocked[issue.id].error == "unable to durably reserve dispatch"
+    assert MapSet.member?(blocked.claimed, issue.id)
+  end
+
   test "execution ledger falls back only when current is absent and rejects ambiguous input" do
     alias SymphonyElixir.ExecutionLedger
 

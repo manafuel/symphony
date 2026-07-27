@@ -691,6 +691,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec spawn_issue_on_worker_host_for_test(
+          State.t(),
+          Issue.t(),
+          non_neg_integer(),
+          String.t() | nil
+        ) :: State.t()
+  def spawn_issue_on_worker_host_for_test(
+        %State{} = state,
+        %Issue{} = issue,
+        attempt,
+        worker_host
+      )
+      when is_integer(attempt) and (is_binary(worker_host) or is_nil(worker_host)) do
+    spawn_issue_on_worker_host(state, issue, attempt, self(), worker_host)
+  end
+
+  @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
