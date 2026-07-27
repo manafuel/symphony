@@ -293,6 +293,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
+  @spec local_port_spawn_command_for_test(String.t(), [String.t()], Path.t()) ::
+          {:ok, String.t(), [String.t()]} | {:error, term()}
   def local_port_spawn_command_for_test(executable, args, workspace) do
     local_port_spawn_command(executable, args, workspace)
   end
