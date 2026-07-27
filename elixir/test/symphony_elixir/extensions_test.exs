@@ -458,6 +458,94 @@ defmodule SymphonyElixir.ExtensionsTest do
              json_response(conn, 202)
   end
 
+  test "presenter distinguishes held and permanent terminal outcomes" do
+    snapshot =
+      Map.merge(static_snapshot(), %{
+        blocked: [
+          %{
+            issue_id: "issue-held",
+            identifier: "MT-R2-HELD",
+            issue_url: "https://example.org/issues/MT-R2-HELD",
+            state: "In Progress",
+            error: "approval required",
+            failure_class: :approval_required,
+            terminal_state: :held,
+            transition: :terminal,
+            attempt: 1,
+            blocked_at: DateTime.utc_now()
+          },
+          %{
+            issue_id: "issue-permanent",
+            identifier: "MT-R2-PERMANENT",
+            issue_url: "https://example.org/issues/MT-R2-PERMANENT",
+            state: "In Progress",
+            error: "contract invalid",
+            failure_class: :permanent_contract,
+            terminal_state: :permanent,
+            transition: :terminal,
+            attempt: 1,
+            blocked_at: DateTime.utc_now()
+          }
+        ],
+        held: [
+          %{
+            issue_id: "issue-held",
+            identifier: "MT-R2-HELD",
+            issue_url: "https://example.org/issues/MT-R2-HELD",
+            state: "In Progress",
+            error: "approval required",
+            failure_class: :approval_required,
+            terminal_state: :held,
+            transition: :terminal,
+            attempt: 1,
+            blocked_at: DateTime.utc_now()
+          }
+        ],
+        permanent: [
+          %{
+            issue_id: "issue-permanent",
+            identifier: "MT-R2-PERMANENT",
+            issue_url: "https://example.org/issues/MT-R2-PERMANENT",
+            state: "In Progress",
+            error: "contract invalid",
+            failure_class: :permanent_contract,
+            terminal_state: :permanent,
+            transition: :terminal,
+            attempt: 1,
+            blocked_at: DateTime.utc_now()
+          }
+        ]
+      })
+
+    orchestrator_name = Module.concat(__MODULE__, :TypedTerminalPresenterOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{}
+      )
+
+    state_payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 50)
+
+    assert state_payload.counts.held == 1
+    assert state_payload.counts.permanent == 1
+    assert [%{status: "held", failure_class: "approval_required"}] = state_payload.held
+
+    assert [%{status: "permanent", failure_class: "permanent_contract"}] =
+             state_payload.permanent
+
+    assert {:ok, %{status: "held", failure_class: "approval_required"}} =
+             SymphonyElixirWeb.Presenter.issue_payload("MT-R2-HELD", orchestrator_name, 50)
+
+    assert {:ok, %{status: "permanent", failure_class: "permanent_contract"}} =
+             SymphonyElixirWeb.Presenter.issue_payload(
+               "MT-R2-PERMANENT",
+               orchestrator_name,
+               50
+             )
+  end
+
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
     unavailable_orchestrator = Module.concat(__MODULE__, :UnavailableOrchestrator)
     start_test_endpoint(orchestrator: unavailable_orchestrator, snapshot_timeout_ms: 5)

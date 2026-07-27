@@ -1063,7 +1063,7 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
-  test "abnormal worker exit increments retry attempt progressively" do
+  test "typed transient worker exit increments the execution attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
@@ -1093,17 +1093,27 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
+    send(
+      pid,
+      {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
+    )
+
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 3,
+             due_at_ms: due_at_ms,
+             identifier: "MT-559",
+             error: "agent exited with transient_transport",
+             failure_class: :transient_transport
+           } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 19_500, 20_500)
   end
 
-  test "first abnormal worker exit waits before retrying" do
+  test "first typed transient worker exit schedules execution attempt two" do
     issue_id = "issue-crash-initial"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
@@ -1132,11 +1142,21 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
+    send(
+      pid,
+      {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
+    )
+
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 2,
+             due_at_ms: due_at_ms,
+             identifier: "MT-560",
+             error: "agent exited with transient_transport",
+             failure_class: :transient_transport
+           } =
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
@@ -1731,9 +1751,10 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      assert {:shutdown, {:classified_failure, :unknown_fail_closed, reason}} =
+               catch_exit(AgentRunner.run(issue, nil, worker_host: "worker-a"))
+
+      assert reason =~ "workspace_prepare_failed"
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"
@@ -2324,5 +2345,569 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "failure classification is typed and unknown outcomes fail closed" do
+    alias SymphonyElixir.FailureSemantics
+
+    assert FailureSemantics.classify({:rate_limit, %{retry_after_ms: 1_000}}).class ==
+             :transient_capacity
+
+    assert FailureSemantics.classify({:workspace_hook_timeout, "before_run", 60_000}).class ==
+             :transient_transport
+
+    assert FailureSemantics.classify({:workspace_hook_failed, "before_run", 20}).class ==
+             :permanent_admission
+
+    assert FailureSemantics.classify({:approval_required, %{request_id: "approval-1"}}).class ==
+             :approval_required
+
+    assert FailureSemantics.classify({:authority_denied, :policy}).class == :authority_denied
+    assert FailureSemantics.classify({:unexpected_shape, %{free_text: "rate limit"}}).class == :unknown_fail_closed
+
+    refute FailureSemantics.classify({:unexpected_shape, %{free_text: "rate limit"}}).retryable
+  end
+
+  test "failure classification exhaustively maps reviewed structural inputs" do
+    alias SymphonyElixir.FailureSemantics
+
+    classifications = [
+      {{:shutdown, {:classified_failure, :transient_transport, :closed}}, :transient_transport},
+      {{:classified_failure, :transient_capacity, :busy}, :transient_capacity},
+      {{:classified_failure, :not_reviewed, :invalid}, :unknown_fail_closed},
+      {{:rate_limit, %{retry_after_ms: 10}}, :transient_capacity},
+      {{:capacity_exhausted, :worker_pool}, :transient_capacity},
+      {:rate_limit, :transient_capacity},
+      {:capacity_exhausted, :transient_capacity},
+      {{:workspace_hook_timeout, "before_run", 1_000}, :transient_transport},
+      {{:response_timeout, :codex}, :transient_transport},
+      {{:port_exit, 75}, :transient_transport},
+      {:epipe, :transient_transport},
+      {:port_exit, :transient_transport},
+      {:response_timeout, :transient_transport},
+      {:timeout, :transient_transport},
+      {{:workspace_hook_failed, "before_run", 20}, :permanent_admission},
+      {{:workspace_hook_failed, "before_run", 21}, :permanent_contract},
+      {{:workspace_hook_failed, "before_run", 22}, :approval_required},
+      {{:workspace_hook_failed, "before_run", 23}, :authority_denied},
+      {{:workspace_hook_failed, "before_run", 24}, :operator_decision_required},
+      {{:workspace_hook_failed, "before_run", 70}, :transient_capacity},
+      {{:workspace_hook_failed, "before_run", 71}, :transient_transport},
+      {{:workspace_hook_failed, "before_run", 999}, :unknown_fail_closed},
+      {{:approval_required, :tool}, :approval_required},
+      {:approval_required, :approval_required},
+      {{:authority_denied, :policy}, :authority_denied},
+      {:authority_denied, :authority_denied},
+      {{:operator_decision_required, :ambiguous}, :operator_decision_required},
+      {:operator_decision_required, :operator_decision_required},
+      {{:permanent_admission, :policy}, :permanent_admission},
+      {{:permanent_contract, :schema}, :permanent_contract},
+      {{:unclassified, :shape}, :unknown_fail_closed}
+    ]
+
+    for {reason, expected_class} <- classifications do
+      classification = FailureSemantics.classify(reason)
+      assert classification.class == expected_class
+      assert classification.retryable == expected_class in [:transient_capacity, :transient_transport]
+    end
+
+    assert FailureSemantics.classes() == [
+             :transient_capacity,
+             :transient_transport,
+             :permanent_admission,
+             :permanent_contract,
+             :approval_required,
+             :authority_denied,
+             :operator_decision_required,
+             :unknown_fail_closed
+           ]
+
+    assert FailureSemantics.valid_class?(:permanent_contract)
+    refute FailureSemantics.valid_class?(:not_reviewed)
+    assert FailureSemantics.disposition(:transient_capacity) == :retry
+    assert FailureSemantics.disposition(:approval_required) == :held
+    assert FailureSemantics.disposition(:permanent_contract) == :permanent
+
+    assert {:shutdown, {:classified_failure, :unknown_fail_closed, bounded_reason}} =
+             FailureSemantics.exit_reason({:unexpected, String.duplicate("x", 4_000)})
+
+    assert byte_size(bounded_reason) <= 2_000
+  end
+
+  test "permanent, approval, and authority failures execute once and enter terminal state" do
+    issue = %Issue{
+      id: "issue-terminal-failure",
+      identifier: "MT-R2-PERM",
+      title: "Permanent failure",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-PERM"
+    }
+
+    base_state = %Orchestrator.State{max_retry_attempts: 3}
+
+    for {failure_class, terminal_state} <- [
+          {:permanent_admission, :permanent},
+          {:permanent_contract, :permanent},
+          {:approval_required, :held},
+          {:authority_denied, :held},
+          {:operator_decision_required, :held},
+          {:unknown_fail_closed, :permanent}
+        ] do
+      state =
+        Orchestrator.transition_failure_for_test(
+          base_state,
+          issue,
+          failure_class,
+          1,
+          "typed test failure"
+        )
+
+      assert state.retry_attempts == %{}
+      assert state.blocked[issue.id].attempt == 1
+      assert state.blocked[issue.id].failure_class == failure_class
+      assert state.blocked[issue.id].terminal_state == terminal_state
+      assert state.blocked[issue.id].transition == :terminal
+    end
+  end
+
+  test "transient failures cannot schedule an attempt beyond the configured ceiling" do
+    issue = %Issue{
+      id: "issue-transient-failure",
+      identifier: "MT-R2-TRANSIENT",
+      title: "Transient failure",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-TRANSIENT"
+    }
+
+    state = %Orchestrator.State{max_retry_attempts: 3}
+
+    state =
+      Orchestrator.transition_failure_for_test(
+        state,
+        issue,
+        :transient_transport,
+        1,
+        "transport unavailable"
+      )
+
+    assert state.retry_attempts[issue.id].attempt == 2
+    assert state.retry_attempts[issue.id].failure_class == :transient_transport
+    assert state.retry_attempts[issue.id].transition == :retrying
+
+    exhausted =
+      Orchestrator.transition_failure_for_test(
+        %{state | retry_attempts: %{}},
+        issue,
+        :transient_transport,
+        3,
+        "transport unavailable"
+      )
+
+    assert exhausted.retry_attempts == %{}
+    assert exhausted.blocked[issue.id].terminal_state == :held
+    assert exhausted.blocked[issue.id].attempt == 3
+    assert exhausted.blocked[issue.id].retry_exhausted
+  end
+
+  test "failed retry revalidation remains represented and obeys the retry ceiling" do
+    issue = %Issue{
+      id: "issue-revalidation-failure",
+      identifier: "MT-R2-REVALIDATE",
+      title: "Retry revalidation failure",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-REVALIDATE"
+    }
+
+    metadata = %{
+      identifier: issue.identifier,
+      issue_url: issue.url,
+      issue: issue,
+      failure_class: :transient_transport,
+      delay_type: :backoff
+    }
+
+    state = %Orchestrator.State{
+      max_retry_attempts: 3,
+      claimed: MapSet.new([issue.id])
+    }
+
+    retrying =
+      Orchestrator.recover_dispatch_revalidation_for_test(
+        {:error, :transport_unavailable},
+        state,
+        issue,
+        1,
+        metadata
+      )
+
+    assert retrying.retry_attempts[issue.id].attempt == 2
+    assert retrying.retry_attempts[issue.id].failure_class == :transient_transport
+    assert MapSet.member?(retrying.claimed, issue.id)
+    Process.cancel_timer(retrying.retry_attempts[issue.id].timer_ref)
+
+    exhausted =
+      Orchestrator.recover_dispatch_revalidation_for_test(
+        {:error, :transport_unavailable},
+        %{state | max_retry_attempts: 1},
+        issue,
+        1,
+        metadata
+      )
+
+    assert exhausted.retry_attempts == %{}
+    assert exhausted.blocked[issue.id].terminal_state == :held
+    assert exhausted.blocked[issue.id].retry_exhausted
+
+    released =
+      Orchestrator.recover_dispatch_revalidation_for_test(
+        :missing,
+        state,
+        issue,
+        1,
+        metadata
+      )
+
+    refute MapSet.member?(released.claimed, issue.id)
+  end
+
+  test "durable failure state survives restart and a prepared effect cannot execute twice" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-idempotent",
+      identifier: "MT-R2-IDEMPOTENT",
+      title: "Idempotent effect",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-IDEMPOTENT"
+    }
+
+    File.mkdir_p!(root)
+
+    on_exit(fn ->
+      File.rm_rf(root)
+    end)
+
+    terminal = %{
+      issue.id => %{
+        issue: issue,
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "permanent admission failure",
+        failure_class: :permanent_admission,
+        terminal_state: :permanent,
+        transition: :terminal,
+        attempt: 1,
+        blocked_at: DateTime.utc_now()
+      }
+    }
+
+    due_at = DateTime.add(DateTime.utc_now(), 60, :second)
+
+    retrying = %{
+      issue.id => %{
+        identifier: issue.identifier,
+        attempt: 2,
+        failure_class: :transient_transport,
+        delay_type: :backoff,
+        transition: :retrying,
+        due_at: due_at
+      },
+      "issue-restart-transient" => %{
+        identifier: "MT-R2-RESTART-TRANSIENT",
+        attempt: 2,
+        failure_class: :transient_transport,
+        delay_type: :backoff,
+        transition: :retrying,
+        due_at: due_at
+      },
+      "issue-restart-continuation" => %{
+        identifier: "MT-R2-RESTART-CONTINUATION",
+        attempt: 1,
+        failure_class: nil,
+        delay_type: :continuation,
+        transition: :retrying,
+        due_at: due_at
+      }
+    }
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert prepared.status == :prepared
+    assert :ok = ExecutionLedger.persist(root, terminal, retrying, effects)
+
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert restored.blocked[issue.id].failure_class == :permanent_admission
+    assert restored.blocked[issue.id].terminal_state == :permanent
+    assert restored.retrying["issue-restart-transient"].attempt == 2
+    assert restored.retrying["issue-restart-transient"].failure_class == :transient_transport
+    assert restored.retrying["issue-restart-transient"].delay_type == :backoff
+    assert restored.retrying["issue-restart-continuation"].failure_class == nil
+    assert restored.retrying["issue-restart-continuation"].delay_type == :continuation
+
+    assert {:duplicate, duplicate} =
+             ExecutionLedger.reserve_effect(restored.effects, issue, 1)
+
+    assert duplicate.idempotency_key == prepared.idempotency_key
+
+    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+    assert recovered.blocked[issue.id].terminal_state == :held
+    refute Map.has_key?(recovered.retrying, issue.id)
+    assert Map.has_key?(recovered.retrying, "issue-restart-transient")
+    assert Map.has_key?(recovered.retrying, "issue-restart-continuation")
+  end
+
+  test "execution ledger falls back only when current is absent and rejects ambiguous input" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-generations-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-generation-safety",
+      identifier: "MT-R2-GENERATION",
+      title: "Generation safety",
+      state: "In Progress"
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+    assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, started_effects)
+
+    assert {:ok, completed_effects} =
+             ExecutionLedger.mark_effect_completed(started_effects, prepared.idempotency_key)
+
+    terminal = %{
+      issue.id => %{
+        issue: issue,
+        identifier: issue.identifier,
+        failure_class: :permanent_contract,
+        terminal_state: :permanent,
+        transition: :terminal,
+        attempt: 1,
+        blocked_at: DateTime.utc_now()
+      }
+    }
+
+    assert :ok = ExecutionLedger.persist(root, terminal, %{}, completed_effects)
+
+    state_root = Path.join(root, ".symphony-state")
+    current = Path.join(state_root, "execution.json")
+    previous = Path.join(state_root, "execution.previous.json")
+
+    File.write!(current, "{")
+    assert {:error, {:invalid_execution_ledger, _reason}} = ExecutionLedger.load(root)
+
+    File.rm!(current)
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert restored.effects[prepared.idempotency_key].status == :started
+
+    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+    assert recovered.blocked[issue.id].terminal_state == :held
+    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+
+    payload = previous |> File.read!() |> Jason.decode!()
+    [effect] = payload["effects"]
+    duplicate_payload = Map.put(payload, "effects", [effect, effect])
+    File.write!(current, Jason.encode!(duplicate_payload))
+
+    assert {:error, {:invalid_execution_ledger, {:duplicate_execution_entry, duplicate_idempotency_key}}} =
+             ExecutionLedger.load(root)
+
+    assert duplicate_idempotency_key == prepared.idempotency_key
+
+    invalid_legacy_payload = %{
+      "schema_version" => "symphony.execution_ledger.v1",
+      "blocked" => [
+        %{
+          "issue_id" => issue.id,
+          "attempt" => "not-an-integer",
+          "blocked_at" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+      ]
+    }
+
+    File.write!(current, Jason.encode!(invalid_legacy_payload))
+
+    assert {:error, {:invalid_execution_ledger, :invalid_legacy_attempt}} =
+             ExecutionLedger.load(root)
+  end
+
+  test "an ambiguous dispatch effect remains held and cannot receive a new sequence" do
+    alias SymphonyElixir.ExecutionLedger
+
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
+
+    issue = %Issue{
+      id: "issue-ambiguous-effect",
+      identifier: "MT-R2-AMBIGUOUS",
+      title: "Ambiguous dispatch effect",
+      state: "In Progress",
+      labels: ["symphony"],
+      assigned_to_worker: true
+    }
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+
+    hidden_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      effects: effects,
+      claimed: MapSet.new(),
+      blocked: %{},
+      running: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, hidden_state)
+
+    blocked_state = %{
+      hidden_state
+      | claimed: MapSet.new([issue.id]),
+        blocked: %{
+          issue.id => %{
+            issue: issue,
+            identifier: issue.identifier,
+            failure_class: :operator_decision_required,
+            terminal_state: :held,
+            idempotency_key: prepared.idempotency_key,
+            blocked_at: DateTime.utc_now()
+          }
+        }
+    }
+
+    opted_out_issue = %{issue | labels: []}
+
+    reconciled =
+      Orchestrator.reconcile_blocked_issue_states_for_test([opted_out_issue], blocked_state)
+
+    assert MapSet.member?(reconciled.claimed, issue.id)
+    assert reconciled.blocked[issue.id].idempotency_key == prepared.idempotency_key
+
+    agent_pid = spawn(fn -> Process.sleep(:infinity) end)
+    agent_ref = Process.monitor(agent_pid)
+
+    running_state = %{
+      hidden_state
+      | claimed: MapSet.new([issue.id]),
+        running: %{
+          issue.id => %{
+            pid: agent_pid,
+            ref: agent_ref,
+            issue: issue,
+            identifier: issue.identifier,
+            retry_attempt: 1,
+            idempotency_key: prepared.idempotency_key,
+            started_at: DateTime.utc_now()
+          }
+        }
+    }
+
+    stopped = Orchestrator.reconcile_issue_states_for_test([opted_out_issue], running_state)
+
+    refute Process.alive?(agent_pid)
+    assert stopped.blocked[issue.id].failure_class == :operator_decision_required
+    assert stopped.blocked[issue.id].terminal_state == :held
+    assert MapSet.member?(stopped.claimed, issue.id)
+  end
+
+  test "execution ledger refuses a state-directory symlink escape" do
+    if match?({:win32, _name}, :os.type()) do
+      :ok
+    else
+      alias SymphonyElixir.ExecutionLedger
+
+      root =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-r2-execution-ledger-root-#{System.unique_integer([:positive])}"
+        )
+
+      outside =
+        Path.join(
+          System.tmp_dir!(),
+          "symphony-r2-execution-ledger-outside-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(root)
+      File.mkdir_p!(outside)
+      File.ln_s!(outside, Path.join(root, ".symphony-state"))
+
+      on_exit(fn ->
+        File.rm_rf(root)
+        File.rm_rf(outside)
+      end)
+
+      assert {:error, {:execution_ledger_outside_workspace, _path}} =
+               ExecutionLedger.load(root)
+    end
+  end
+
+  test "crash before a dispatch receipt preserves the idempotency reservation" do
+    alias SymphonyElixir.ExecutionLedger
+
+    issue = %Issue{
+      id: "issue-crash-before-receipt",
+      identifier: "MT-R2-CRASH-RECEIPT",
+      title: "Preserve ambiguous dispatch",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-CRASH-RECEIPT"
+    }
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
+
+    orchestrator_name = Module.concat(__MODULE__, :CrashBeforeReceiptOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      retry_attempt: 1,
+      idempotency_key: prepared.idempotency_key,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{issue.id => running_entry},
+          claimed: MapSet.put(state.claimed, issue.id),
+          effects: started_effects
+      }
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :untyped_crash})
+    assert is_map(Orchestrator.snapshot(orchestrator_name, 5_000))
+
+    state = :sys.get_state(pid)
+    assert state.effects[prepared.idempotency_key].status == :started
+    refute Map.has_key?(state.retry_attempts, issue.id)
+    assert state.blocked[issue.id].failure_class == :unknown_fail_closed
+    assert state.blocked[issue.id].terminal_state == :permanent
+
+    assert {:duplicate, duplicate} =
+             ExecutionLedger.reserve_effect(state.effects, issue, prepared.attempt)
+
+    assert duplicate.idempotency_key == prepared.idempotency_key
   end
 end

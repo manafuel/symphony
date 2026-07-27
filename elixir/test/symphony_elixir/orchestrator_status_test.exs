@@ -754,6 +754,102 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert due_in_ms > 0
   end
 
+  test "orchestrator snapshot exposes typed running, retrying, held, and permanent states" do
+    now = DateTime.utc_now()
+
+    held = %{
+      issue: %Issue{
+        id: "issue-held",
+        identifier: "MT-R2-HELD",
+        title: "Held",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-R2-HELD"
+      },
+      identifier: "MT-R2-HELD",
+      error: "approval required",
+      failure_class: :approval_required,
+      terminal_state: :held,
+      transition: :terminal,
+      attempt: 1,
+      blocked_at: now
+    }
+
+    permanent = %{
+      issue: %Issue{
+        id: "issue-permanent",
+        identifier: "MT-R2-PERMANENT",
+        title: "Permanent",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-R2-PERMANENT"
+      },
+      identifier: "MT-R2-PERMANENT",
+      error: "contract invalid",
+      failure_class: :permanent_contract,
+      terminal_state: :permanent,
+      transition: :terminal,
+      attempt: 1,
+      blocked_at: now
+    }
+
+    state = %Orchestrator.State{
+      blocked: %{
+        held.issue.id => held,
+        permanent.issue.id => permanent
+      },
+      retry_attempts: %{
+        "issue-retrying" => %{
+          attempt: 2,
+          identifier: "MT-R2-RETRYING",
+          failure_class: :transient_transport,
+          transition: :retrying,
+          due_at_ms: System.monotonic_time(:millisecond) + 1_000
+        }
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    {:reply, snapshot, _state} =
+      Orchestrator.handle_call(:snapshot, {self(), make_ref()}, state)
+
+    assert [%{identifier: "MT-R2-HELD", failure_class: :approval_required}] = snapshot.held
+
+    assert [%{identifier: "MT-R2-PERMANENT", failure_class: :permanent_contract}] =
+             snapshot.permanent
+
+    assert [%{identifier: "MT-R2-RETRYING", transition: :retrying}] = snapshot.retrying
+  end
+
+  test "token telemetry cannot change a typed terminal transition" do
+    issue_id = "issue-token-invariant"
+
+    state = %Orchestrator.State{
+      blocked: %{
+        issue_id => %{
+          identifier: "MT-R2-TOKEN",
+          failure_class: :authority_denied,
+          terminal_state: :held,
+          transition: :terminal,
+          attempt: 1
+        }
+      },
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert {:noreply, unchanged} =
+             Orchestrator.handle_info(
+               {:codex_worker_update, issue_id,
+                %{
+                  event: :token_count,
+                  timestamp: DateTime.utc_now(),
+                  token_usage: %{input_tokens: 99, output_tokens: 1, total_tokens: 100}
+                }},
+               state
+             )
+
+    assert unchanged.blocked == state.blocked
+    assert unchanged.retry_attempts == state.retry_attempts
+  end
+
   test "orchestrator snapshot includes poll countdown and checking status" do
     orchestrator_name = Module.concat(__MODULE__, :PollingSnapshotOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -906,6 +1002,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       codex_stall_timeout_ms: 1_000
     )
 
+    WorkflowStore.force_reload()
+    assert Config.settings!().codex.stall_timeout_ms == 1_000
     issue_id = "issue-stall"
     orchestrator_name = Module.concat(__MODULE__, :StallOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -923,8 +1021,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         end
       end)
 
+    worker_monitor = Process.monitor(worker_pid)
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
+    refute Map.has_key?(initial_state.blocked, issue_id)
 
     running_entry = %{
       pid: worker_pid,
@@ -949,25 +1049,28 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    send(pid, :tick)
-    Process.sleep(100)
+    tick_started_ms = System.monotonic_time(:millisecond)
+    send(pid, :run_poll_cycle)
+    assert is_map(Orchestrator.snapshot(orchestrator_name, 5_000))
     state = :sys.get_state(pid)
 
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker_pid, _reason}, 5_000
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
 
     assert %{
-             attempt: 1,
+             attempt: 2,
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              issue_url: "https://example.org/issues/MT-STALL",
-             error: "stalled for " <> _
+             error: "worker stalled without codex activity",
+             failure_class: :transient_transport
            } = state.retry_attempts[issue_id]
 
     assert is_integer(due_at_ms)
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
-    assert remaining_ms <= 10_500
+    scheduled_delay_ms = due_at_ms - tick_started_ms
+    assert scheduled_delay_ms >= 9_500
+    assert scheduled_delay_ms <= 10_500
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
@@ -976,6 +1079,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       codex_stall_timeout_ms: 1_000
     )
 
+    WorkflowStore.force_reload()
+    assert Config.settings!().codex.stall_timeout_ms == 1_000
     issue_id = "issue-mcp-elicitation-stall"
     orchestrator_name = Module.concat(__MODULE__, :McpElicitationBlockOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -993,8 +1098,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         end
       end)
 
+    worker_monitor = Process.monitor(worker_pid)
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
+    refute Map.has_key?(initial_state.blocked, issue_id)
 
     running_entry = %{
       pid: worker_pid,
@@ -1025,11 +1132,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    send(pid, :tick)
-    Process.sleep(100)
+    send(pid, :run_poll_cycle)
+    assert is_map(Orchestrator.snapshot(orchestrator_name, 5_000))
     state = :sys.get_state(pid)
 
-    refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
     refute Map.has_key?(state.retry_attempts, issue_id)
     assert MapSet.member?(state.claimed, issue_id)
@@ -1040,6 +1146,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              worker_host: "dm-dev2",
              workspace_path: "/workspaces/MT-MCP"
            } = state.blocked[issue_id]
+
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker_pid, _reason}, 5_000
+    refute Process.alive?(worker_pid)
 
     assert %{
              blocked: [
@@ -1180,6 +1289,25 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert rendered =~ "https://linear.app/project/project/issues"
     refute rendered =~ "Dashboard:"
+  end
+
+  test "status dashboard renders held and permanent terminal counts" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         held: [%{identifier: "MT-R2-HELD"}],
+         permanent: [%{identifier: "MT-R2-PERMANENT"}],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
+
+    assert rendered =~ "Terminal states:"
+    assert rendered =~ "held 1"
+    assert rendered =~ "permanent 1"
   end
 
   test "status dashboard renders dashboard url on its own line when server port is configured" do

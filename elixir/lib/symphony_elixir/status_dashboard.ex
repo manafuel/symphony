@@ -315,6 +315,8 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             held: Map.get(snapshot, :held, []),
+             permanent: Map.get(snapshot, :permanent, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -336,6 +338,10 @@ defmodule SymphonyElixir.StatusDashboard do
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
+
+        terminal_state_lines =
+          format_terminal_state_lines(Map.get(snapshot, :held, []), Map.get(snapshot, :permanent, []))
+
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
@@ -365,6 +371,7 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
+           terminal_state_lines,
            colorize("├─ Running", @ansi_bold),
            "│",
            running_table_header_row(running_event_width),
@@ -425,6 +432,17 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_project_refresh_line(_) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
+  end
+
+  defp format_terminal_state_lines([], []), do: []
+
+  defp format_terminal_state_lines(held, permanent) do
+    [
+      colorize("│ Terminal states: ", @ansi_bold) <>
+        colorize("held #{length(held)}", @ansi_yellow) <>
+        colorize(" | ", @ansi_gray) <>
+        colorize("permanent #{length(permanent)}", @ansi_red)
+    ]
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
@@ -560,6 +578,8 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             held: Map.get(snapshot, :held, []),
+             permanent: Map.get(snapshot, :permanent, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
