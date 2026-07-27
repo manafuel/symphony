@@ -108,8 +108,7 @@ defmodule SymphonyElixir.PromptBuilder do
     omitted_headings =
       sections
       |> Map.keys()
-      |> Enum.reject(&MapSet.member?(selected_headings, &1))
-      |> Enum.reject(&(&1 == "__preamble__"))
+      |> Enum.reject(&(MapSet.member?(selected_headings, &1) or &1 == "__preamble__"))
       |> Enum.sort()
 
     compacted =
@@ -184,7 +183,7 @@ defmodule SymphonyElixir.PromptBuilder do
   defp omitted_sections_note(headings) do
     [
       "Compacted prompt omitted these full-policy sections from the first turn:",
-      headings |> Enum.map(&("- " <> &1)) |> Enum.join("\n"),
+      Enum.map_join(headings, "\n", &("- " <> &1)),
       "If the current ticket touches one of those surfaces, inspect that section from `#{@manafuel_full_workflow_path}` before making scoped changes."
     ]
     |> Enum.join("\n")
