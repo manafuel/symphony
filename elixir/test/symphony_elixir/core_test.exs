@@ -3001,7 +3001,7 @@ defmodule SymphonyElixir.CoreTest do
         issue,
         1,
         nil
-    )
+      )
 
     assert blocked.running == %{}
     assert [prepared_effect] = Map.values(blocked.effects)
