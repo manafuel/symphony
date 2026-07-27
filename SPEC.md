@@ -397,6 +397,27 @@ Fields:
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
   - Failure aborts the current attempt.
+- `before_terminal` (multiline shell script string, OPTIONAL)
+  - Runs after a refreshed tracker snapshot enters a configured terminal state and before Symphony
+    removes the issue workspace or releases its claim.
+  - Failure blocks terminal acceptance and preserves the claim and workspace for recovery.
+  - A terminal-acceptance block MUST be retried at a bounded rate after future authoritative
+    terminal snapshots. Implementations MUST run at most one retry per reconciliation refresh,
+    bound every attempt by `hooks.timeout_ms`, and cap retry backoff.
+  - An issue omitted from an otherwise successful batch refresh is not an authoritative terminal
+    snapshot. Implementations MUST preserve terminal-acceptance claims and workspaces across empty
+    or partial refreshes.
+  - An authoritative active-state snapshot MUST release a terminal-acceptance block without
+    deleting the workspace so normal remediation can be redispatched.
+  - Hook output MUST NOT be retained in orchestrator state, logs, status snapshots, or observability
+    responses. Failure records MUST contain only a bounded error code and non-secret metadata.
+  - Remote implementations MUST determine workspace absence independently of hook output. A hook
+    MUST NOT be able to spoof a missing workspace by printing a control marker.
+  - Implementations MUST also apply this gate to terminal cleanup discovered by reconciliation,
+    retry lookup, or startup cleanup. A failed startup cleanup MUST reconstruct a claimed,
+    terminal-acceptance-blocked entry so the next authoritative refresh can recover safely.
+  - Retry lookup MUST refresh the claimed issue by ID without an active-state filter before
+    deciding that it is missing or releasable.
 - `after_run` (multiline shell script string, OPTIONAL)
   - Runs after each agent attempt (success, failure, timeout, or cancellation) once the workspace
     exists.
@@ -409,6 +430,19 @@ Fields:
   - Applies to all workspace hooks.
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
+
+Hooks that receive an issue snapshot expose these environment variables:
+
+- `SYMPHONY_ISSUE_ID`
+- `SYMPHONY_ISSUE_IDENTIFIER`
+- `SYMPHONY_ISSUE_TITLE`
+- `SYMPHONY_ISSUE_DESCRIPTION`
+- `SYMPHONY_ISSUE_LABELS` (comma-separated label names)
+- `SYMPHONY_ISSUE_STATE`
+- `SYMPHONY_ISSUE_UPDATED_AT` (ISO 8601 with the tracker snapshot's precision)
+
+The `before_terminal` values MUST come from the terminal snapshot being accepted, not the
+pre-run snapshot.
 
 #### 5.3.5 `agent` (object)
 
@@ -586,6 +620,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
+- `hooks.before_terminal`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
@@ -616,7 +651,8 @@ claim state.
 
 2. `Claimed`
    - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - In practice, claimed issues are `Running`, `RetryQueued`, or
+     `TerminalAcceptanceBlocked`.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
@@ -624,7 +660,11 @@ claim state.
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
 
-5. `Released`
+5. `TerminalAcceptanceBlocked`
+   - Worker is stopped, but `hooks.before_terminal` has not accepted the authoritative terminal
+     snapshot. The claim and workspace remain reserved while bounded reconciliation retries run.
+
+6. `Released`
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
@@ -698,6 +738,10 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
 - Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Failed startup terminal cleanup reconstructs `TerminalAcceptanceBlocked` state in memory.
+- Empty or partial tracker batches never release a terminal-acceptance block.
+- An authoritative terminal snapshot releases the block only after the hook passes. An
+  authoritative active-state snapshot releases the block without cleanup so remediation can resume.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
@@ -877,6 +921,7 @@ Supported hooks:
 
 - `hooks.after_create`
 - `hooks.before_run`
+- `hooks.before_terminal`
 - `hooks.after_run`
 - `hooks.before_remove`
 
@@ -893,6 +938,8 @@ Failure semantics:
 
 - `after_create` failure or timeout is fatal to workspace creation.
 - `before_run` failure or timeout is fatal to the current run attempt.
+- `before_terminal` failure or timeout blocks terminal acceptance; the claim and workspace remain
+  available for recovery and MUST NOT be removed by a concurrent or startup cleanup path.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
 
@@ -1980,6 +2027,9 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - OPTIONAL workspace population/synchronization errors are surfaced
 - `after_create` hook runs only on new workspace creation
 - `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
+- `before_terminal` hook receives the refreshed terminal issue snapshot; success permits workspace
+  cleanup and claim release, while failure preserves both across reconciliation, retry lookup, and
+  startup cleanup paths
 - `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
 - `before_remove` hook runs on cleanup and failures/timeouts are ignored
 - Workspace path sanitization and root containment invariants are enforced before agent launch
@@ -2095,7 +2145,7 @@ Use the same validation profiles as Section 17:
 - Polling orchestrator with single-authority mutable state
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
-- Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
+- Workspace lifecycle hooks (`after_create`, `before_run`, `before_terminal`, `after_run`, `before_remove`)
 - Hook timeout config (`hooks.timeout_ms`, default `60000`)
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)

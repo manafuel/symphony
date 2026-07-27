@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
+    send_event({:memory_tracker_fetch_by_ids, issue_ids})
     wanted_ids = MapSet.new(issue_ids)
 
     {:ok,
