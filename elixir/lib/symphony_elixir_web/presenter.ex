@@ -11,7 +11,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           source_sha: runtime_source_sha(),
           max_concurrent_agents: Config.settings!().agent.max_concurrent_agents,
@@ -26,6 +26,11 @@ defmodule SymphonyElixirWeb.Presenter do
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
+
+        held = Enum.map(Map.get(snapshot, :held, []), &terminal_entry_payload/1)
+        permanent = Enum.map(Map.get(snapshot, :permanent, []), &terminal_entry_payload/1)
+
+        maybe_put_terminal_collections(payload, held, permanent)
 
       :timeout ->
         %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
@@ -78,17 +83,32 @@ defmodule SymphonyElixirWeb.Presenter do
         restart_count: restart_count(retry),
         current_retry_attempt: retry_attempt(retry)
       },
-      running: running && running_issue_payload(running),
-      retry: retry && retry_issue_payload(retry),
-      blocked: blocked && blocked_issue_payload(blocked),
+      running: optional_payload(running, &running_issue_payload/1),
+      retry: optional_payload(retry, &retry_issue_payload/1),
+      blocked: optional_payload(blocked, &blocked_issue_payload/1),
       logs: %{
         codex_session_logs: []
       },
-      recent_events: recent_events_payload(running || blocked),
-      last_error: (blocked && blocked.error) || (retry && retry.error),
+      recent_events: recent_events_payload(recent_event_entry(running, blocked)),
+      last_error: last_error(blocked, retry),
       tracked: %{}
     }
+    |> maybe_put(:failure_class, encode_atom(entry_attribute(blocked, :failure_class)))
+    |> maybe_put(:terminal_state, encode_atom(entry_attribute(blocked, :terminal_state)))
   end
+
+  defp optional_payload(nil, _builder), do: nil
+  defp optional_payload(entry, builder), do: builder.(entry)
+
+  defp recent_event_entry(running, _blocked) when not is_nil(running), do: running
+  defp recent_event_entry(nil, blocked), do: blocked
+
+  defp last_error(%{error: error}, _retry), do: error
+  defp last_error(nil, %{error: error}), do: error
+  defp last_error(_blocked, _retry), do: nil
+
+  defp entry_attribute(nil, _key), do: nil
+  defp entry_attribute(entry, key), do: Map.get(entry, key)
 
   defp issue_id_from_entries(running, retry, blocked),
     do: (running && running.issue_id) || (retry && retry.issue_id) || (blocked && blocked.issue_id)
@@ -99,6 +119,8 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp issue_status(running, _retry, _blocked) when not is_nil(running), do: "running"
   defp issue_status(nil, retry, _blocked) when not is_nil(retry), do: "retrying"
+  defp issue_status(nil, nil, %{terminal_state: :held}), do: "held"
+  defp issue_status(nil, nil, %{terminal_state: :permanent}), do: "permanent"
   defp issue_status(nil, nil, _blocked), do: "blocked"
 
   defp running_entry_payload(entry) do
@@ -117,6 +139,9 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: token_payload(entry)
     }
+    |> maybe_put(:transition, encode_atom(Map.get(entry, :transition)))
+    |> maybe_put(:attempt, Map.get(entry, :attempt))
+    |> maybe_put(:idempotency_key, Map.get(entry, :idempotency_key))
   end
 
   defp retry_entry_payload(entry) do
@@ -130,6 +155,8 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
     }
+    |> maybe_put(:failure_class, encode_atom(Map.get(entry, :failure_class)))
+    |> maybe_put(:transition, encode_atom(Map.get(entry, :transition)))
   end
 
   defp blocked_entry_payload(entry) do
@@ -137,16 +164,28 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       issue_url: Map.get(entry, :issue_url),
-      state: entry.state,
-      error: entry.error,
+      state: Map.get(entry, :state),
+      error: Map.get(entry, :error),
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
-      session_id: entry.session_id,
-      blocked_at: iso8601(entry.blocked_at),
-      last_event: entry.last_codex_event,
-      last_message: summarize_message(entry.last_codex_message),
-      last_event_at: iso8601(entry.last_codex_timestamp)
+      session_id: Map.get(entry, :session_id),
+      blocked_at: iso8601(Map.get(entry, :blocked_at)),
+      last_event: Map.get(entry, :last_codex_event),
+      last_message: summarize_message(Map.get(entry, :last_codex_message)),
+      last_event_at: iso8601(Map.get(entry, :last_codex_timestamp))
     }
+    |> maybe_put(:failure_class, encode_atom(Map.get(entry, :failure_class)))
+    |> maybe_put(:terminal_state, encode_atom(Map.get(entry, :terminal_state)))
+    |> maybe_put(:transition, encode_atom(Map.get(entry, :transition)))
+    |> maybe_put(:attempt, Map.get(entry, :attempt))
+    |> maybe_put(:retry_exhausted, Map.get(entry, :retry_exhausted))
+    |> maybe_put(:idempotency_key, Map.get(entry, :idempotency_key))
+  end
+
+  defp terminal_entry_payload(entry) do
+    entry
+    |> blocked_entry_payload()
+    |> Map.put(:status, encode_atom(Map.get(entry, :terminal_state)))
   end
 
   defp running_issue_payload(running) do
@@ -197,20 +236,28 @@ defmodule SymphonyElixirWeb.Presenter do
       worker_host: Map.get(retry, :worker_host),
       workspace_path: Map.get(retry, :workspace_path)
     }
+    |> maybe_put(:failure_class, encode_atom(Map.get(retry, :failure_class)))
+    |> maybe_put(:transition, encode_atom(Map.get(retry, :transition)))
   end
 
   defp blocked_issue_payload(blocked) do
     %{
       worker_host: Map.get(blocked, :worker_host),
       workspace_path: Map.get(blocked, :workspace_path),
-      session_id: blocked.session_id,
-      state: blocked.state,
-      error: blocked.error,
-      blocked_at: iso8601(blocked.blocked_at),
-      last_event: blocked.last_codex_event,
-      last_message: summarize_message(blocked.last_codex_message),
-      last_event_at: iso8601(blocked.last_codex_timestamp)
+      session_id: Map.get(blocked, :session_id),
+      state: Map.get(blocked, :state),
+      error: Map.get(blocked, :error),
+      blocked_at: iso8601(Map.get(blocked, :blocked_at)),
+      last_event: Map.get(blocked, :last_codex_event),
+      last_message: summarize_message(Map.get(blocked, :last_codex_message)),
+      last_event_at: iso8601(Map.get(blocked, :last_codex_timestamp))
     }
+    |> maybe_put(:failure_class, encode_atom(Map.get(blocked, :failure_class)))
+    |> maybe_put(:terminal_state, encode_atom(Map.get(blocked, :terminal_state)))
+    |> maybe_put(:transition, encode_atom(Map.get(blocked, :transition)))
+    |> maybe_put(:attempt, Map.get(blocked, :attempt))
+    |> maybe_put(:retry_exhausted, Map.get(blocked, :retry_exhausted))
+    |> maybe_put(:idempotency_key, Map.get(blocked, :idempotency_key))
   end
 
   defp workspace_path(issue_identifier, running, retry, blocked) do
@@ -231,9 +278,9 @@ defmodule SymphonyElixirWeb.Presenter do
   defp recent_events_payload(entry) do
     [
       %{
-        at: iso8601(entry.last_codex_timestamp),
-        event: entry.last_codex_event,
-        message: summarize_message(entry.last_codex_message)
+        at: iso8601(Map.get(entry, :last_codex_timestamp)),
+        event: Map.get(entry, :last_codex_event),
+        message: summarize_message(Map.get(entry, :last_codex_message))
       }
     ]
     |> Enum.reject(&is_nil(&1.at))
@@ -275,4 +322,26 @@ defmodule SymphonyElixirWeb.Presenter do
         nil
     end
   end
+
+  defp maybe_put(payload, _key, nil), do: payload
+  defp maybe_put(payload, key, value), do: Map.put(payload, key, value)
+
+  defp maybe_put_terminal_collections(payload, [], []), do: payload
+
+  defp maybe_put_terminal_collections(payload, held, permanent) do
+    counts =
+      payload.counts
+      |> Map.put(:held, length(held))
+      |> Map.put(:permanent, length(permanent))
+
+    payload
+    |> Map.put(:counts, counts)
+    |> Map.put(:held, held)
+    |> Map.put(:permanent, permanent)
+  end
+
+  defp encode_atom(nil), do: nil
+  defp encode_atom(value) when is_atom(value), do: Atom.to_string(value)
+  defp encode_atom(value) when is_binary(value), do: value
+  defp encode_atom(_value), do: nil
 end

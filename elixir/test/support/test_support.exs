@@ -33,7 +33,7 @@ defmodule SymphonyElixir.TestSupport do
 
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
-        write_workflow_file!(workflow_file)
+        write_workflow_file!(workflow_file, workspace_root: Path.join(workflow_root, "workspaces"))
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
         stop_default_http_server()
@@ -59,6 +59,9 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   def write_workflow_file!(path, overrides \\ []) do
+    overrides =
+      Keyword.put_new(overrides, :workspace_root, Path.join(Path.dirname(path), "workspaces"))
+
     workflow = workflow_content(overrides)
     File.write!(path, workflow)
 
@@ -117,6 +120,7 @@ defmodule SymphonyElixir.TestSupport do
           max_concurrent_agents: 10,
           max_turns: 20,
           max_issue_tokens: 0,
+          max_retry_attempts: 3,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
@@ -160,6 +164,7 @@ defmodule SymphonyElixir.TestSupport do
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_issue_tokens = Keyword.get(config, :max_issue_tokens)
+    max_retry_attempts = Keyword.get(config, :max_retry_attempts)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
@@ -206,6 +211,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_issue_tokens: #{yaml_value(max_issue_tokens)}",
+        "  max_retry_attempts: #{yaml_value(max_retry_attempts)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",

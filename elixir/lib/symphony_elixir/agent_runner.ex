@@ -4,7 +4,17 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.{AgentMemory, Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+
+  alias SymphonyElixir.{
+    AgentMemory,
+    Config,
+    FailureSemantics,
+    Linear.Issue,
+    PromptBuilder,
+    Tracker,
+    Workspace
+  }
+
   alias SymphonyElixir.Codex.AppServer
 
   @type worker_host :: String.t() | nil
@@ -36,8 +46,11 @@ defmodule SymphonyElixir.AgentRunner do
         :ok
 
       {:error, reason} ->
-        Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
-        raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+        classification = FailureSemantics.classify(reason)
+
+        Logger.error("Agent run failed for #{issue_context(issue)} failure_class=#{classification.class} retryable=#{classification.retryable}")
+
+        exit(FailureSemantics.exit_reason(reason))
     end
   end
 

@@ -1328,6 +1328,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().codex.command == "codex app-server"
   end
 
+  test "agent config exposes a validated retry-attempt ceiling" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_retry_attempts: 4)
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().agent.max_retry_attempts == 4
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_retry_attempts: 0)
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_retry_attempts"
+  end
+
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

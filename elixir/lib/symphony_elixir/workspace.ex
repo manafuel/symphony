@@ -515,11 +515,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp run_local_shell_command(command, workspace, issue_context) do
-    hook_env = [
-      {"SYMPHONY_WORKSPACE", workspace},
-      {"SYMPHONY_ISSUE_ID", to_string(issue_context.issue_id || "")},
-      {"SYMPHONY_ISSUE_IDENTIFIER", to_string(issue_context.issue_identifier || "issue")}
-    ]
+    hook_env = [{"SYMPHONY_WORKSPACE", workspace} | hook_environment(issue_context)]
 
     case :os.type() do
       {:win32, _} ->
