@@ -190,6 +190,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.Config.ModelRouting
+
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
@@ -209,6 +211,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:model_routing, :map)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -223,7 +226,8 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :model_routing
         ],
         empty_values: []
       )
@@ -231,6 +235,12 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_change(:model_routing, fn :model_routing, routing ->
+        case ModelRouting.validate(routing) do
+          :ok -> []
+          {:error, reason} -> [model_routing: reason]
+        end
+      end)
     end
   end
 
@@ -418,7 +428,8 @@ defmodule SymphonyElixir.Config.Schema do
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
-        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
+        turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy),
+        model_routing: normalize_optional_map(settings.codex.model_routing)
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex}
