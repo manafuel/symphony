@@ -386,12 +386,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
     mode =
       cond do
-        String.contains?(script, ~s([ "$1" = "auth" ])) and
-          not String.contains?(script, ~s([ "$1" = "pr" ])) and String.contains?(script, "exit 1") ->
+        gh_auth_failure_script?(script) ->
           "auth_fail"
 
-        String.contains?(script, ~s([ "$1" = "pr" ] && [ "$2" = "list" ])) and
-          String.contains?(script, "exit 1") and not String.contains?(script, ~s([ "$2" = "close" ])) ->
+        gh_list_failure_script?(script) ->
           "list_fail"
 
         String.contains?(script, ~s([ "$2" = "close" ])) and not String.contains?(script, "boom") ->
@@ -436,6 +434,18 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
     sys.exit(99)
     """
+  end
+
+  defp gh_auth_failure_script?(script) do
+    String.contains?(script, ~s([ "$1" = "auth" ])) and
+      not String.contains?(script, ~s([ "$1" = "pr" ])) and
+      String.contains?(script, "exit 1")
+  end
+
+  defp gh_list_failure_script?(script) do
+    String.contains?(script, ~s([ "$1" = "pr" ] && [ "$2" = "list" ])) and
+      String.contains?(script, "exit 1") and
+      not String.contains?(script, ~s([ "$2" = "close" ]))
   end
 
   defp windows? do

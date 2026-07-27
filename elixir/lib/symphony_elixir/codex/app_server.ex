@@ -276,6 +276,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
+  @spec local_port_spawn_command_for_test(String.t(), [String.t()], Path.t()) ::
+          {:ok, String.t(), [String.t()]} | {:error, term()}
   def local_port_spawn_command_for_test(executable, args, workspace) do
     local_port_spawn_command(executable, args, workspace)
   end
@@ -365,8 +367,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "C:/Program Files/Git/usr/bin/bash.exe",
       System.find_executable("bash")
     ]
-    |> Enum.reject(&is_nil/1)
-    |> Enum.reject(&windows_system_bash?/1)
+    |> Enum.reject(&(is_nil(&1) or windows_system_bash?(&1)))
     |> Enum.find(&File.exists?/1)
   end
 
@@ -639,16 +640,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         next_timeout_context = next_timeout_context(payload, timeout_context)
 
         handle_turn_method(
-          port,
-          on_message,
+          %{
+            port: port,
+            on_message: on_message,
+            timeout_ms: timeout_ms,
+            tool_executor: tool_executor,
+            auto_approve_requests: auto_approve_requests,
+            workspace: workspace,
+            timeout_context: next_timeout_context
+          },
           payload,
           payload_string,
-          method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests,
-          workspace,
-          next_timeout_context
+          method
         )
 
       {:ok, payload} ->
@@ -714,24 +717,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
-  defp handle_turn_method(
-         port,
-         on_message,
-         payload,
-         payload_string,
-         method,
-         timeout_ms,
-         tool_executor,
-         auto_approve_requests,
-         workspace,
-         timeout_context
-       ) do
-    metadata = metadata_from_message(port, payload)
+  defp handle_turn_method(context, payload, payload_string, method) do
+    metadata = metadata_from_message(context.port, payload)
 
-    case maybe_block_unsafe_command(payload, workspace) do
+    case maybe_block_unsafe_command(payload, context.workspace) do
       {:block, reason} ->
         emit_message(
-          on_message,
+          context.on_message,
           :unsafe_command_blocked,
           %{payload: payload, raw: payload_string, reason: reason},
           metadata
@@ -740,84 +732,79 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:unsafe_command_blocked, reason, payload}}
 
       :ok ->
-        case maybe_handle_approval_request(
-               port,
-               method,
-               payload,
-               payload_string,
-               on_message,
-               metadata,
-               tool_executor,
-               auto_approve_requests
-             ) do
-          :input_required ->
-            emit_message(
-              on_message,
-              :turn_input_required,
-              %{payload: payload, raw: payload_string},
-              metadata
-            )
-
-            {:error, {:turn_input_required, payload}}
-
-          :approved ->
-            receive_loop(
-              port,
-              on_message,
-              timeout_ms,
-              "",
-              tool_executor,
-              auto_approve_requests,
-              workspace,
-              timeout_context
-            )
-
-          :approval_required ->
-            emit_message(
-              on_message,
-              :approval_required,
-              %{payload: payload, raw: payload_string},
-              metadata
-            )
-
-            {:error, {:approval_required, payload}}
-
-          :unhandled ->
-            if needs_input?(method, payload) do
-              emit_message(
-                on_message,
-                :turn_input_required,
-                %{payload: payload, raw: payload_string},
-                metadata
-              )
-
-              {:error, {:turn_input_required, payload}}
-            else
-              emit_message(
-                on_message,
-                :notification,
-                %{
-                  payload: payload,
-                  raw: payload_string
-                },
-                metadata
-              )
-
-              Logger.debug("Codex notification: #{inspect(method)}")
-
-              receive_loop(
-                port,
-                on_message,
-                timeout_ms,
-                "",
-                tool_executor,
-                auto_approve_requests,
-                workspace,
-                timeout_context
-              )
-            end
-        end
+        handle_safe_turn_method(context, payload, payload_string, method, metadata)
     end
+  end
+
+  defp handle_safe_turn_method(context, payload, payload_string, method, metadata) do
+    approval =
+      maybe_handle_approval_request(
+        context.port,
+        method,
+        payload,
+        payload_string,
+        context.on_message,
+        metadata,
+        context.tool_executor,
+        context.auto_approve_requests
+      )
+
+    handle_turn_approval(approval, context, payload, payload_string, method, metadata)
+  end
+
+  defp handle_turn_approval(:input_required, context, payload, payload_string, _method, metadata) do
+    emit_message(
+      context.on_message,
+      :turn_input_required,
+      %{payload: payload, raw: payload_string},
+      metadata
+    )
+
+    {:error, {:turn_input_required, payload}}
+  end
+
+  defp handle_turn_approval(:approved, context, _payload, _payload_string, _method, _metadata) do
+    continue_receive_loop(context)
+  end
+
+  defp handle_turn_approval(:approval_required, context, payload, payload_string, _method, metadata) do
+    emit_message(
+      context.on_message,
+      :approval_required,
+      %{payload: payload, raw: payload_string},
+      metadata
+    )
+
+    {:error, {:approval_required, payload}}
+  end
+
+  defp handle_turn_approval(:unhandled, context, payload, payload_string, method, metadata) do
+    if needs_input?(method, payload) do
+      handle_turn_approval(:input_required, context, payload, payload_string, method, metadata)
+    else
+      emit_message(
+        context.on_message,
+        :notification,
+        %{payload: payload, raw: payload_string},
+        metadata
+      )
+
+      Logger.debug("Codex notification: #{inspect(method)}")
+      continue_receive_loop(context)
+    end
+  end
+
+  defp continue_receive_loop(context) do
+    receive_loop(
+      context.port,
+      context.on_message,
+      context.timeout_ms,
+      "",
+      context.tool_executor,
+      context.auto_approve_requests,
+      context.workspace,
+      context.timeout_context
+    )
   end
 
   defp next_timeout_context(payload, current_context) do
@@ -923,27 +910,23 @@ defmodule SymphonyElixir.Codex.AppServer do
          %{command: command, cwd: cwd, command_actions: command_actions},
          workspace
        ) do
-    [command, cwd | command_actions]
-    |> Enum.find_value(fn value ->
-      case unsafe_absolute_command_reason(value) do
-        nil -> false
-        reason -> reason
-      end
-    end) ||
-      unsafe_legacy_harness_poller_reason(command) ||
-      Enum.find_value(command_actions, fn action -> unsafe_legacy_harness_poller_reason(action) end) ||
-      unsafe_inline_shell_payload_reason(command) ||
-      Enum.find_value(command_actions, fn action -> unsafe_inline_shell_payload_reason(action) end) ||
-      unsafe_hosted_shell_generation_reason(command) ||
-      Enum.find_value(command_actions, fn action -> unsafe_hosted_shell_generation_reason(action) end) ||
-      unsafe_relative_command_reason(command, cwd) ||
-      Enum.find_value(command_actions, fn action -> unsafe_relative_command_reason(action, cwd) end) ||
-      unsafe_direct_powershell_cmdlet_reason(command) ||
-      Enum.find_value(command_actions, fn action -> unsafe_direct_powershell_cmdlet_reason(action) end) ||
+    [
+      find_unsafe_reason([command, cwd | command_actions], &unsafe_absolute_command_reason/1),
+      find_unsafe_reason([command | command_actions], &unsafe_legacy_harness_poller_reason/1),
+      find_unsafe_reason([command | command_actions], &unsafe_inline_shell_payload_reason/1),
+      find_unsafe_reason([command | command_actions], &unsafe_hosted_shell_generation_reason/1),
+      find_unsafe_reason([command | command_actions], &unsafe_relative_command_reason(&1, cwd)),
+      find_unsafe_reason([command | command_actions], &unsafe_direct_powershell_cmdlet_reason/1),
       unsafe_repository_discovery_reason([command | command_actions], cwd, workspace)
+    ]
+    |> Enum.find(&is_binary/1)
   end
 
   defp unsafe_command_reason(_context, _workspace), do: nil
+
+  defp find_unsafe_reason(values, reason_fun) do
+    Enum.find_value(values, reason_fun)
+  end
 
   defp unsafe_absolute_command_reason(command) when is_binary(command) do
     normalized = String.downcase(String.replace(command, "\\", "/"))
@@ -1134,11 +1117,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       not Enum.any?(candidates, &repository_discovery_command?/1) ->
         nil
 
-      raw_parent_path_segment?(cwd) or
-          Enum.any?(candidates, fn candidate ->
-            repository_scope_override_command?(candidate) and
-                not allowed_issue_local_git_directory_scope?(candidate, cwd, workspace)
-          end) ->
+      invalid_repository_discovery_scope?(candidates, cwd, workspace) ->
         "scratch Symphony workspace repository discovery cannot override the issue-local clone scope"
 
       all_repository_discovery_candidates_issue_local_scoped?(candidates, cwd, workspace) ->
@@ -1153,6 +1132,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp unsafe_repository_discovery_reason(_commands, _cwd, _workspace), do: nil
+
+  defp invalid_repository_discovery_scope?(candidates, cwd, workspace) do
+    raw_parent_path_segment?(cwd) or
+      Enum.any?(candidates, fn candidate ->
+        repository_scope_override_command?(candidate) and
+          not allowed_issue_local_git_directory_scope?(candidate, cwd, workspace)
+      end)
+  end
 
   defp shell_command_candidates(command) when is_binary(command) do
     [command]
