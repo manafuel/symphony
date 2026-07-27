@@ -51,7 +51,8 @@ defmodule SymphonyElixir.MixProject do
         "test/support/test_support.exs"
       ],
       dialyzer: [
-        plt_add_apps: [:mix]
+        plt_add_apps: [:mix],
+        ignore_warnings: "dialyzer.ignore-warnings.exs"
       ],
       escript: escript(),
       aliases: aliases(),
