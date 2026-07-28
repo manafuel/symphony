@@ -3112,30 +3112,23 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
     assert :ok = ExecutionLedger.persist(root, %{}, %{}, started_effects)
 
-    assert {:ok, completed_effects} =
-             ExecutionLedger.mark_effect_completed(started_effects, prepared.idempotency_key)
-
-    terminal = %{
-      issue.id => %{
-        issue: issue,
-        identifier: issue.identifier,
-        failure_class: :permanent_contract,
-        terminal_state: :permanent,
-        transition: :terminal,
-        attempt: 1,
-        blocked_at: DateTime.utc_now()
-      }
-    }
-
-    assert :ok = ExecutionLedger.persist(root, terminal, %{}, completed_effects)
-
     state_root = Path.join(root, ".symphony-state")
     current = Path.join(state_root, "execution.json")
     previous = Path.join(state_root, "execution.previous.json")
 
     valid_previous = File.read!(previous)
+    assert File.read!(current) == valid_previous
     payload = Jason.decode!(valid_previous)
     [effect] = payload["effects"]
+
+    legacy_v4_payload =
+      payload
+      |> Map.put("schema_version", "symphony.execution_ledger.v4")
+      |> Map.delete("generation_id")
+
+    File.write!(current, Jason.encode!(legacy_v4_payload))
+    assert {:ok, restored_v4} = ExecutionLedger.load(root)
+    assert restored_v4.effects[prepared.idempotency_key].status == :started
 
     invalid_current_generations = [
       {"corrupt JSON", "{"},
@@ -3191,6 +3184,135 @@ defmodule SymphonyElixir.CoreTest do
 
     File.write!(current, Jason.encode!(invalid_legacy_payload))
     assert {:ok, _restored_from_previous} = ExecutionLedger.load(root)
+  end
+
+  test "a corrupt current generation after dispatch launch preserves ownership and cannot redispatch" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-post-reservation-corruption-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-post-reservation-corruption",
+      identifier: "MT-R2-POST-RESERVATION",
+      title: "Never redispatch after ambiguous launch",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    # Establish a pre-reservation generation, then commit the reservation. The
+    # old protocol left the pre-reservation state in execution.previous.json.
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, %{})
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+
+    state_root = Path.join(root, ".symphony-state")
+    current = Path.join(state_root, "execution.json")
+    previous = Path.join(state_root, "execution.previous.json")
+
+    # A successful commit mirrors the same generation before returning. Writing
+    # the marker represents a worker launch after the durable reservation.
+    assert File.read!(current) == File.read!(previous)
+    launch_marker = Path.join(root, "worker-launched")
+    File.write!(launch_marker, prepared.idempotency_key)
+    File.write!(current, "{")
+
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert restored.effects[prepared.idempotency_key].status == :prepared
+
+    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+    assert recovered.blocked[issue.id].terminal_state == :held
+    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+
+    restarted_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      effects: recovered.effects,
+      claimed: MapSet.new(Map.keys(recovered.blocked)),
+      blocked: recovered.blocked,
+      retry_attempts: recovered.retrying,
+      running: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert MapSet.member?(restarted_state.claimed, issue.id)
+    assert restarted_state.running == %{}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, restarted_state)
+    assert File.read!(launch_marker) == prepared.idempotency_key
+  end
+
+  test "execution ledger retains idempotency evidence within a fail-closed capacity bound" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-effect-capacity-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    limit = ExecutionLedger.max_effect_entries()
+    now = DateTime.utc_now()
+
+    effects =
+      Map.new(1..limit, fn attempt ->
+        issue_id = "bounded-effect-#{attempt}"
+        key = ExecutionLedger.idempotency_key(issue_id, 1)
+
+        {key,
+         %{
+           idempotency_key: key,
+           issue_id: issue_id,
+           identifier: issue_id,
+           issue: %Issue{id: issue_id, identifier: issue_id, assigned_to_worker: true},
+           attempt: 1,
+           status: :completed,
+           prepared_at: now,
+           receipt_at: now
+         }}
+      end)
+
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+
+    overflow_issue_id = "bounded-effect-overflow"
+    overflow_key = ExecutionLedger.idempotency_key(overflow_issue_id, 1)
+
+    overflow_effect = %{
+      idempotency_key: overflow_key,
+      issue_id: overflow_issue_id,
+      identifier: overflow_issue_id,
+      issue: %Issue{
+        id: overflow_issue_id,
+        identifier: overflow_issue_id,
+        assigned_to_worker: true
+      },
+      attempt: 1,
+      status: :completed,
+      prepared_at: now,
+      receipt_at: now
+    }
+
+    assert {:error, {:execution_ledger_capacity_exceeded, :effects, exceeded, ^limit}} =
+             ExecutionLedger.persist(
+               root,
+               %{},
+               %{},
+               Map.put(effects, overflow_key, overflow_effect)
+             )
+
+    assert exceeded == limit + 1
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert map_size(restored.effects) == limit
+
+    assert {:duplicate, _effect} =
+             ExecutionLedger.reserve_effect(restored.effects, %Issue{id: "bounded-effect-1"}, 1)
   end
 
   test "execution ledger generation transitions preserve a recoverable synced state" do
