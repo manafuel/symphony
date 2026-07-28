@@ -1076,15 +1076,23 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      1_000
+    )
   end
 
   test "typed transient worker exit increments the execution attempt progressively" do
@@ -1117,6 +1125,8 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
+
     send(
       pid,
       {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
@@ -1124,6 +1134,7 @@ defmodule SymphonyElixir.CoreTest do
 
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     assert %{
              attempt: 3,
@@ -1134,7 +1145,12 @@ defmodule SymphonyElixir.CoreTest do
            } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 19_500, 20_500)
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      20_000
+    )
   end
 
   test "first typed transient worker exit schedules execution attempt two" do
@@ -1166,6 +1182,8 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
+
     send(
       pid,
       {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
@@ -1173,6 +1191,7 @@ defmodule SymphonyElixir.CoreTest do
 
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     assert %{
              attempt: 2,
@@ -1183,7 +1202,12 @@ defmodule SymphonyElixir.CoreTest do
            } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      10_000
+    )
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1303,11 +1327,9 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp assert_due_after_event(due_at_ms, event_started_at_ms, state_observed_at_ms, expected_delay_ms) do
+    assert due_at_ms >= event_started_at_ms + expected_delay_ms
+    assert due_at_ms <= state_observed_at_ms + expected_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
