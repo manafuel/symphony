@@ -396,6 +396,73 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "exact MANAfuel admission hook command preserves success and exit 20 in both Windows selectors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-admission-command-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      bash = Path.join(test_root, "bash.exe")
+      File.write!(bash, "fixture")
+      parent = self()
+
+      command =
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " <>
+          "-File C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/.codex/scripts/" <>
+          "codex-symphony-cma-ticket-admission-hook.ps1 -MonitorOnlyEnforcement strict"
+
+      issue_context = %{
+        issue_id: "issue-admission-command",
+        issue_identifier: "MT-ADMISSION-COMMAND",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "Ready",
+        issue_updated_at: ""
+      }
+
+      for {selector, candidates, expected_executable} <- [
+            {:git_bash, [bash], bash},
+            {:powershell, [], "powershell.exe"}
+          ],
+          {outcome, status, expected_result} <- [
+            {:success, 0, :ok},
+            {:rejection, 20, {:error, {:workspace_hook_failed, "before_run", 20}}}
+          ] do
+        assert ^expected_result =
+                 Workspace.run_local_hook_for_test(
+                   command,
+                   test_root,
+                   issue_context,
+                   "before_run",
+                   os_type: {:win32, :nt},
+                   git_bash_candidates: candidates,
+                   command_runner: fn executable, args, opts ->
+                     send(parent, {:admission_invocation, selector, outcome, executable, args, opts})
+                     {"redacted-by-hook-runner", status}
+                   end
+                 )
+
+        assert_receive {:admission_invocation, ^selector, ^outcome, ^expected_executable, args, opts}
+        assert Keyword.fetch!(opts, :cd) == test_root
+
+        case selector do
+          :git_bash ->
+            assert args == ["-lc", command]
+
+          :powershell ->
+            assert Enum.at(args, 5) == "-Command"
+            assert Enum.at(args, 6) =~ command
+        end
+      end
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace surfaces after_create hook timeouts" do
     workspace_root =
       Path.join(
