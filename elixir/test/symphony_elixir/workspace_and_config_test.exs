@@ -412,7 +412,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       command =
         "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " <>
           "-File C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/.codex/scripts/" <>
-          "codex-symphony-cma-ticket-admission-hook.ps1 -MonitorOnlyEnforcement strict"
+          "codex-symphony-ticket-admission-hook.ps1 -MonitorOnlyEnforcement strict"
 
       issue_context = %{
         issue_id: "issue-admission-command",
