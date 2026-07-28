@@ -353,7 +353,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
     failure_class = input_required_failure_class(running_entry)
 
-    Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} failure_class=#{failure_class}: #{error}")
+    Logger.warning("Agent task blocked for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id} failure_class=#{failure_class}")
 
     transition_agent_failure(
       state,
@@ -474,7 +474,7 @@ defmodule SymphonyElixir.Orchestrator do
          failure_class,
          terminal_state,
          attempt,
-         error,
+         _error,
          retry_exhausted
        ) do
     blocked_entry =
@@ -486,7 +486,7 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host: Map.get(entry, :worker_host),
         workspace_path: Map.get(entry, :workspace_path),
         session_id: running_entry_session_id(entry),
-        error: error,
+        error: structural_failure_diagnostic(failure_class, :terminal),
         failure_class: failure_class,
         terminal_state: terminal_state,
         transition: :terminal,
@@ -1704,15 +1704,13 @@ defmodule SymphonyElixir.Orchestrator do
       due_at = DateTime.add(DateTime.utc_now(), delay_ms, :millisecond)
       identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
       issue_url = pick_retry_issue_url(previous_retry, metadata)
-      error = pick_retry_error(previous_retry, metadata)
+      diagnostic = structural_failure_diagnostic(failure_class, :retrying)
       worker_host = pick_retry_worker_host(previous_retry, metadata)
       workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
       cancel_retry_timer(old_timer)
       timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
-      error_suffix = retry_error_suffix(error)
-
-      Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt}) failure_class=#{failure_class || "continuation"}#{error_suffix}")
+      Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt}) failure_class=#{failure_class || "continuation"}")
 
       %{
         state
@@ -1726,7 +1724,7 @@ defmodule SymphonyElixir.Orchestrator do
               identifier: identifier,
               issue_url: issue_url,
               issue: Map.get(metadata, :issue) || Map.get(previous_retry, :issue),
-              error: error,
+              error: diagnostic,
               failure_class: failure_class,
               transition: :retrying,
               delay_type: Map.get(metadata, :delay_type),
@@ -1752,8 +1750,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cancel_retry_timer(_timer_ref), do: :ok
 
-  defp retry_error_suffix(error) when is_binary(error), do: " error=#{error}"
-  defp retry_error_suffix(_error), do: ""
+  defp structural_failure_diagnostic(failure_class, transition) do
+    normalized_class =
+      cond do
+        is_nil(failure_class) -> :continuation
+        FailureSemantics.valid_class?(failure_class) -> failure_class
+        true -> :unknown_fail_closed
+      end
+
+    prefix = if transition == :retrying, do: "execution_backoff", else: "execution_terminal"
+    "#{prefix}:#{normalized_class}"
+  end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
@@ -2060,10 +2067,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_issue_url(previous_retry, metadata) do
     metadata[:issue_url] || Map.get(previous_retry, :issue_url)
-  end
-
-  defp pick_retry_error(previous_retry, metadata) do
-    metadata[:error] || Map.get(previous_retry, :error)
   end
 
   defp pick_retry_worker_host(previous_retry, metadata) do

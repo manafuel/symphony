@@ -472,7 +472,7 @@ defmodule SymphonyElixir.CoreTest do
       assert blocked_state.blocked[issue_id].block_kind == :before_terminal
 
       assert blocked_state.blocked[issue_id].error ==
-               "before_terminal acceptance failed: hook_failed_status_19"
+               "execution_terminal:operator_decision_required"
 
       refute Process.alive?(agent_pid)
       assert File.dir?(workspace)
@@ -1140,7 +1140,7 @@ defmodule SymphonyElixir.CoreTest do
              attempt: 3,
              due_at_ms: due_at_ms,
              identifier: "MT-559",
-             error: "agent exited with transient_transport",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } =
              state.retry_attempts[issue_id]
@@ -1197,7 +1197,7 @@ defmodule SymphonyElixir.CoreTest do
              attempt: 2,
              due_at_ms: due_at_ms,
              identifier: "MT-560",
-             error: "agent exited with transient_transport",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } =
              state.retry_attempts[issue_id]
@@ -2768,6 +2768,58 @@ defmodule SymphonyElixir.CoreTest do
     assert exhausted.blocked[issue.id].retry_exhausted
   end
 
+  test "retry and terminal diagnostics never log or expose caller-controlled error text" do
+    secret_sentinel = "sk_live_R2_RETRY_DIAGNOSTIC_SENTINEL"
+
+    issue = %Issue{
+      id: "issue-retry-diagnostic-redaction",
+      identifier: "MT-R2-RETRY-DIAGNOSTIC",
+      title: "Retry diagnostics are structural",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-RETRY-DIAGNOSTIC"
+    }
+
+    retry_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        retrying =
+          Orchestrator.transition_failure_for_test(
+            %Orchestrator.State{max_retry_attempts: 3},
+            issue,
+            :transient_transport,
+            1,
+            "provider response #{secret_sentinel}"
+          )
+
+        send(self(), {:retry_diagnostic_state, retrying})
+      end)
+
+    assert_receive {:retry_diagnostic_state, retrying}
+    Process.cancel_timer(retrying.retry_attempts[issue.id].timer_ref)
+    assert retry_log =~ "failure_class=transient_transport"
+    refute retry_log =~ secret_sentinel
+    refute inspect(retrying) =~ secret_sentinel
+    assert retrying.retry_attempts[issue.id].error == "execution_backoff:transient_transport"
+
+    terminal_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        terminal =
+          Orchestrator.transition_failure_for_test(
+            %Orchestrator.State{max_retry_attempts: 3},
+            issue,
+            :transient_transport,
+            3,
+            "subprocess path #{secret_sentinel}"
+          )
+
+        send(self(), {:terminal_diagnostic_state, terminal})
+      end)
+
+    assert_receive {:terminal_diagnostic_state, terminal}
+    refute terminal_log =~ secret_sentinel
+    refute inspect(terminal) =~ secret_sentinel
+    assert terminal.blocked[issue.id].error == "execution_terminal:transient_transport"
+  end
+
   test "failed retry revalidation remains represented and obeys the retry ceiling" do
     issue = %Issue{
       id: "issue-revalidation-failure",
@@ -3032,7 +3084,7 @@ defmodule SymphonyElixir.CoreTest do
     assert blocked.execution_ledger_healthy == false
     assert blocked.blocked[issue.id].failure_class == :unknown_fail_closed
     assert blocked.blocked[issue.id].terminal_state == :permanent
-    assert blocked.blocked[issue.id].error == "unable to durably reserve dispatch"
+    assert blocked.blocked[issue.id].error == "execution_terminal:unknown_fail_closed"
     assert MapSet.member?(blocked.claimed, issue.id)
   end
 
