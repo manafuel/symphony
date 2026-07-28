@@ -6,6 +6,12 @@ defmodule SymphonyElixir.ExecutionLedger do
   workspace root. A prepared dispatch effect is written before a worker starts;
   after restart, an unreceipted effect is ambiguous and must be held rather than
   executed again.
+
+  Persistence uses a synced temporary file followed by crash-safe generation
+  rotation. POSIX hosts sync the parent directory after every directory-entry
+  transition. On Windows, Erlang/OTP implements `:file.rename/2` with
+  `MOVEFILE_WRITE_THROUGH`; the synced file plus write-through rename is the
+  supported metadata durability boundary.
   """
 
   alias SymphonyElixir.{FailureSemantics, PathSafety}
@@ -140,13 +146,37 @@ defmodule SymphonyElixir.ExecutionLedger do
   defp load_current_or_previous(paths) do
     cond do
       File.exists?(paths.current) ->
-        load_file(paths.current)
+        load_current_with_previous_fallback(paths)
 
       File.exists?(paths.previous) ->
         load_file(paths.previous)
 
       true ->
         {:ok, %{blocked: %{}, retrying: %{}, effects: %{}}}
+    end
+  end
+
+  defp load_current_with_previous_fallback(paths) do
+    case load_file(paths.current) do
+      {:ok, _state} = current ->
+        current
+
+      {:error, current_reason} = current_error ->
+        load_previous_after_current_failure(paths, current_reason, current_error)
+    end
+  end
+
+  defp load_previous_after_current_failure(paths, current_reason, current_error) do
+    if File.exists?(paths.previous) do
+      case load_file(paths.previous) do
+        {:ok, _state} = previous ->
+          previous
+
+        {:error, previous_reason} ->
+          {:error, {:invalid_execution_generations, current_reason, previous_reason}}
+      end
+    else
+      current_error
     end
   end
 
@@ -614,13 +644,40 @@ defmodule SymphonyElixir.ExecutionLedger do
     temporary = "#{paths.current}.tmp-#{System.unique_integer([:positive, :monotonic])}"
 
     with :ok <- durable_write(temporary, content),
+         :ok <- sync_parent_directory(paths.current),
          :ok <- rotate_current_generation(paths),
-         :ok <- File.rename(temporary, paths.current) do
+         :ok <- sync_parent_directory(paths.current),
+         :ok <- File.rename(temporary, paths.current),
+         :ok <- sync_parent_directory(paths.current) do
       :ok
     else
       {:error, reason} ->
         File.rm(temporary)
         {:error, {:execution_ledger_write_failed, reason}}
+    end
+  end
+
+  defp sync_parent_directory(path) do
+    case :os.type() do
+      {:win32, _name} ->
+        # OTP's Windows efile_rename uses MOVEFILE_WRITE_THROUGH. File content
+        # and metadata are synced before the rename by durable_write/2.
+        :ok
+
+      _other ->
+        sync_directory(Path.dirname(path))
+    end
+  end
+
+  defp sync_directory(path) do
+    case :file.open(String.to_charlist(path), [:read, :directory, :raw]) do
+      {:ok, device} ->
+        sync_result = :file.sync(device)
+        close_result = :file.close(device)
+        if sync_result == :ok, do: close_result, else: sync_result
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

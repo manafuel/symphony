@@ -3014,7 +3014,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(blocked.claimed, issue.id)
   end
 
-  test "execution ledger falls back only when current is absent and rejects ambiguous input" do
+  test "execution ledger recovers valid generations and fails closed when both are invalid" do
     alias SymphonyElixir.ExecutionLedger
 
     root =
@@ -3059,26 +3059,50 @@ defmodule SymphonyElixir.CoreTest do
     current = Path.join(state_root, "execution.json")
     previous = Path.join(state_root, "execution.previous.json")
 
-    File.write!(current, "{")
-    assert {:error, {:invalid_execution_ledger, _reason}} = ExecutionLedger.load(root)
+    valid_previous = File.read!(previous)
+    payload = Jason.decode!(valid_previous)
+    [effect] = payload["effects"]
+
+    invalid_current_generations = [
+      {"corrupt JSON", "{"},
+      {"truncated JSON", binary_part(valid_previous, 0, div(byte_size(valid_previous), 2))},
+      {"schema-invalid JSON", Jason.encode!(%{"schema_version" => "unknown"})},
+      {"duplicate execution entry", payload |> Map.put("effects", [effect, effect]) |> Jason.encode!()},
+      {"invalid legacy entry",
+       Jason.encode!(%{
+         "schema_version" => "symphony.execution_ledger.v1",
+         "blocked" => [
+           %{
+             "issue_id" => issue.id,
+             "attempt" => "not-an-integer",
+             "blocked_at" => DateTime.to_iso8601(DateTime.utc_now())
+           }
+         ]
+       })}
+    ]
+
+    for {kind, invalid_current} <- invalid_current_generations do
+      File.write!(current, invalid_current)
+      assert {:ok, restored} = ExecutionLedger.load(root), kind
+      assert restored.effects[prepared.idempotency_key].status == :started
+
+      recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+      assert recovered.blocked[issue.id].terminal_state == :held
+      assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+    end
 
     File.rm!(current)
-    assert {:ok, restored} = ExecutionLedger.load(root)
-    assert restored.effects[prepared.idempotency_key].status == :started
+    File.mkdir!(current)
+    assert {:ok, restored_from_unreadable_current} = ExecutionLedger.load(root)
+    assert restored_from_unreadable_current.effects[prepared.idempotency_key].status == :started
+    File.rmdir!(current)
 
-    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
-    assert recovered.blocked[issue.id].terminal_state == :held
-    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+    File.write!(current, "{")
+    File.write!(previous, "{")
 
-    payload = previous |> File.read!() |> Jason.decode!()
-    [effect] = payload["effects"]
-    duplicate_payload = Map.put(payload, "effects", [effect, effect])
-    File.write!(current, Jason.encode!(duplicate_payload))
+    assert {:error, {:invalid_execution_generations, {:invalid_execution_ledger, _current_reason}, {:invalid_execution_ledger, _previous_reason}}} = ExecutionLedger.load(root)
 
-    assert {:error, {:invalid_execution_ledger, {:duplicate_execution_entry, duplicate_idempotency_key}}} =
-             ExecutionLedger.load(root)
-
-    assert duplicate_idempotency_key == prepared.idempotency_key
+    File.write!(previous, valid_previous)
 
     invalid_legacy_payload = %{
       "schema_version" => "symphony.execution_ledger.v1",
@@ -3092,9 +3116,68 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     File.write!(current, Jason.encode!(invalid_legacy_payload))
+    assert {:ok, _restored_from_previous} = ExecutionLedger.load(root)
+  end
 
-    assert {:error, {:invalid_execution_ledger, :invalid_legacy_attempt}} =
-             ExecutionLedger.load(root)
+  test "execution ledger generation transitions preserve a recoverable synced state" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-crash-states-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-crash-state-safety",
+      identifier: "MT-R2-CRASH-STATE",
+      title: "Generation crash state",
+      state: "In Progress"
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+    assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, started_effects)
+
+    state_root = Path.join(root, ".symphony-state")
+    current = Path.join(state_root, "execution.json")
+    previous = Path.join(state_root, "execution.previous.json")
+    temporary = Path.join(state_root, "execution.json.tmp-crash-simulation")
+    valid_current = File.read!(current)
+    valid_previous = File.read!(previous)
+
+    # Crash after syncing the new temporary generation but before rotation.
+    File.write!(temporary, valid_current)
+    assert {:ok, before_rotation} = ExecutionLedger.load(root)
+    assert before_rotation.effects[prepared.idempotency_key].status == :started
+
+    # Crash after removing an older previous generation but before rotating current.
+    File.rm!(previous)
+    assert {:ok, after_previous_removal} = ExecutionLedger.load(root)
+    assert after_previous_removal.effects[prepared.idempotency_key].status == :started
+
+    # Crash after rotating current to previous but before installing the temporary generation.
+    File.rename!(current, previous)
+    assert {:ok, after_rotation} = ExecutionLedger.load(root)
+    assert after_rotation.effects[prepared.idempotency_key].status == :started
+
+    # Crash after installing a new current but before its directory-sync boundary.
+    File.rename!(temporary, current)
+    assert {:ok, after_install} = ExecutionLedger.load(root)
+    assert after_install.effects[prepared.idempotency_key].status == :started
+
+    # A torn installed current still recovers the last synced previous generation.
+    File.write!(current, "{")
+    assert {:ok, after_torn_install} = ExecutionLedger.load(root)
+    assert after_torn_install.effects[prepared.idempotency_key].status == :started
+
+    # Restore the older generation to prove the fixture itself retained both states.
+    File.write!(previous, valid_previous)
+    assert {:ok, _restored} = ExecutionLedger.load(root)
   end
 
   test "an ambiguous dispatch effect remains held and cannot receive a new sequence" do
