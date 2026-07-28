@@ -2288,7 +2288,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              issue_url: "https://example.org/issues/MT-STALL",
-             error: "worker stalled without codex activity",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } = state.retry_attempts[issue_id]
 
@@ -2367,7 +2367,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-MCP",
-             error: "codex MCP elicitation requires operator input",
+             error: "execution_terminal:operator_decision_required",
              worker_host: "dm-dev2",
              workspace_path: "/workspaces/MT-MCP"
            } = state.blocked[issue_id]
@@ -2380,7 +2380,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                %{
                  identifier: "MT-MCP",
                  issue_url: "https://example.org/issues/MT-MCP",
-                 error: "codex MCP elicitation requires operator input"
+                 error: "execution_terminal:operator_decision_required"
                }
              ]
            } =
@@ -2436,7 +2436,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT",
-             error: "codex turn requires operator input"
+             error: "execution_terminal:operator_decision_required"
            } = state.blocked[issue_id]
   end
 
@@ -2486,7 +2486,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT-NORMAL",
-             error: "codex turn requires operator input"
+             error: "execution_terminal:operator_decision_required"
            } = state.blocked[issue_id]
   end
 
