@@ -3,7 +3,9 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
-  alias SymphonyElixir.LogFile
+  alias SymphonyElixir.{LogFile, ProducerContract}
+  alias SymphonyElixir.ProducerV6.Authority
+  alias SymphonyElixir.ProducerV6.RuntimeBinding.Live
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
   @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
@@ -14,7 +16,12 @@ defmodule SymphonyElixir.CLI do
           set_workflow_file_path: (String.t() -> :ok | {:error, term()}),
           set_logs_root: (String.t() -> :ok | {:error, term()}),
           set_server_port_override: (non_neg_integer() | nil -> :ok | {:error, term()}),
-          ensure_all_started: (-> ensure_started_result())
+          ensure_all_started: (-> ensure_started_result()),
+          load_producer_contract: (String.t(), String.t() -> {:ok, map()} | {:error, term()}),
+          load_launch_receipt: (String.t(), String.t() -> {:ok, map()} | {:error, term()}),
+          validate_production_authority: (map(), map(), String.t() -> :ok | {:error, term()}),
+          validate_runtime_binding: (map(), map(), String.t() -> :ok | {:error, term()}),
+          install_production_authority: (map(), map(), String.t() -> :ok | {:error, term()})
         }
 
   @spec main([String.t()]) :: no_return()
@@ -30,7 +37,36 @@ defmodule SymphonyElixir.CLI do
   end
 
   @spec evaluate([String.t()], deps()) :: :ok | {:error, String.t()}
-  def evaluate(args, deps \\ runtime_deps()) do
+  def evaluate(args, deps \\ runtime_deps())
+
+  def evaluate(
+        [
+          "--production-mode",
+          "--production-launch-receipt",
+          launch_path,
+          "--expected-launch-receipt-sha256",
+          launch_sha256,
+          "--producer-contract-manifest",
+          contract_path,
+          "--expected-producer-contract-sha256",
+          contract_sha256,
+          workflow_path
+        ],
+        deps
+      ) do
+    with {:ok, launch} <- deps.load_launch_receipt.(launch_path, launch_sha256),
+         {:ok, contract} <- deps.load_producer_contract.(contract_path, contract_sha256),
+         :ok <- deps.validate_production_authority.(launch, contract, workflow_path),
+         :ok <- deps.validate_runtime_binding.(launch, contract, workflow_path),
+         :ok <- deps.install_production_authority.(launch, contract, workflow_path) do
+      run(workflow_path, deps)
+    else
+      {:error, reason} ->
+        {:error, "Production startup authority rejected: #{inspect(reason)}"}
+    end
+  end
+
+  def evaluate(args, deps) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
         with :ok <- require_guardrails_acknowledgement(opts),
@@ -82,7 +118,12 @@ defmodule SymphonyElixir.CLI do
       set_workflow_file_path: &SymphonyElixir.Workflow.set_workflow_file_path/1,
       set_logs_root: &set_logs_root/1,
       set_server_port_override: &set_server_port_override/1,
-      ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end
+      ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end,
+      load_producer_contract: &ProducerContract.load/2,
+      load_launch_receipt: &ProducerContract.validate_launch_receipt/2,
+      validate_production_authority: &ProducerContract.validate_production_authority/3,
+      validate_runtime_binding: &Live.validate/3,
+      install_production_authority: &Authority.install/3
     }
   end
 

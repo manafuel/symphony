@@ -237,6 +237,52 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec run_before_run_hook_with_receipt(
+          Path.t(),
+          map() | String.t() | nil,
+          worker_host()
+        ) :: {:ok, String.t()} | {:error, term()}
+  def run_before_run_hook_with_receipt(workspace, issue_or_identifier, nil)
+      when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.before_run do
+      nil ->
+        {:error, :producer_admission_hook_missing}
+
+      command ->
+        timeout_ms = hooks.timeout_ms
+
+        task =
+          Task.async(fn ->
+            run_local_shell_command(command, workspace, issue_context)
+          end)
+
+        case Task.yield(task, timeout_ms) do
+          {:ok, {output, 0}} when is_binary(output) and byte_size(output) <= 65_536 ->
+            {:ok, output}
+
+          {:ok, {_output, 0}} ->
+            {:error, :producer_admission_hook_receipt_oversized}
+
+          {:ok, {_output, status}} ->
+            {:error, {:workspace_hook_failed, "before_run", status}}
+
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+            {:error, {:workspace_hook_timeout, "before_run", timeout_ms}}
+
+          {:exit, reason} ->
+            {:error, {:workspace_hook_execution_failed, "before_run", reason}}
+        end
+    end
+  end
+
+  def run_before_run_hook_with_receipt(_workspace, _issue_or_identifier, worker_host)
+      when is_binary(worker_host),
+      do: {:error, :producer_v6_remote_worker_forbidden}
+
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)

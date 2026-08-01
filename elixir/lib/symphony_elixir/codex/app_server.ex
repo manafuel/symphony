@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_read_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @max_dynamic_tool_output_chars 8_000
@@ -93,14 +94,27 @@ defmodule SymphonyElixir.Codex.AppServer do
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    client_user_message_id = Keyword.get(opts, :client_user_message_id)
+    capture_history = Keyword.get(opts, :capture_history, false)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
         DynamicTool.execute(tool, arguments, workspace: workspace)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-      {:ok, turn_id} ->
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           client_user_message_id,
+           capture_history
+         ) do
+      {:ok, %{turn: turn_payload} = start_evidence} ->
+        turn_id = turn_payload["id"]
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -110,7 +124,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           %{
             session_id: session_id,
             thread_id: thread_id,
-            turn_id: turn_id
+            turn_id: turn_id,
+            client_user_message_id: client_user_message_id,
+            turn_start_response: turn_payload,
+            history_response: start_evidence[:history]
           },
           metadata
         )
@@ -124,7 +141,10 @@ defmodule SymphonyElixir.Codex.AppServer do
                result: result,
                session_id: session_id,
                thread_id: thread_id,
-               turn_id: turn_id
+               turn_id: turn_id,
+               client_user_message_id: client_user_message_id,
+               turn_start_response: turn_payload,
+               history_response: start_evidence[:history]
              }}
 
           {:error, reason} ->
@@ -469,29 +489,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         client_user_message_id,
+         capture_history
+       ) do
+    params = %{
+      "threadId" => thread_id,
+      "input" => [%{"type" => "text", "text" => prompt}],
+      "cwd" => workspace,
+      "title" => "#{issue.identifier}: #{issue.title}",
+      "approvalPolicy" => approval_policy,
+      "sandboxPolicy" => turn_sandbox_policy
+    }
+
+    params =
+      if is_binary(client_user_message_id) and client_user_message_id != "",
+        do: Map.put(params, "clientUserMessageId", client_user_message_id),
+        else: params
+
+    send_message(port, %{"method" => "turn/start", "id" => @turn_start_id, "params" => params})
+
+    with {:ok, %{"turn" => %{"id" => turn_id} = turn}} when is_binary(turn_id) <-
+           await_response(port, @turn_start_id),
+         {:ok, history} <- maybe_read_thread_history(port, thread_id, capture_history) do
+      {:ok, %{turn: turn, history: history}}
+    end
+  end
+
+  defp maybe_read_thread_history(_port, _thread_id, false), do: {:ok, nil}
+
+  defp maybe_read_thread_history(port, thread_id, true) do
     send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
-        "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
-        "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
-      }
+      "method" => "thread/read",
+      "id" => @thread_read_id,
+      "params" => %{"threadId" => thread_id, "includeTurns" => true}
     })
 
-    case await_response(port, @turn_start_id) do
-      {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
-      other -> other
-    end
+    await_response_deferred(port, @thread_read_id)
   end
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
@@ -610,7 +651,14 @@ defmodule SymphonyElixir.Codex.AppServer do
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+
+        {:ok,
+         %{
+           status: "completed",
+           payload: payload,
+           raw: payload_string,
+           terminal_at_utc: DateTime.utc_now() |> Calendar.strftime("%Y-%m-%dT%H:%M:%S.%3fZ")
+         }}
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -2250,6 +2298,53 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> String.downcase()
 
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
+  end
+
+  defp await_response_deferred(port, request_id) do
+    with_timeout_response_deferred(port, request_id, Config.settings!().codex.read_timeout_ms, "", [])
+  end
+
+  defp with_timeout_response_deferred(port, request_id, timeout_ms, pending_line, deferred) do
+    receive do
+      {^port, {:data, {:eol, chunk}}} ->
+        complete_line = pending_line <> to_string(chunk)
+
+        case Jason.decode(complete_line) do
+          {:ok, %{"id" => ^request_id, "error" => error}} ->
+            replay_deferred(port, deferred)
+            {:error, {:response_error, error}}
+
+          {:ok, %{"id" => ^request_id, "result" => result}} ->
+            replay_deferred(port, deferred)
+            {:ok, result}
+
+          _ ->
+            with_timeout_response_deferred(port, request_id, timeout_ms, "", [complete_line | deferred])
+        end
+
+      {^port, {:data, {:noeol, chunk}}} ->
+        with_timeout_response_deferred(
+          port,
+          request_id,
+          timeout_ms,
+          pending_line <> to_string(chunk),
+          deferred
+        )
+
+      {^port, {:exit_status, status}} ->
+        replay_deferred(port, deferred)
+        {:error, {:port_exit, status}}
+    after
+      timeout_ms ->
+        replay_deferred(port, deferred)
+        {:error, :response_timeout}
+    end
+  end
+
+  defp replay_deferred(port, deferred) do
+    deferred
+    |> Enum.reverse()
+    |> Enum.each(fn line -> send(self(), {port, {:data, {:eol, line}}}) end)
   end
 
   defp await_response(port, request_id) do

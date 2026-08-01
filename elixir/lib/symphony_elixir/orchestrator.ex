@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{
     AgentRunner,
     Config,
-    ExecutionLedger,
+    ExecutionLedgerRouter,
     FailureSemantics,
     StatusDashboard,
     Tracker,
@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Orchestrator do
   }
 
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.ProducerV6.{ExecutionBinding, Lifecycle, Management}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -64,6 +65,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       :terminal_workspace_cleanup,
       :execution_ledger_healthy,
+      execution_ledger_context: :preview,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -89,8 +91,8 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
-    case ExecutionLedger.load(config.workspace.root) do
-      {:ok, loaded_state} ->
+    case ExecutionLedgerRouter.load(config.workspace.root) do
+      {:ok, ledger_context, loaded_state} ->
         durable_state = recover_ambiguous_effects(loaded_state)
         retry_attempts = restore_retry_timers(durable_state.retrying)
 
@@ -103,6 +105,7 @@ defmodule SymphonyElixir.Orchestrator do
             tick_token: nil,
             terminal_workspace_cleanup: nil,
             execution_ledger_healthy: true,
+            execution_ledger_context: ledger_context,
             claimed: MapSet.new(Map.keys(durable_state.blocked) ++ Map.keys(retry_attempts)),
             blocked: durable_state.blocked,
             retry_attempts: retry_attempts,
@@ -175,6 +178,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = execute_poll_cycle(state)
+    state = maybe_observe_producer_management(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -241,8 +245,20 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+
+        state =
+          case {running_entry[:idempotency_key], runtime_info[:workspace_path]} do
+            {idempotency_key, workspace_path}
+            when is_binary(idempotency_key) and is_binary(workspace_path) ->
+              mark_dispatch_workspace_ready(state, idempotency_key, workspace_path)
+
+            _ ->
+              state
+          end
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -1511,7 +1527,7 @@ defmodule SymphonyElixir.Orchestrator do
     failure_attempt = normalize_retry_attempt(attempt)
     dispatch_sequence = next_dispatch_sequence(state, issue.id)
 
-    case reserve_dispatch_effect(state, issue, dispatch_sequence) do
+    case reserve_dispatch_effect(state, issue, dispatch_sequence, failure_attempt) do
       {:ok, reserved_state, prepared_effect} ->
         start_reserved_agent(
           reserved_state,
@@ -1572,7 +1588,8 @@ defmodule SymphonyElixir.Orchestrator do
              issue,
              recipient,
              attempt: failure_attempt,
-             worker_host: worker_host
+             worker_host: worker_host,
+             producer_v6: producer_v6_context?(state.execution_ledger_context)
            )
          end) do
       {:ok, %Task{pid: pid, ref: ref}} ->
@@ -1580,7 +1597,7 @@ defmodule SymphonyElixir.Orchestrator do
           "Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{failure_attempt} idempotency_key=#{prepared_effect.idempotency_key} worker_host=#{worker_host || "local"}"
         )
 
-        state = mark_dispatch_effect_started(state, prepared_effect.idempotency_key)
+        state = mark_dispatch_effect_started(state, prepared_effect.idempotency_key, pid)
 
         running =
           Map.put(state.running, issue.id, %{
@@ -2203,6 +2220,23 @@ defmodule SymphonyElixir.Orchestrator do
       end
     else
       :unavailable
+    end
+  end
+
+  @impl true
+  def handle_call({:producer_checkpoint, issue_id, kind, payload}, _from, state)
+      when is_binary(issue_id) and is_atom(kind) and is_map(payload) do
+    case apply_producer_checkpoint(state, issue_id, kind, payload) do
+      {:ok, next_state, reply} ->
+        {:reply, reply, next_state}
+
+      {:ok, next_state} ->
+        {:reply, :ok, next_state}
+
+      {:error, reason, failed_state} ->
+        Logger.error("Producer-v6 checkpoint failed issue_id=#{issue_id} checkpoint=#{kind} reason=#{inspect(reason)}")
+
+        {:reply, {:error, reason}, %{failed_state | execution_ledger_healthy: false}}
     end
   end
 
@@ -3005,6 +3039,209 @@ defmodule SymphonyElixir.Orchestrator do
     |> Map.put(:permanent, permanent)
   end
 
+  defp apply_producer_checkpoint(state, issue_id, kind, payload) do
+    with true <- producer_v6_context?(state.execution_ledger_context),
+         running when is_map(running) <- Map.get(state.running, issue_id),
+         key when is_binary(key) <- running[:idempotency_key],
+         effect when is_map(effect) <- Map.get(state.effects, key) do
+      apply_producer_checkpoint(state, issue_id, running, key, effect, kind, payload)
+    else
+      false -> {:error, :producer_checkpoint_in_preview_context, state}
+      nil -> {:error, :producer_checkpoint_running_effect_missing, state}
+      _ -> {:error, :producer_checkpoint_state_invalid, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(
+         state,
+         issue_id,
+         running,
+         key,
+         _effect,
+         :workspace_ready,
+         payload
+       ) do
+    workspace_path = payload[:workspace_path]
+
+    updated_running =
+      running
+      |> maybe_put_runtime_value(:worker_host, payload[:worker_host])
+      |> maybe_put_runtime_value(:workspace_path, workspace_path)
+
+    state = %{state | running: Map.put(state.running, issue_id, updated_running)}
+    state = mark_dispatch_workspace_ready(state, key, workspace_path)
+
+    with true <- state.execution_ledger_healthy,
+         effect when is_map(effect) <- Map.get(state.effects, key),
+         {:ok, claim} <- Lifecycle.claim(state.execution_ledger_context, effect, workspace_path),
+         {:ok, next_state} <-
+           checkpoint_transition(
+             state,
+             key,
+             &ExecutionLedgerRouter.mark_claim_ready/4,
+             claim
+           ) do
+      next_running = Map.put(updated_running, :producer_claim, claim)
+      {:ok, %{next_state | running: Map.put(next_state.running, issue_id, next_running)}}
+    else
+      false -> {:error, :producer_workspace_transition_failed, state}
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :producer_claim_checkpoint_invalid, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(
+         state,
+         issue_id,
+         running,
+         key,
+         effect,
+         :admission_passed,
+         payload
+       ) do
+    with claim when is_map(claim) <- running[:producer_claim],
+         receipt when is_binary(receipt) <- payload[:hook_receipt_bytes],
+         {:ok, admission} <-
+           Lifecycle.admission(state.execution_ledger_context, effect, claim, receipt),
+         {:ok, next_state} <-
+           checkpoint_transition(
+             state,
+             key,
+             &ExecutionLedgerRouter.mark_admission_passed/4,
+             admission
+           ) do
+      next_running = Map.put(running, :admission_result, admission)
+      {:ok, %{next_state | running: Map.put(next_state.running, issue_id, next_running)}}
+    else
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :producer_admission_checkpoint_invalid, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(state, issue_id, running, key, _effect, :thread_ready, payload) do
+    thread = Lifecycle.thread(payload)
+
+    with {:ok, next_state} <-
+           checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_thread_ready/4, thread),
+         claim when is_map(claim) <- running[:producer_claim],
+         current_effect when is_map(current_effect) <- Map.get(next_state.effects, key),
+         {:ok, closeout} <-
+           Lifecycle.closeout_directive(next_state.execution_ledger_context, current_effect, claim) do
+      next_running = Map.put(running, :producer_closeout, closeout)
+
+      {:ok, %{next_state | running: Map.put(next_state.running, issue_id, next_running)}, {:ok, closeout}}
+    else
+      {:error, reason, failed_state} -> {:error, reason, failed_state}
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :producer_closeout_directive_invalid, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(
+         state,
+         _issue_id,
+         _running,
+         key,
+         _effect,
+         :turn_start_intent,
+         intent
+       ) do
+    checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_start_intent/4, intent)
+  end
+
+  defp apply_producer_checkpoint(state, _issue_id, _running, key, effect, :turn_started, message) do
+    with {:ok, started} <- Lifecycle.turn_started(state.execution_ledger_context, effect, message) do
+      checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_started/4, started)
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(
+         state,
+         _issue_id,
+         _running,
+         key,
+         effect,
+         :turn_terminal,
+         turn_session
+       ) do
+    with {:ok, terminal} <-
+           Lifecycle.turn_terminal(state.execution_ledger_context, effect, turn_session) do
+      checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_terminal/4, terminal)
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(
+         state,
+         _issue_id,
+         _running,
+         key,
+         effect,
+         :turn_terminal_final,
+         turn_session
+       ) do
+    closeout = turn_session[:producer_closeout]
+
+    with true <- is_map(closeout),
+         {:ok, final} <-
+           Lifecycle.turn_terminal_final(
+             state.execution_ledger_context,
+             effect,
+             turn_session,
+             closeout
+           ),
+         {:ok, terminal_state} <-
+           checkpoint_transition(
+             state,
+             key,
+             &ExecutionLedgerRouter.mark_turn_terminal/4,
+             final.terminal
+           ),
+         {:ok, completed_effects} <-
+           ExecutionLedgerRouter.mark_effect_completed(
+             terminal_state.execution_ledger_context,
+             terminal_state.effects,
+             key,
+             final.terminal_tracker,
+             final.completion_seal
+           ) do
+      completed_state = %{terminal_state | effects: completed_effects} |> persist_execution_state()
+
+      if completed_state.execution_ledger_healthy,
+        do: {:ok, completed_state},
+        else: {:error, :producer_completed_checkpoint_persist_failed, completed_state}
+    else
+      false -> {:error, :producer_closeout_directive_missing, state}
+      {:error, reason, failed_state} -> {:error, reason, failed_state}
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :producer_final_terminal_checkpoint_invalid, state}
+    end
+  end
+
+  defp apply_producer_checkpoint(state, _issue_id, _running, _key, _effect, kind, _payload),
+    do: {:error, {:producer_checkpoint_kind_invalid, kind}, state}
+
+  defp checkpoint_transition(state, key, transition, payload)
+       when is_function(transition, 4) do
+    case transition.(state.execution_ledger_context, state.effects, key, payload) do
+      {:ok, effects} ->
+        next_state = %{state | effects: effects} |> persist_execution_state()
+
+        if next_state.execution_ledger_healthy,
+          do: {:ok, next_state},
+          else: {:error, :producer_checkpoint_persist_failed, next_state}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp producer_v6_context?(%{kind: :producer_v6}), do: true
+  defp producer_v6_context?(_context), do: false
+
   defp next_dispatch_sequence(%State{} = state, issue_id) do
     state.effects
     |> Map.values()
@@ -3024,8 +3261,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp ambiguous_effect_for_issue?(_state, _issue_id), do: false
 
-  defp reserve_dispatch_effect(%State{} = state, %Issue{} = issue, sequence) do
-    case ExecutionLedger.reserve_effect(state.effects, issue, sequence) do
+  defp reserve_dispatch_effect(%State{} = state, %Issue{} = issue, sequence, retry_attempt) do
+    case ExecutionLedgerRouter.reserve_effect(
+           state.execution_ledger_context,
+           state.effects,
+           issue,
+           sequence,
+           retry_attempt
+         ) do
       {:ok, effects, prepared_effect} ->
         reserved_state = %{state | effects: effects}
 
@@ -3036,18 +3279,42 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:duplicate, duplicate_effect} ->
         {:duplicate, duplicate_effect}
+
+      {:error, reason} ->
+        {:error, %{state | execution_ledger_healthy: false}, reason}
     end
   end
 
-  defp mark_dispatch_effect_started(%State{} = state, idempotency_key) do
-    case ExecutionLedger.mark_effect_started(state.effects, idempotency_key) do
+  defp mark_dispatch_effect_started(%State{} = state, idempotency_key, worker_pid) do
+    case ExecutionLedgerRouter.mark_effect_started(
+           state.execution_ledger_context,
+           state.effects,
+           idempotency_key,
+           worker_pid
+         ) do
       {:ok, effects} ->
         %{state | effects: effects}
         |> persist_execution_state()
 
-      {:error, :missing_effect} ->
-        Logger.error("Dispatch effect receipt missing idempotency_key=#{idempotency_key}; durable state is fail-closed")
+      {:error, reason} ->
+        Logger.error("Unable to commit worker_registered producer transition: #{inspect(reason)}")
+        %{state | execution_ledger_healthy: false}
+    end
+  end
 
+  defp mark_dispatch_workspace_ready(%State{} = state, idempotency_key, workspace_path) do
+    case ExecutionLedgerRouter.mark_workspace_ready(
+           state.execution_ledger_context,
+           state.effects,
+           idempotency_key,
+           workspace_path
+         ) do
+      {:ok, effects} ->
+        %{state | effects: effects}
+        |> persist_execution_state()
+
+      {:error, reason} ->
+        Logger.error("Unable to commit workspace_ready producer transition: #{inspect(reason)}")
         %{state | execution_ledger_healthy: false}
     end
   end
@@ -3055,12 +3322,19 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_dispatch_effect(%State{} = state, running_entry) when is_map(running_entry) do
     case Map.get(running_entry, :idempotency_key) do
       idempotency_key when is_binary(idempotency_key) ->
-        case ExecutionLedger.mark_effect_completed(state.effects, idempotency_key) do
+        case ExecutionLedgerRouter.mark_effect_completed(state.execution_ledger_context, state.effects, idempotency_key) do
           {:ok, effects} ->
-            %{state | effects: effects}
+            state
+            |> Map.put(:effects, effects)
+            |> maybe_publish_execution_binding(Map.get(effects, idempotency_key))
 
           {:error, :missing_effect} ->
             Logger.error("Completed dispatch has no durable effect idempotency_key=#{idempotency_key}")
+
+            %{state | execution_ledger_healthy: false}
+
+          {:error, reason} ->
+            Logger.error("Completed dispatch lacks exact producer completion evidence idempotency_key=#{idempotency_key} reason=#{inspect(reason)}")
 
             %{state | execution_ledger_healthy: false}
         end
@@ -3071,6 +3345,43 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp complete_dispatch_effect(state, _running_entry), do: state
+
+  defp maybe_publish_execution_binding(
+         %State{execution_ledger_context: %{kind: :producer_v6} = context} = state,
+         %{status: :completed} = effect
+       ) do
+    task_down_observed_at_utc =
+      DateTime.utc_now() |> Calendar.strftime("%Y-%m-%dT%H:%M:%S.%3fZ")
+
+    case ExecutionBinding.publish(context, effect, task_down_observed_at_utc) do
+      {:ok, %{reference: reference}} ->
+        Logger.info("Published producer-v6 execution binding sha256=#{reference["sha256"]}")
+        state
+
+      {:error, reason} ->
+        Logger.error("Unable to publish producer-v6 execution binding: #{inspect(reason)}")
+        %{state | execution_ledger_healthy: false}
+    end
+  end
+
+  defp maybe_publish_execution_binding(state, _effect), do: state
+
+  defp maybe_observe_producer_management(%State{execution_ledger_context: %{kind: :producer_v6} = context} = state) do
+    case Management.observe(context) do
+      {:ok, published} when published > 0 ->
+        Logger.info("Published #{published} producer-v6 recurring management projection(s)")
+        state
+
+      {:ok, 0} ->
+        state
+
+      {:error, reason} ->
+        Logger.error("Unable to reconcile producer-v6 recurring management: #{inspect(reason)}")
+        %{state | execution_ledger_healthy: false}
+    end
+  end
+
+  defp maybe_observe_producer_management(state), do: state
 
   defp maybe_complete_dispatch_effect(state, running_entry, reason) do
     if dispatch_receipt_reason?(reason) do
@@ -3177,7 +3488,8 @@ defmodule SymphonyElixir.Orchestrator do
     do: {:ok, state}
 
   defp persist_execution_state_result(%State{} = state) do
-    case ExecutionLedger.persist(
+    case ExecutionLedgerRouter.persist(
+           state.execution_ledger_context,
            execution_ledger_root(state),
            state.blocked,
            state.retry_attempts,

@@ -165,6 +165,24 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @doc """
+  Returns the stable Linear user ID authenticated by the configured production credential.
+
+  Producer-v6 binds this server-returned identity into the immutable launch and
+  execution chain; display names and caller-supplied identity values are never used.
+  """
+  @spec viewer_identity() :: {:ok, String.t()} | {:error, term()}
+  def viewer_identity do
+    resolve_viewer_identity(&graphql/2)
+  end
+
+  @doc false
+  @spec viewer_identity_for_test((String.t(), map() -> {:ok, map()} | {:error, term()})) ::
+          {:ok, String.t()} | {:error, term()}
+  def viewer_identity_for_test(graphql_fun) when is_function(graphql_fun, 2) do
+    resolve_viewer_identity(graphql_fun)
+  end
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(state_names) when is_list(state_names) do
     normalized_states = Enum.map(state_names, &to_string/1) |> Enum.uniq()
@@ -640,14 +658,21 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp resolve_viewer_assignee_filter do
-    case graphql(@viewer_query, %{}) do
+    case viewer_identity() do
+      {:ok, viewer_id} ->
+        {:ok, %{configured_assignee: "me", match_values: MapSet.new([viewer_id])}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp resolve_viewer_identity(graphql_fun) do
+    case graphql_fun.(@viewer_query, %{}) do
       {:ok, %{"data" => %{"viewer" => viewer}}} when is_map(viewer) ->
         case assignee_id(viewer) do
-          nil ->
-            {:error, :missing_linear_viewer_identity}
-
-          viewer_id ->
-            {:ok, %{configured_assignee: "me", match_values: MapSet.new([viewer_id])}}
+          viewer_id when is_binary(viewer_id) and viewer_id != "" -> {:ok, viewer_id}
+          _ -> {:error, :missing_linear_viewer_identity}
         end
 
       {:ok, _body} ->
