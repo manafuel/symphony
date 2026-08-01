@@ -14,9 +14,8 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
   @doc false
   @spec validate_hook_receipt_for_test(binary()) :: :ok | {:error, term()}
   def validate_hook_receipt_for_test(bytes) when is_binary(bytes) do
-    with {:ok, receipt} <- Rfc8785Jcs.validate_canonical(bytes),
-         :ok <- validate_hook_receipt(receipt) do
-      :ok
+    with {:ok, receipt} <- Rfc8785Jcs.validate_canonical(bytes) do
+      validate_hook_receipt(receipt)
     end
   end
 
@@ -269,15 +268,14 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
          cycle when is_integer(cycle) and cycle in 1..2 <- ceo["originator_cycle_index"],
          runtime_sha when is_binary(runtime_sha) <-
            get_in(claim, ["runtime_binding", "runtime_binding_sha256"]),
-         {:ok, deadline} <- find_cycle_deadline(context, document, cycle, runtime_sha),
-         marker = TerminalTracker.marker_text(document, deadline) do
+         {:ok, deadline} <- find_cycle_deadline(context, document, cycle, runtime_sha) do
       {:ok,
        %{
          deadline_at_utc: deadline.deadline_at_utc,
          deadline_sha256: deadline.deadline_sha256,
          deadline_artifact_path: deadline.deadline_artifact_path,
          originator_cycle_index: cycle,
-         terminal_marker: marker
+         terminal_marker: TerminalTracker.marker_text(document, deadline)
        }}
     else
       {:error, reason} -> {:error, reason}
@@ -377,35 +375,11 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
     if length(paths) > 1_000 do
       {:error, :producer_cycle_deadline_enumeration_limit}
     else
-      matches =
-        Enum.filter(paths, fn path ->
-          with {:ok, bytes} <- File.read(path),
-               {:ok, deadline} <- Rfc8785Jcs.validate_canonical(bytes),
-               true <- deadline["schema_version"] == "manafuel.symphony_cycle_deadline.v1",
-               true <- deadline["originator_cycle_index"] == cycle,
-               true <- deadline["issue_id"] == document["issue_id"],
-               true <- deadline["identifier"] == document["identifier"],
-               true <- deadline["runtime_binding_sha256"] == runtime_sha,
-               {:ok, expiry, 0} <- DateTime.from_iso8601(deadline["deadline_at_utc"]),
-               true <- DateTime.compare(DateTime.utc_now(), expiry) == :lt do
-            true
-          else
-            _ -> false
-          end
-        end)
+      matches = Enum.filter(paths, &cycle_deadline_match?(&1, document, cycle, runtime_sha))
 
       case matches do
         [path] ->
-          with {:ok, bytes} <- File.read(path),
-               {:ok, deadline} <- Rfc8785Jcs.validate_canonical(bytes) do
-            {:ok,
-             %{
-               deadline_at_utc: deadline["deadline_at_utc"],
-               deadline_sha256: sha256(bytes),
-               deadline_artifact_path: Path.expand(path),
-               originator_cycle_index: cycle
-             }}
-          end
+          reopen_cycle_deadline(path, cycle)
 
         [] ->
           {:error, :producer_cycle_deadline_missing}
@@ -413,6 +387,35 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
         _ ->
           {:error, :producer_cycle_deadline_ambiguous}
       end
+    end
+  end
+
+  defp cycle_deadline_match?(path, document, cycle, runtime_sha) do
+    with {:ok, bytes} <- File.read(path),
+         {:ok, deadline} <- Rfc8785Jcs.validate_canonical(bytes),
+         true <- deadline["schema_version"] == "manafuel.symphony_cycle_deadline.v1",
+         true <- deadline["originator_cycle_index"] == cycle,
+         true <- deadline["issue_id"] == document["issue_id"],
+         true <- deadline["identifier"] == document["identifier"],
+         true <- deadline["runtime_binding_sha256"] == runtime_sha,
+         {:ok, expiry, 0} <- DateTime.from_iso8601(deadline["deadline_at_utc"]),
+         true <- DateTime.compare(DateTime.utc_now(), expiry) == :lt do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp reopen_cycle_deadline(path, cycle) do
+    with {:ok, bytes} <- File.read(path),
+         {:ok, deadline} <- Rfc8785Jcs.validate_canonical(bytes) do
+      {:ok,
+       %{
+         deadline_at_utc: deadline["deadline_at_utc"],
+         deadline_sha256: sha256(bytes),
+         deadline_artifact_path: Path.expand(path),
+         originator_cycle_index: cycle
+       }}
     end
   end
 
@@ -532,32 +535,35 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
     end)
   end
 
+  defp regular_files_in_shard(root, shard) do
+    shard_path = Path.join(root, shard)
+
+    case File.lstat(shard_path) do
+      {:ok, %File.Stat{type: :directory}} -> regular_files(shard_path)
+      _ -> []
+    end
+  end
+
+  defp regular_files(shard_path) do
+    case File.ls(shard_path) do
+      {:ok, files} ->
+        files
+        |> Enum.sort()
+        |> Enum.map(&Path.join(shard_path, &1))
+        |> Enum.filter(&File.regular?/1)
+
+      _ ->
+        []
+    end
+  end
+
   defp cas_paths(root) do
     case File.ls(root) do
       {:ok, shards} ->
         paths =
           shards
           |> Enum.sort()
-          |> Enum.flat_map(fn shard ->
-            shard_path = Path.join(root, shard)
-
-            case File.lstat(shard_path) do
-              {:ok, %File.Stat{type: :directory}} ->
-                case File.ls(shard_path) do
-                  {:ok, files} ->
-                    files
-                    |> Enum.sort()
-                    |> Enum.map(&Path.join(shard_path, &1))
-                    |> Enum.filter(&File.regular?/1)
-
-                  _ ->
-                    []
-                end
-
-              _ ->
-                []
-            end
-          end)
+          |> Enum.flat_map(&regular_files_in_shard(root, &1))
 
         {:ok, paths}
 

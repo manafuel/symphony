@@ -163,14 +163,12 @@ defmodule SymphonyElixir.ProducerContract do
              sha256(render_inputs_bytes)
            ),
          {:ok, rewrite_contract_bytes} <-
-           Rfc8785Jcs.encode(contract["workflow_rewrite_contract"]),
-         :ok <-
-           exact_value(
-             render,
-             "workflow_rewrite_contract_sha256",
-             sha256(rewrite_contract_bytes)
-           ) do
-      :ok
+           Rfc8785Jcs.encode(contract["workflow_rewrite_contract"]) do
+      exact_value(
+        render,
+        "workflow_rewrite_contract_sha256",
+        sha256(rewrite_contract_bytes)
+      )
     end
   end
 
@@ -216,9 +214,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_count(document, "ledger_install_recovery_table", 7),
          :ok <- exact_count(document, "stage_projections", 11),
          :ok <- exact_count(document, "evidence_requirements", 11),
-         :ok <- minimum_count(document, "transition_table", 11),
-         :ok <- minimum_count(document, "recovery_table", 12) do
-      :ok
+         :ok <- minimum_count(document, "transition_table", 11) do
+      minimum_count(document, "recovery_table", 12)
     end
   end
 
@@ -239,9 +236,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- validate_launch_runtime(document["runtime"]),
          :ok <- validate_launch_lock_evidence(document["lock_evidence"]),
          :ok <- validate_launch_files(document["files"]),
-         :ok <- validate_launch_workflow_render(document["workflow_render"]),
-         :ok <- validate_launch_binding(document["binding"]) do
-      :ok
+         :ok <- validate_launch_workflow_render(document["workflow_render"]) do
+      validate_launch_binding(document["binding"])
     end
   end
 
@@ -257,9 +253,8 @@ defmodule SymphonyElixir.ProducerContract do
            ),
          :ok <- absolute_path(source["git_root"], :launch_git_root),
          :ok <- lower_hex(source["head_sha"], 40, :launch_head_sha),
-         :ok <- exact_value(source, "protected_ref", "origin/main"),
-         :ok <- exact_value(source, "protected_ref_sha", source["head_sha"]) do
-      :ok
+         :ok <- exact_value(source, "protected_ref", "origin/main") do
+      exact_value(source, "protected_ref_sha", source["head_sha"])
     end
   end
 
@@ -275,9 +270,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(plugin, "plugin_id", "manafuel-codex@manafuel-local"),
          :ok <- non_empty(plugin["version"], :plugin_version),
          :ok <- lower_hex(plugin["package_sha256"], 64, :plugin_package_sha256),
-         :ok <- absolute_path(plugin["source_path"], :plugin_source_path),
-         :ok <- absolute_path(plugin["source_physical_path"], :plugin_source_physical_path) do
-      :ok
+         :ok <- absolute_path(plugin["source_path"], :plugin_source_path) do
+      absolute_path(plugin["source_physical_path"], :plugin_source_physical_path)
     end
   end
 
@@ -292,9 +286,8 @@ defmodule SymphonyElixir.ProducerContract do
            ),
          :ok <- positive_integer(runtime["port"], :runtime_port),
          :ok <- absolute_path(runtime["run_directory"], :runtime_run_directory),
-         :ok <- is_map_value(runtime["worker_process"], :runtime_worker_process),
-         :ok <- is_map_value(runtime["scheduled_task"], :runtime_scheduled_task) do
-      :ok
+         :ok <- map_value(runtime["worker_process"], :runtime_worker_process) do
+      map_value(runtime["scheduled_task"], :runtime_scheduled_task)
     end
   end
 
@@ -310,9 +303,8 @@ defmodule SymphonyElixir.ProducerContract do
            ),
          :ok <- exact_value(lock, "share_mode", "FILE_SHARE_READ"),
          :ok <- exact_value(lock, "generic_write_probe_win32_error", 32),
-         :ok <- exact_value(lock, "delete_probe_win32_error", 32),
-         :ok <- exact_value(lock, "locks_retained_through", "synchronous_mise_exit") do
-      :ok
+         :ok <- exact_value(lock, "delete_probe_win32_error", 32) do
+      exact_value(lock, "locks_retained_through", "synchronous_mise_exit")
     end
   end
 
@@ -326,36 +318,39 @@ defmodule SymphonyElixir.ProducerContract do
     )
 
     with :ok <- exact_keys(files, required, :launch_files) do
-      Enum.reduce_while(required, :ok, fn name, :ok ->
-        case files[name] do
-          file when is_map(file) ->
-            with :ok <-
-                   exact_keys(
-                     file,
-                     ~w(file_type lexical_path physical_path sha256 volume_serial_number file_id
-                        link_count length),
-                     {:launch_file, name}
-                   ),
-                 :ok <- exact_value(file, "file_type", "regular_file"),
-                 :ok <- absolute_path(file["lexical_path"], {:launch_file_path, name}),
-                 :ok <-
-                   absolute_path(file["physical_path"], {:launch_file_physical_path, name}),
-                 :ok <- lower_hex(file["sha256"], 64, {:launch_file_sha256, name}),
-                 :ok <- exact_value(file, "link_count", 1),
-                 :ok <- non_negative_integer(file["length"], {:launch_file_length, name}) do
-              {:cont, :ok}
-            else
-              {:error, reason} -> {:halt, {:error, reason}}
-            end
-
-          _ ->
-            {:halt, {:error, {:launch_file_not_an_object, name}}}
-        end
-      end)
+      validate_launch_file_entries(files, required)
     end
   end
 
   defp validate_launch_files(_files), do: {:error, :launch_files_not_an_object}
+
+  defp validate_launch_file_entries(files, required) do
+    Enum.reduce_while(required, :ok, fn name, :ok ->
+      case validate_launch_file(files[name], name) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_launch_file(file, name) when is_map(file) do
+    with :ok <-
+           exact_keys(
+             file,
+             ~w(file_type lexical_path physical_path sha256 volume_serial_number file_id
+                link_count length),
+             {:launch_file, name}
+           ),
+         :ok <- exact_value(file, "file_type", "regular_file"),
+         :ok <- absolute_path(file["lexical_path"], {:launch_file_path, name}),
+         :ok <- absolute_path(file["physical_path"], {:launch_file_physical_path, name}),
+         :ok <- lower_hex(file["sha256"], 64, {:launch_file_sha256, name}),
+         :ok <- exact_value(file, "link_count", 1) do
+      non_negative_integer(file["length"], {:launch_file_length, name})
+    end
+  end
+
+  defp validate_launch_file(_file, name), do: {:error, {:launch_file_not_an_object, name}}
 
   defp validate_launch_workflow_render(render) when is_map(render) do
     with :ok <- exact_keys(render, @launch_workflow_render_keys, :launch_workflow_render),
@@ -395,9 +390,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(render, "codex_app_server_history_mode", "paginated"),
          :ok <- exact_value(render, "line_endings", "lf"),
          :ok <- exact_value(render, "text_encoding", "utf-8-no-bom"),
-         :ok <- exact_value(render, "terminal_newline", false),
-         :ok <- exact_value(render, "decision", "PASS") do
-      :ok
+         :ok <- exact_value(render, "terminal_newline", false) do
+      exact_value(render, "decision", "PASS")
     end
   end
 
@@ -413,9 +407,8 @@ defmodule SymphonyElixir.ProducerContract do
            ),
          :ok <-
            exact_value(binding, "schema_version", "manafuel.symphony-runtime-binding.v1"),
-         :ok <- lower_hex(binding["vendor_binding_sha256"], 64, :vendor_binding_sha256),
-         :ok <- lower_hex(binding["runtime_binding_sha256"], 64, :runtime_binding_sha256) do
-      :ok
+         :ok <- lower_hex(binding["vendor_binding_sha256"], 64, :vendor_binding_sha256) do
+      lower_hex(binding["runtime_binding_sha256"], 64, :runtime_binding_sha256)
     end
   end
 
@@ -423,24 +416,30 @@ defmodule SymphonyElixir.ProducerContract do
 
   defp validate_ordered_fields(fields) when is_map(fields) do
     with :ok <- exact_keys(fields, @ordered_field_keys, :ordered_fields) do
-      Enum.reduce_while(@ordered_field_keys, :ok, fn name, :ok ->
-        case fields[name] do
-          values when is_list(values) and values != [] ->
-            if Enum.all?(values, &(is_binary(&1) and &1 != "")) and
-                 Enum.uniq(values) == values do
-              {:cont, :ok}
-            else
-              {:halt, {:error, {:invalid_ordered_field_projection, name}}}
-            end
-
-          _ ->
-            {:halt, {:error, {:invalid_ordered_field_projection, name}}}
-        end
-      end)
+      validate_ordered_field_entries(fields)
     end
   end
 
   defp validate_ordered_fields(_fields), do: {:error, :ordered_fields_not_an_object}
+
+  defp validate_ordered_field_entries(fields) do
+    Enum.reduce_while(@ordered_field_keys, :ok, fn name, :ok ->
+      validate_ordered_field_entry(fields[name], name)
+    end)
+  end
+
+  defp validate_ordered_field_entry(values, name) when is_list(values) and values != [] do
+    if valid_ordered_projection?(values),
+      do: {:cont, :ok},
+      else: {:halt, {:error, {:invalid_ordered_field_projection, name}}}
+  end
+
+  defp validate_ordered_field_entry(_values, name),
+    do: {:halt, {:error, {:invalid_ordered_field_projection, name}}}
+
+  defp valid_ordered_projection?(values) do
+    Enum.all?(values, &(is_binary(&1) and &1 != "")) and Enum.uniq(values) == values
+  end
 
   defp validate_constants(constants) when is_map(constants) do
     required = ~w(
@@ -466,9 +465,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(constants, "persistent_graph_dependency", false),
          :ok <- exact_value(constants, "azure_dependency", false),
          :ok <- exact_value(constants, "global_cutover", false),
-         :ok <- exact_value(constants, "parallel_cutover", false),
-         :ok <- exact_value(constants, "blue_green_cutover", false) do
-      :ok
+         :ok <- exact_value(constants, "parallel_cutover", false) do
+      exact_value(constants, "blue_green_cutover", false)
     end
   end
 
@@ -498,9 +496,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(contract, "text_encoding", "utf-8-no-bom"),
          :ok <- exact_value(contract, "line_endings", "lf"),
          :ok <- exact_value(contract, "terminal_newline", false),
-         :ok <- validate_startup_contract(contract["startup_contract"]),
-         :ok <- validate_rules(contract["rules"]) do
-      :ok
+         :ok <- validate_startup_contract(contract["startup_contract"]) do
+      validate_rules(contract["rules"])
     end
   end
 
@@ -526,9 +523,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(contract, "history_mode", "paginated"),
          :ok <- exact_value(contract, "workflow_hot_reload", false),
          :ok <- exact_value(contract, "general_workflow_fallback", false),
-         :ok <- exact_value(contract, "default_workflow_fallback", false),
-         :ok <- validate_concurrency(contract["concurrency"]) do
-      :ok
+         :ok <- exact_value(contract, "default_workflow_fallback", false) do
+      validate_concurrency(contract["concurrency"])
     end
   end
 
@@ -541,16 +537,20 @@ defmodule SymphonyElixir.ProducerContract do
     )
 
     with :ok <- exact_keys(concurrency, keys, :concurrency) do
-      Enum.reduce_while(keys, :ok, fn key, :ok ->
-        case exact_value(concurrency, key, 1) do
-          :ok -> {:cont, :ok}
-          error -> {:halt, error}
-        end
-      end)
+      validate_concurrency_values(concurrency, keys)
     end
   end
 
   defp validate_concurrency(_concurrency), do: {:error, :concurrency_not_an_object}
+
+  defp validate_concurrency_values(concurrency, keys) do
+    Enum.reduce_while(keys, :ok, fn key, :ok ->
+      case exact_value(concurrency, key, 1) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
   defp validate_cli_contract(contract) when is_map(contract) do
     keys = ~w(
@@ -570,9 +570,8 @@ defmodule SymphonyElixir.ProducerContract do
          :ok <- exact_value(contract, "latest_pointer", false),
          :ok <- exact_value(contract, "duplicate_arguments", false),
          :ok <- exact_value(contract, "logs_root_override", false),
-         :ok <- exact_value(contract, "port_override", false),
-         :ok <- exact_value(contract, "unknown_arguments", "reject") do
-      :ok
+         :ok <- exact_value(contract, "port_override", false) do
+      exact_value(contract, "unknown_arguments", "reject")
     end
   end
 
@@ -693,8 +692,8 @@ defmodule SymphonyElixir.ProducerContract do
   defp non_empty(value, _label) when is_binary(value) and value != "", do: :ok
   defp non_empty(_value, label), do: {:error, {:empty_value, label}}
 
-  defp is_map_value(value, _label) when is_map(value), do: :ok
-  defp is_map_value(_value, label), do: {:error, {:not_an_object, label}}
+  defp map_value(value, _label) when is_map(value), do: :ok
+  defp map_value(_value, label), do: {:error, {:not_an_object, label}}
 
   defp non_negative_integer(value, _label) when is_integer(value) and value >= 0, do: :ok
 

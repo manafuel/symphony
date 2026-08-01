@@ -42,14 +42,12 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding do
              get_in(launch, ["binding", "vendor_binding_sha256"]),
              reconstructed.binding["vendor_binding_sha256"],
              :vendor_binding_sha256_mismatch
-           ),
-         :ok <-
-           exact_digest(
-             get_in(launch, ["binding", "runtime_binding_sha256"]),
-             reconstructed.binding["runtime_binding_sha256"],
-             :runtime_binding_sha256_mismatch
            ) do
-      :ok
+      exact_digest(
+        get_in(launch, ["binding", "runtime_binding_sha256"]),
+        reconstructed.binding["runtime_binding_sha256"],
+        :runtime_binding_sha256_mismatch
+      )
     end
   end
 

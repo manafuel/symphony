@@ -60,22 +60,7 @@ defmodule SymphonyElixir.Rfc8785Jcs do
   defp normalize(%Jason.OrderedObject{values: values}) do
     Enum.reduce_while(values, {:ok, %{}, MapSet.new()}, fn
       {key, value}, {:ok, acc, seen} when is_binary(key) ->
-        cond do
-          MapSet.member?(seen, key) ->
-            {:halt, {:error, {:duplicate_object_name, key}}}
-
-          not String.valid?(key) ->
-            {:halt, {:error, :invalid_utf8_string}}
-
-          true ->
-            case normalize(value) do
-              {:ok, normalized} ->
-                {:cont, {:ok, Map.put(acc, key, normalized), MapSet.put(seen, key)}}
-
-              {:error, reason} ->
-                {:halt, {:error, reason}}
-            end
-        end
+        normalize_ordered_entry(key, value, acc, seen)
 
       _entry, _acc ->
         {:halt, {:error, :invalid_object_entry}}
@@ -91,14 +76,7 @@ defmodule SymphonyElixir.Rfc8785Jcs do
     |> Map.to_list()
     |> Enum.reduce_while({:ok, %{}}, fn
       {key, nested}, {:ok, acc} when is_binary(key) ->
-        if String.valid?(key) do
-          case normalize(nested) do
-            {:ok, normalized} -> {:cont, {:ok, Map.put(acc, key, normalized)}}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        else
-          {:halt, {:error, :invalid_utf8_string}}
-        end
+        normalize_map_entry(key, nested, acc)
 
       _entry, _acc ->
         {:halt, {:error, :non_string_object_name}}
@@ -124,4 +102,34 @@ defmodule SymphonyElixir.Rfc8785Jcs do
   defp normalize(value) when is_binary(value), do: if(String.valid?(value), do: {:ok, value}, else: {:error, :invalid_utf8_string})
   defp normalize(value) when is_boolean(value) or is_nil(value), do: {:ok, value}
   defp normalize(_value), do: {:error, :unsupported_json_value}
+
+  defp normalize_ordered_entry(key, value, acc, seen) do
+    cond do
+      MapSet.member?(seen, key) ->
+        {:halt, {:error, {:duplicate_object_name, key}}}
+
+      not String.valid?(key) ->
+        {:halt, {:error, :invalid_utf8_string}}
+
+      true ->
+        case normalize(value) do
+          {:ok, normalized} ->
+            {:cont, {:ok, Map.put(acc, key, normalized), MapSet.put(seen, key)}}
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+    end
+  end
+
+  defp normalize_map_entry(key, nested, acc) do
+    if String.valid?(key) do
+      case normalize(nested) do
+        {:ok, normalized} -> {:cont, {:ok, Map.put(acc, key, normalized)}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    else
+      {:halt, {:error, :invalid_utf8_string}}
+    end
+  end
 end

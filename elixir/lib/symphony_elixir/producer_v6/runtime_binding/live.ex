@@ -71,9 +71,16 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
              evidence
            ),
          {:ok, reconstructed} <-
-           RuntimeBinding.build_for_test(launch, contract_sha256, viewer_id, evidence),
-         :ok <- cache_live_binding(launch, contract, contract_sha256, workflow_path, viewer_id, evidence, reconstructed) do
-      :ok
+           RuntimeBinding.build_for_test(launch, contract_sha256, viewer_id, evidence) do
+      cache_live_binding(
+        launch,
+        contract,
+        contract_sha256,
+        workflow_path,
+        viewer_id,
+        evidence,
+        reconstructed
+      )
     end
   end
 
@@ -101,7 +108,15 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
 
   @spec full_binding(map(), Path.t(), module()) :: {:ok, map()} | {:error, term()}
   def full_binding(
-        %{launch: %{document: launch, path: launch_path, sha256: launch_sha256}, contract: %{document: contract, path: contract_path, sha256: contract_sha256}, workflow_path: workflow_path},
+        %{
+          launch: %{document: launch, path: launch_path, sha256: launch_sha256},
+          contract: %{
+            document: contract,
+            path: contract_path,
+            sha256: contract_sha256
+          },
+          workflow_path: workflow_path
+        },
         workspace_root,
         broker
       )
@@ -115,7 +130,8 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
            contract: %{document: contract, path: contract_path, sha256: contract_sha256},
            workflow_path: workflow_path
          },
-         {:ok, runtime_workflow_artifact} <- runtime_workflow_artifact(launch, workspace_root, broker, authority),
+         {:ok, runtime_workflow_artifact} <-
+           runtime_workflow_artifact(launch, workspace_root, broker, authority),
          {:ok, cli_contract_bytes} <- Rfc8785Jcs.encode(contract["production_cli_contract"]) do
       projection = cached.reconstructed.runtime_projection
       constants = contract["constants"]
@@ -369,9 +385,8 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
              expanded_root,
              ["status", "--porcelain=v1", "--untracked-files=all"],
              :source_status
-           ),
-         :ok <- exact(status, "", :source_repository_dirty) do
-      :ok
+           ) do
+      exact(status, "", :source_repository_dirty)
     end
   end
 
@@ -430,14 +445,12 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
              run_local["length"],
              render["runtime_workflow_length"],
              :rendered_workflow_length_drift
-           ),
-         :ok <-
-           exact(
-             get_in(render, ["render_inputs", "runtime_truth_source_sha"]),
-             get_in(launch, ["source", "head_sha"]),
-             :render_source_sha_drift
            ) do
-      :ok
+      exact(
+        get_in(render, ["render_inputs", "runtime_truth_source_sha"]),
+        get_in(launch, ["source", "head_sha"]),
+        :render_source_sha_drift
+      )
     end
   end
 
@@ -455,14 +468,12 @@ defmodule SymphonyElixir.ProducerV6.RuntimeBinding.Live do
              template_binding.sha256,
              render["tracked_workflow_sha256"],
              :tracked_workflow_sha256_drift
-           ),
-         :ok <-
-           exact(
-             template_binding.blob_oid,
-             render["tracked_workflow_blob_oid"],
-             :tracked_workflow_blob_drift
            ) do
-      :ok
+      exact(
+        template_binding.blob_oid,
+        render["tracked_workflow_blob_oid"],
+        :tracked_workflow_blob_drift
+      )
     end
   end
 

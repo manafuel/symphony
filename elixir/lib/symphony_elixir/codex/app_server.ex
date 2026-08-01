@@ -102,17 +102,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, workspace: workspace)
       end)
 
-    case start_turn(
-           port,
-           thread_id,
-           prompt,
-           issue,
-           workspace,
-           approval_policy,
-           turn_sandbox_policy,
-           client_user_message_id,
-           capture_history
-         ) do
+    turn_context = %{
+      thread_id: thread_id,
+      prompt: prompt,
+      issue: issue,
+      workspace: workspace,
+      approval_policy: approval_policy,
+      turn_sandbox_policy: turn_sandbox_policy,
+      client_user_message_id: client_user_message_id,
+      capture_history: capture_history
+    }
+
+    case start_turn(port, turn_context) do
       {:ok, %{turn: turn_payload} = start_evidence} ->
         turn_id = turn_payload["id"]
         session_id = "#{thread_id}-#{turn_id}"
@@ -489,36 +490,27 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(
-         port,
-         thread_id,
-         prompt,
-         issue,
-         workspace,
-         approval_policy,
-         turn_sandbox_policy,
-         client_user_message_id,
-         capture_history
-       ) do
+  defp start_turn(port, context) do
     params = %{
-      "threadId" => thread_id,
-      "input" => [%{"type" => "text", "text" => prompt}],
-      "cwd" => workspace,
-      "title" => "#{issue.identifier}: #{issue.title}",
-      "approvalPolicy" => approval_policy,
-      "sandboxPolicy" => turn_sandbox_policy
+      "threadId" => context.thread_id,
+      "input" => [%{"type" => "text", "text" => context.prompt}],
+      "cwd" => context.workspace,
+      "title" => "#{context.issue.identifier}: #{context.issue.title}",
+      "approvalPolicy" => context.approval_policy,
+      "sandboxPolicy" => context.turn_sandbox_policy
     }
 
     params =
-      if is_binary(client_user_message_id) and client_user_message_id != "",
-        do: Map.put(params, "clientUserMessageId", client_user_message_id),
+      if is_binary(context.client_user_message_id) and context.client_user_message_id != "",
+        do: Map.put(params, "clientUserMessageId", context.client_user_message_id),
         else: params
 
     send_message(port, %{"method" => "turn/start", "id" => @turn_start_id, "params" => params})
 
     with {:ok, %{"turn" => %{"id" => turn_id} = turn}} when is_binary(turn_id) <-
            await_response(port, @turn_start_id),
-         {:ok, history} <- maybe_read_thread_history(port, thread_id, capture_history) do
+         {:ok, history} <-
+           maybe_read_thread_history(port, context.thread_id, context.capture_history) do
       {:ok, %{turn: turn, history: history}}
     end
   end

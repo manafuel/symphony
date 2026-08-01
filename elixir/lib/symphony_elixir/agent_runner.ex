@@ -102,16 +102,19 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp codex_message_handler(recipient, issue, producer_v6) do
     fn message ->
-      if producer_v6 and message[:event] == :session_started do
-        case producer_checkpoint(recipient, issue, :turn_started, message, true) do
-          :ok -> :ok
-          {:error, reason} -> exit({:producer_checkpoint_failed, reason})
-        end
-      end
-
+      maybe_checkpoint_session_started(recipient, issue, message, producer_v6)
       send_codex_update(recipient, issue, message)
     end
   end
+
+  defp maybe_checkpoint_session_started(recipient, issue, %{event: :session_started} = message, true) do
+    case producer_checkpoint(recipient, issue, :turn_started, message, true) do
+      :ok -> :ok
+      {:error, reason} -> exit({:producer_checkpoint_failed, reason})
+    end
+  end
+
+  defp maybe_checkpoint_session_started(_recipient, _issue, _message, _producer_v6), do: :ok
 
   defp producer_checkpoint(_recipient, _issue, _kind, _payload, false), do: :ok
 
@@ -162,42 +165,36 @@ defmodule SymphonyElixir.AgentRunner do
              %{thread_id: session.thread_id, metadata: session.metadata},
              producer_v6
            ) do
+      run_context = %{
+        app_session: session,
+        workspace: workspace,
+        codex_update_recipient: codex_update_recipient,
+        opts: opts,
+        issue_state_fetcher: issue_state_fetcher,
+        max_turns: max_turns,
+        closeout: closeout
+      }
+
       try do
-        do_run_codex_turns(
-          session,
-          workspace,
-          issue,
-          codex_update_recipient,
-          opts,
-          issue_state_fetcher,
-          1,
-          max_turns,
-          closeout
-        )
+        do_run_codex_turns(run_context, issue, 1)
       after
         AppServer.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(
-         app_session,
-         workspace,
-         issue,
-         codex_update_recipient,
-         opts,
-         issue_state_fetcher,
-         turn_number,
-         max_turns,
-         closeout
-       ) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns) |> append_producer_closeout(closeout)
-    producer_v6 = Keyword.get(opts, :producer_v6, false)
+  defp do_run_codex_turns(context, issue, turn_number) do
+    prompt =
+      issue
+      |> build_turn_prompt(context.opts, turn_number, context.max_turns)
+      |> append_producer_closeout(context.closeout)
+
+    producer_v6 = Keyword.get(context.opts, :producer_v6, false)
     intent = Lifecycle.turn_intent(turn_number, prompt)
 
     with :ok <-
            producer_checkpoint(
-             codex_update_recipient,
+             context.codex_update_recipient,
              issue,
              :turn_start_intent,
              intent,
@@ -205,70 +202,93 @@ defmodule SymphonyElixir.AgentRunner do
            ),
          {:ok, turn_session} <-
            AppServer.run_turn(
-             app_session,
+             context.app_session,
              prompt,
              issue,
-             on_message: codex_message_handler(codex_update_recipient, issue, producer_v6),
+             on_message: codex_message_handler(context.codex_update_recipient, issue, producer_v6),
              client_user_message_id: if(producer_v6, do: intent["client_user_message_id"]),
              capture_history: producer_v6
            ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{context.workspace} turn=#{turn_number}/#{context.max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          with :ok <-
-                 commit_turn_terminal(
-                   codex_update_recipient,
-                   issue,
-                   turn_session,
-                   closeout,
-                   false,
-                   producer_v6
-                 ) do
-            Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-            do_run_codex_turns(
-              app_session,
-              workspace,
-              refreshed_issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              turn_number + 1,
-              max_turns,
-              closeout
-            )
-          end
-
-        {:continue, refreshed_issue} ->
-          with :ok <-
-                 commit_turn_terminal(
-                   codex_update_recipient,
-                   issue,
-                   turn_session,
-                   closeout,
-                   false,
-                   producer_v6
-                 ) do
-            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-            :ok
-          end
-
-        {:done, _refreshed_issue} ->
-          commit_turn_terminal(
-            codex_update_recipient,
-            issue,
-            turn_session,
-            closeout,
-            true,
-            producer_v6
-          )
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+      issue
+      |> continue_with_issue?(context.issue_state_fetcher)
+      |> handle_turn_completion(context, issue, turn_session, turn_number, producer_v6)
     end
   end
+
+  defp handle_turn_completion(
+         {:continue, refreshed_issue},
+         context,
+         issue,
+         turn_session,
+         turn_number,
+         producer_v6
+       )
+       when turn_number < context.max_turns do
+    with :ok <-
+           commit_turn_terminal(
+             context.codex_update_recipient,
+             issue,
+             turn_session,
+             context.closeout,
+             false,
+             producer_v6
+           ) do
+      Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{context.max_turns}")
+      do_run_codex_turns(context, refreshed_issue, turn_number + 1)
+    end
+  end
+
+  defp handle_turn_completion(
+         {:continue, refreshed_issue},
+         context,
+         issue,
+         turn_session,
+         _turn_number,
+         producer_v6
+       ) do
+    with :ok <-
+           commit_turn_terminal(
+             context.codex_update_recipient,
+             issue,
+             turn_session,
+             context.closeout,
+             false,
+             producer_v6
+           ) do
+      Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+      :ok
+    end
+  end
+
+  defp handle_turn_completion(
+         {:done, _refreshed_issue},
+         context,
+         issue,
+         turn_session,
+         _turn_number,
+         producer_v6
+       ) do
+    commit_turn_terminal(
+      context.codex_update_recipient,
+      issue,
+      turn_session,
+      context.closeout,
+      true,
+      producer_v6
+    )
+  end
+
+  defp handle_turn_completion(
+         {:error, reason},
+         _context,
+         _issue,
+         _turn_session,
+         _turn_number,
+         _producer_v6
+       ),
+       do: {:error, reason}
 
   defp producer_thread_checkpoint(recipient, issue, payload, true) do
     case producer_checkpoint(recipient, issue, :thread_ready, payload, true) do

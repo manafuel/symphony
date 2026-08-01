@@ -38,6 +38,8 @@ defmodule SymphonyElixir.ProducerReceipts do
   end
 
   @doc false
+  @spec reserve_dispatch_with_broker(map(), pos_integer(), non_neg_integer(), Path.t(), map(), map(), module()) ::
+          {:ok, map()} | {:error, term()}
   def reserve_dispatch_with_broker(
         issue,
         dispatch_sequence,
@@ -76,6 +78,8 @@ defmodule SymphonyElixir.ProducerReceipts do
     do: commit_transition_with_broker(workspace_root, authority, input, Broker)
 
   @doc false
+  @spec commit_transition_with_broker(Path.t(), map(), map(), module()) ::
+          {:ok, map()} | {:error, term()}
   def commit_transition_with_broker(workspace_root, authority, input, broker)
       when is_binary(workspace_root) and is_map(authority) and is_map(input) and
              is_atom(broker) do
@@ -91,15 +95,7 @@ defmodule SymphonyElixir.ProducerReceipts do
            ) do
       case commit_under_lock(workspace_root, authority, input, lock, broker) do
         {:ok, result} ->
-          case broker.release_lock(
-                 lock.reference,
-                 input.deadline_at_utc,
-                 workspace_root,
-                 authority
-               ) do
-            :ok -> {:ok, result}
-            {:error, reason} -> {:error, {:ledger_lock_release_failed_after_commit, reason}}
-          end
+          release_committed_lock(result, lock, input, workspace_root, authority, broker)
 
         {:error, reason} ->
           {:error, {:producer_transition_commit_blocked_lock_retained, reason, lock.reference}}
@@ -109,6 +105,13 @@ defmodule SymphonyElixir.ProducerReceipts do
 
   def commit_transition_with_broker(_workspace_root, _authority, _input, _broker),
     do: {:error, :invalid_producer_transition_input}
+
+  defp release_committed_lock(result, lock, input, workspace_root, authority, broker) do
+    case broker.release_lock(lock.reference, input.deadline_at_utc, workspace_root, authority) do
+      :ok -> {:ok, result}
+      {:error, reason} -> {:error, {:ledger_lock_release_failed_after_commit, reason}}
+    end
+  end
 
   defp commit_under_lock(workspace_root, authority, input, lock, broker) do
     issue = issue_projection(input.issue)
@@ -163,17 +166,16 @@ defmodule SymphonyElixir.ProducerReceipts do
            ),
          generation_id = random_hex(16),
          intent =
-           intent_document(
-             input,
-             issue,
-             dispatch,
-             sequence,
-             milestone_name,
-             transition_reference,
-             before.fingerprints,
-             generation_id,
-             lock_receipt_reference
-           ),
+           intent_document(input, %{
+             issue: issue,
+             dispatch: dispatch,
+             sequence: sequence,
+             name: milestone_name,
+             transition: transition_reference,
+             before: before.fingerprints,
+             generation: generation_id,
+             lock: lock_receipt_reference
+           }),
          :ok <- exact_projection(intent, authority, "ledger_install_intent_core"),
          {:ok, intent_reference} <-
            broker.publish_cas(
@@ -210,17 +212,16 @@ defmodule SymphonyElixir.ProducerReceipts do
            ),
          expected_after = expected_after(generation_id, ledger_sha256, byte_size(ledger_bytes)),
          plan =
-           plan_document(
-             input,
-             issue,
-             dispatch,
-             sequence,
-             intent_reference,
-             effect_sha256,
-             before.cas,
-             expected_after,
-             lock_receipt_reference
-           ),
+           plan_document(input, %{
+             issue: issue,
+             dispatch: dispatch,
+             sequence: sequence,
+             intent: intent_reference,
+             effect_sha: effect_sha256,
+             before_cas: before.cas,
+             after_pair: expected_after,
+             lock: lock_receipt_reference
+           }),
          :ok <- exact_projection(plan, authority, "ledger_install_plan"),
          {:ok, plan_reference} <-
            broker.publish_cas(
@@ -252,18 +253,17 @@ defmodule SymphonyElixir.ProducerReceipts do
          {:ok, installed_after, destination_results} <-
            installed_after(broker_receipt, generation_id, ledger_sha256, byte_size(ledger_bytes)),
          result =
-           result_document(
-             input,
-             issue,
-             dispatch,
-             sequence,
-             intent_reference,
-             plan_reference,
-             effect_sha256,
-             broker_reference,
-             destination_results,
-             installed_after
-           ),
+           result_document(input, %{
+             issue: issue,
+             dispatch: dispatch,
+             sequence: sequence,
+             intent: intent_reference,
+             plan: plan_reference,
+             effect_sha: effect_sha256,
+             broker: broker_reference,
+             outcomes: destination_results,
+             after_pair: installed_after
+           }),
          :ok <- exact_projection(result, authority, "ledger_install_result"),
          {:ok, result_reference} <-
            broker.publish_cas(
@@ -374,22 +374,22 @@ defmodule SymphonyElixir.ProducerReceipts do
     }
   end
 
-  defp intent_document(input, issue, dispatch, sequence, name, transition, before, generation, lock) do
+  defp intent_document(input, attrs) do
     %{
       "schema_version" => @intent_schema,
       "claim_session_id" => input.dispatch_allocation.document["claim_session_id"],
       "idempotency_key" => input.dispatch_allocation.document["idempotency_key"],
-      "issue" => issue,
-      "dispatch" => dispatch,
+      "issue" => attrs.issue,
+      "dispatch" => attrs.dispatch,
       "transaction_id" => random_hex(16),
       "process_epoch_id" => input.process_epoch_id,
-      "milestone_sequence" => sequence,
-      "milestone_name" => name,
-      "transition_receipt" => transition,
-      "ledger_before" => before,
-      "target_generation_id" => generation,
-      "target_transition_head_sha256" => transition["sha256"],
-      "lock" => lock,
+      "milestone_sequence" => attrs.sequence,
+      "milestone_name" => attrs.name,
+      "transition_receipt" => attrs.transition,
+      "ledger_before" => attrs.before,
+      "target_generation_id" => attrs.generation,
+      "target_transition_head_sha256" => attrs.transition["sha256"],
+      "lock" => attrs.lock,
       "created_at_utc" => now(),
       "decision" => "PREPARED"
     }
@@ -448,18 +448,18 @@ defmodule SymphonyElixir.ProducerReceipts do
     }
   end
 
-  defp plan_document(input, issue, dispatch, sequence, intent, effect_sha, before_cas, after_pair, lock) do
+  defp plan_document(input, attrs) do
     %{
       "schema_version" => @plan_schema,
       "claim_session_id" => input.dispatch_allocation.document["claim_session_id"],
       "idempotency_key" => input.dispatch_allocation.document["idempotency_key"],
-      "issue" => issue,
-      "dispatch" => dispatch,
-      "milestone_sequence" => sequence,
-      "install_intent_core" => intent,
-      "target_effect_sha256" => effect_sha,
-      "ledger_before_cas" => before_cas,
-      "ledger_after" => after_pair,
+      "issue" => attrs.issue,
+      "dispatch" => attrs.dispatch,
+      "milestone_sequence" => attrs.sequence,
+      "install_intent_core" => attrs.intent,
+      "target_effect_sha256" => attrs.effect_sha,
+      "ledger_before_cas" => attrs.before_cas,
+      "ledger_after" => attrs.after_pair,
       "installation_mode" => "DURABLE_SEQUENTIAL_PAIR",
       "installation_order" => ["PREVIOUS", "CURRENT"],
       "destination_commit_contract" => [
@@ -471,27 +471,27 @@ defmodule SymphonyElixir.ProducerReceipts do
         "handle_reopen_identity_and_bytes"
       ],
       "split_recovery" => "BLOCK_WITH_IMMUTABLE_JOURNAL_NO_RESTART_INSTALL",
-      "lock" => lock,
+      "lock" => attrs.lock,
       "prepared_at_utc" => now(),
       "decision" => "READY_TO_INSTALL"
     }
   end
 
-  defp result_document(input, issue, dispatch, sequence, intent, plan, effect_sha, broker, outcomes, after_pair) do
+  defp result_document(input, attrs) do
     %{
       "schema_version" => @result_schema,
       "claim_session_id" => input.dispatch_allocation.document["claim_session_id"],
       "idempotency_key" => input.dispatch_allocation.document["idempotency_key"],
-      "issue" => issue,
-      "dispatch" => dispatch,
-      "milestone_sequence" => sequence,
-      "install_intent_core" => intent,
-      "install_plan" => plan,
-      "target_effect_sha256" => effect_sha,
-      "broker_result" => broker,
-      "destination_results" => outcomes,
-      "ledger_after" => after_pair,
-      "installed_at_utc" => List.last(outcomes)["completed_at_utc"],
+      "issue" => attrs.issue,
+      "dispatch" => attrs.dispatch,
+      "milestone_sequence" => attrs.sequence,
+      "install_intent_core" => attrs.intent,
+      "install_plan" => attrs.plan,
+      "target_effect_sha256" => attrs.effect_sha,
+      "broker_result" => attrs.broker,
+      "destination_results" => attrs.outcomes,
+      "ledger_after" => attrs.after_pair,
+      "installed_at_utc" => List.last(attrs.outcomes)["completed_at_utc"],
       "decision" => "PASS"
     }
   end

@@ -16,6 +16,8 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
   end
 
   @doc false
+  @spec publish_with_broker(map(), map(), String.t(), module()) ::
+          {:ok, map()} | {:error, term()}
   def publish_with_broker(
         %{kind: :producer_v6} = context,
         %{document: document},
@@ -112,6 +114,7 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
     do: {:error, :invalid_producer_execution_binding_input}
 
   @doc false
+  @spec build_for_test(map(), map()) :: {:ok, map()} | {:error, term()}
   def build_for_test(context, fields) when is_map(context) and is_map(fields) do
     binding = Map.put(fields, "schema_version", @schema)
 
@@ -122,17 +125,21 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
   end
 
   defp completed_effect(document) do
-    if document["effect_schema_version"] == "symphony.execution_effect.v6" and
-         document["source_ledger_schema_version"] == "symphony.execution_ledger.v6" and
-         document["attempt_phase"] == "completed" and document["disposition"] == "completed" and
-         document["last_milestone"] == "completed" and
-         document["completion_outcome"] == "issue_terminal" and
-         is_map(document["terminal_tracker"]) and is_list(document["milestones"]) and
-         length(document["milestones"]) == document["milestone_sequence"] do
-      :ok
-    else
-      {:error, :producer_execution_effect_not_completed}
-    end
+    requirements = [
+      document["effect_schema_version"] == "symphony.execution_effect.v6",
+      document["source_ledger_schema_version"] == "symphony.execution_ledger.v6",
+      document["attempt_phase"] == "completed",
+      document["disposition"] == "completed",
+      document["last_milestone"] == "completed",
+      document["completion_outcome"] == "issue_terminal",
+      is_map(document["terminal_tracker"]),
+      is_list(document["milestones"]),
+      length(document["milestones"]) == document["milestone_sequence"]
+    ]
+
+    if Enum.all?(requirements),
+      do: :ok,
+      else: {:error, :producer_execution_effect_not_completed}
   end
 
   defp contract_manifest(
@@ -395,27 +402,49 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
          paths = Path.wildcard(Path.join(root, "**/*.json"), match_dot: true) |> Enum.sort(),
          true <- length(paths) <= max_effects * max_receipts do
       Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, rows} ->
-        with true <- File.regular?(path),
-             {:ok, bytes} <- File.read(path),
-             true <- byte_size(bytes) <= maximum_bytes,
-             digest = sha256(bytes),
-             true <- Path.basename(path, ".json") == digest,
-             {:ok, document} <- Rfc8785Jcs.validate_canonical(bytes),
-             :ok <- exact_projection(context, projection, document),
-             {:ok, identity} <- broker.inspect(path, workspace_root, context),
-             {:ok, reference} <- immutable_reference(identity, workspace_root),
-             true <- reference["sha256"] == digest and reference["length"] == byte_size(bytes) do
-          {:cont, {:ok, rows ++ [%{document: document, reference: reference}]}}
-        else
-          false -> {:halt, {:error, {:producer_cas_enumeration_drift, root_name}}}
-          {:error, reason} -> {:halt, {:error, reason}}
-          _ -> {:halt, {:error, {:producer_cas_enumeration_invalid, root_name}}}
-        end
+        append_cas_document(
+          path,
+          rows,
+          root_name,
+          projection,
+          maximum_bytes,
+          workspace_root,
+          context,
+          broker
+        )
       end)
     else
       false -> {:error, {:producer_cas_enumeration_contract_invalid, root_name}}
       {:error, reason} -> {:error, reason}
       _ -> {:error, {:producer_cas_enumeration_invalid, root_name}}
+    end
+  end
+
+  defp append_cas_document(
+         path,
+         rows,
+         root_name,
+         projection,
+         maximum_bytes,
+         workspace_root,
+         context,
+         broker
+       ) do
+    with true <- File.regular?(path),
+         {:ok, bytes} <- File.read(path),
+         true <- byte_size(bytes) <= maximum_bytes,
+         digest = sha256(bytes),
+         true <- Path.basename(path, ".json") == digest,
+         {:ok, document} <- Rfc8785Jcs.validate_canonical(bytes),
+         :ok <- exact_projection(context, projection, document),
+         {:ok, identity} <- broker.inspect(path, workspace_root, context),
+         {:ok, reference} <- immutable_reference(identity, workspace_root),
+         true <- reference["sha256"] == digest and reference["length"] == byte_size(bytes) do
+      {:cont, {:ok, rows ++ [%{document: document, reference: reference}]}}
+    else
+      false -> {:halt, {:error, {:producer_cas_enumeration_drift, root_name}}}
+      {:error, reason} -> {:halt, {:error, reason}}
+      _ -> {:halt, {:error, {:producer_cas_enumeration_invalid, root_name}}}
     end
   end
 

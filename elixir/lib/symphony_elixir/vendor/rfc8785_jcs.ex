@@ -38,6 +38,7 @@ defmodule Jcs do
   encoded in UTF-8, according to the particular rules in
   [RFC 8785 - 3.2.2.2 - Serialization of Strings](https://www.rfc-editor.org/rfc/rfc8785#name-serialization-of-strings).
   """
+  @spec encode(term()) :: String.t()
   def encode(data) do
     otp = System.otp_release()
 
@@ -64,26 +65,17 @@ defmodule Jcs do
   MUST be serialized "as is" unless it is equivalent to U+005C (\) or
   U+0022 ("), which MUST be serialized as "\\" and "\"", respectively.
   """
+  @spec encode_basestring(String.t()) :: String.t()
   def encode_basestring(s) do
-    String.to_charlist(s)
-    |> Enum.map(fn cp ->
-      cond do
-        cp == 0x22 ->
-          "\\\""
-
-        cp == 0x5C ->
-          "\\\\"
-
-        cp < 0x20 ->
-          Map.get_lazy(@specials, cp, fn -> escape_unicode(cp) end)
-
-        true ->
-          # "as is"
-          to_string([cp])
-      end
-    end)
-    |> Enum.join("")
+    s
+    |> String.to_charlist()
+    |> Enum.map_join("", &encode_codepoint/1)
   end
+
+  defp encode_codepoint(0x22), do: "\\\""
+  defp encode_codepoint(0x5C), do: "\\\\"
+  defp encode_codepoint(cp) when cp < 0x20, do: Map.get_lazy(@specials, cp, fn -> escape_unicode(cp) end)
+  defp encode_codepoint(cp), do: to_string([cp])
 
   @doc """
   Returns a JSON representation of a string, escaping characters
@@ -94,32 +86,26 @@ defmodule Jcs do
   See `encode_basestring/1` for details of the encoding of values
   U+005C (\), U+0022 (") and U+0000 through U+001F.
   """
+  @spec encode_basestring_ascii(String.t()) :: String.t()
   def encode_basestring_ascii(s) do
-    String.to_charlist(s)
-    |> Enum.map(fn cp ->
-      cond do
-        cp == 0x22 ->
-          "\\\""
-
-        cp == 0x5C ->
-          "\\\\"
-
-        # \u encode anything other than the basic ascii set
-        cp < 0x20 || cp > 0x7E ->
-          Map.get_lazy(@specials, cp, fn -> escape_unicode(cp) end)
-
-        true ->
-          # Basic ascii left "as is"
-          to_string([cp])
-      end
-    end)
-    |> Enum.join("")
+    s
+    |> String.to_charlist()
+    |> Enum.map_join("", &encode_ascii_codepoint/1)
   end
+
+  defp encode_ascii_codepoint(0x22), do: "\\\""
+  defp encode_ascii_codepoint(0x5C), do: "\\\\"
+
+  defp encode_ascii_codepoint(cp) when cp < 0x20 or cp > 0x7E,
+    do: Map.get_lazy(@specials, cp, fn -> escape_unicode(cp) end)
+
+  defp encode_ascii_codepoint(cp), do: to_string([cp])
 
   @doc """
   Given either a String, or single codepoint, returns a string
   concatenating  "\\uhhhh" and "\\u{hhhhh}" elements.
   """
+  @spec escape_unicode(integer() | String.t() | [integer()]) :: String.t()
   def escape_unicode(n) when is_integer(n) do
     if n < 0x10000 do
       if n >= 0xD800 && n <= 0xDFFF do
@@ -152,6 +138,7 @@ defmodule Jcs do
   returns a flattened list of UTF-16 encoded values. This list
   can be used to sort object names as specified in the RFC.
   """
+  @spec to_utf16(integer() | String.t() | [integer()]) :: [integer()]
   def to_utf16(n) when is_integer(n) do
     if n < 0x10000 do
       if n >= 0xD800 && n <= 0xDFFF do
@@ -225,23 +212,20 @@ defmodule Jcs do
   end
 
   defp canonicalize(data, output) when is_list(data) do
-    encoded_list =
-      Enum.map(data, fn entry -> canonicalize(entry, []) end)
-      |> Enum.join(",")
+    encoded_list = Enum.map_join(data, ",", &canonicalize(&1, []))
 
     output ++ ["[", encoded_list, "]"]
   end
 
   defp canonicalize(data, output) when is_map(data) do
     dict =
-      Map.to_list(data)
+      data
+      |> Map.to_list()
       |> Enum.map(&stringify_name/1)
       |> Enum.sort(&sort_properties/2)
-      |> Enum.map(fn {name, value} ->
-        {encode_basestring(name), canonicalize(value, [])}
+      |> Enum.map_join(",", fn {name, value} ->
+        ["\"", encode_basestring(name), "\":", canonicalize(value, [])]
       end)
-      |> Enum.map(fn {name, value} -> ["\"", name, "\":", value] end)
-      |> Enum.join(",")
 
     output ++ ["{", dict, "}"]
   end
@@ -255,12 +239,12 @@ defmodule Jcs do
   defp stringify_name({name, value}) when is_atom(name), do: {Atom.to_string(name), value}
 
   defp stringify_name({name, value}) do
-    try do
-      {String.Chars.to_string(name), value}
-    rescue
-      _ ->
-        raise ArgumentError, "Invalid JSON object name #{inspect(name)}"
-    end
+    {String.Chars.to_string(name), value}
+  rescue
+    _error ->
+      reraise ArgumentError,
+              [message: "Invalid JSON object name #{inspect(name)}"],
+              __STACKTRACE__
   end
 
   defp sort_properties({name1, _value1}, {name2, _value2}) do
@@ -347,56 +331,38 @@ defmodule Jcs do
   #   choose the one that is even. Note that k is the number of digits
   #   in the decimal representation of s and that s is not divisible by 10.
   defp number_to_string(number) do
-    # Use Erlang Ryu implementation
-    s = :erlang.float_to_binary(number, [:short])
+    original = :erlang.float_to_binary(number, [:short])
+    serialized = expand_exponent(original, Regex.run(~r/^(\d)[.](.+)e([-]?)(\d+)$/, original))
+    normalize_exponent(serialized)
+  end
 
-    s =
-      case Regex.run(~r/^(\d)[.](.+)e([-]?)(\d+)$/, s) do
-        nil ->
-          s
+  defp expand_exponent(original, nil), do: original
 
-        [_, x, decimals, "-", k] ->
-          k = String.to_integer(k)
+  defp expand_exponent(original, [_, first, decimals, "-", exponent]) do
+    exponent = String.to_integer(exponent)
+    digits = if(decimals == "0", do: first, else: first <> decimals)
 
-          decimals =
-            if decimals == "0" do
-              x
-            else
-              x <> decimals
-            end
+    if exponent in 0..6,
+      do: "0." <> String.duplicate("0", exponent - 1) <> digits,
+      else: original
+  end
 
-          # "1.0e-6" -> "0.000001"
-          # k = 6
-          # decimals = "1"
-          # String.duplicate = "00000"
-          if k >= 0 && k <= 6 do
-            "0." <> String.duplicate("0", k - 1) <> decimals
-          else
-            s
-          end
+  defp expand_exponent(original, [_, first, decimals, _sign, exponent]) do
+    exponent = String.to_integer(exponent) + 1
+    digits = first <> decimals
 
-        [_, x, decimals, _, k] ->
-          k = String.to_integer(k) + 1
-          decimals = x <> decimals
+    if exponent in 0..21,
+      do: String.pad_trailing(digits, exponent, "0"),
+      else: original
+  end
 
-          if k >= 0 && k <= 21 do
-            # "9.999999999999997e20" -> "999999999999999700000"
-            # k = 21
-            # decimals = "9999999999999997"
-            String.pad_trailing(decimals, k, "0")
-          else
-            s
-          end
-      end
-
-    if String.contains?(s, "e") do
-      # Change "<N>.0e21" to "<N>e21"
-      s = Regex.replace(~r/\.0e/, s, "e")
-      # Change "<MANTISSA>e21" to "<MANTISSA>e+21"
-      Regex.replace(~r/e(\d)/, s, "e+\\1")
+  defp normalize_exponent(serialized) do
+    if String.contains?(serialized, "e") do
+      serialized
+      |> then(&Regex.replace(~r/\.0e/, &1, "e"))
+      |> then(&Regex.replace(~r/e(\d)/, &1, "e+\\1"))
     else
-      # Change "<NUMBER>.0" to "<NUMBER>" (integer)
-      String.replace_trailing(s, ".0", "")
+      String.replace_trailing(serialized, ".0", "")
     end
   end
 end

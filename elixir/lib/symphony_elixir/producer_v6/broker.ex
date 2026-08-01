@@ -347,7 +347,7 @@ defmodule SymphonyElixir.ProducerV6.Broker do
     do: {:error, :broker_contract_authority_missing}
 
   defp build_request(action, parameters, workspace_root, deadline_at_utc) do
-    with true <- Format.producer_datetime?(deadline_at_utc) do
+    if Format.producer_datetime?(deadline_at_utc) do
       {:ok,
        %{
          "schema_version" => @request_schema,
@@ -358,7 +358,7 @@ defmodule SymphonyElixir.ProducerV6.Broker do
          "parameters" => stringify_keys(parameters)
        }}
     else
-      _ -> {:error, :broker_deadline_invalid}
+      {:error, :broker_deadline_invalid}
     end
   end
 
@@ -564,9 +564,8 @@ defmodule SymphonyElixir.ProducerV6.Broker do
                workspace_root,
                authority,
                deadline
-             ),
-           :ok <- validate_bootstrap_result(receipt["result"], target) do
-        :ok
+             ) do
+        validate_bootstrap_result(receipt["result"], target)
       end
 
     case result do

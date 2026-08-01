@@ -1,1 +1,2 @@
 test/fixtures/status_dashboard_snapshots/* linguist-generated=true
+test/fixtures/WORKFLOW.production.template.md text eol=lf

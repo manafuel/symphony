@@ -42,6 +42,8 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
   end
 
   @doc false
+  @spec capture_with(map(), map(), map(), map(), function(), module()) ::
+          {:ok, map()} | {:error, term()}
   def capture_with(context, effect, server_event, deadline, graphql, broker)
       when is_function(graphql, 2) and is_atom(broker) do
     document = effect.document
@@ -63,47 +65,23 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
          {:ok, comment} <- exact_comment(comments, marker_text, viewer_id),
          {:ok, done} <- exact_done(history, state["id"], viewer_id),
          {:ok, refreshed_at} <- producer_now(),
-         :ok <- chronology(turn, comment, done, server_event, refreshed_at, deadline),
-         tracker = %{
-           "issue_id" => issue_id,
-           "identifier" => identifier,
-           "deadline_at_utc" => deadline.deadline_at_utc,
-           "deadline_sha256" => deadline.deadline_sha256,
-           "refreshed_at_utc" => refreshed_at,
-           "state_readback" => state_ref,
-           "state" => %{
-             "id" => state["id"],
-             "name" => "Done",
-             "type" => "completed",
-             "updated_at_utc" => normalize_time(issue["updatedAt"])
-           },
-           "final_worker_comment" => %{
-             "id" => comment["id"],
-             "author_id" => viewer_id,
-             "created_at_utc" => normalize_time(comment["createdAt"]),
-             "marker" => %{
-               "prefix" => "symphony:final:",
-               "identifier" => identifier,
-               "deadline_at_utc" => deadline.deadline_at_utc,
-               "deadline_sha256" => deadline.deadline_sha256,
-               "claim_session_id" => document["claim_session_id"],
-               "idempotency_key" => document["idempotency_key"],
-               "occurrences" => 1
-             },
-             "body_sha256" => sha256(marker_text)
-           },
-           "done_transition" => %{
-             "history_id" => done["id"],
-             "from_state_id" => done["fromStateId"],
-             "to_state_id" => done["toStateId"],
-             "actor_id" => done["actorId"],
-             "created_at_utc" => normalize_time(done["createdAt"])
-           },
-           "comment_pagination" => %{comment_proof | "match_count" => 1},
-           "history_pagination" => %{history_proof | "match_count" => 1},
-           "server_turn_terminal_event" => server_event.reference
-         } do
-      {:ok, tracker}
+         :ok <- chronology(turn, comment, done, server_event, refreshed_at, deadline) do
+      {:ok,
+       tracker_document(document, deadline, %{
+         identifier: identifier,
+         issue_id: issue_id,
+         viewer_id: viewer_id,
+         marker_text: marker_text,
+         state_ref: state_ref,
+         issue: issue,
+         state: state,
+         comment: comment,
+         done: done,
+         comment_proof: comment_proof,
+         history_proof: history_proof,
+         server_event: server_event,
+         refreshed_at: refreshed_at
+       })}
     else
       false -> {:error, :producer_terminal_tracker_identity_invalid}
       {:error, reason} -> {:error, reason}
@@ -111,6 +89,49 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
     end
   end
 
+  defp tracker_document(document, deadline, attrs) do
+    %{
+      "issue_id" => attrs.issue_id,
+      "identifier" => attrs.identifier,
+      "deadline_at_utc" => deadline.deadline_at_utc,
+      "deadline_sha256" => deadline.deadline_sha256,
+      "refreshed_at_utc" => attrs.refreshed_at,
+      "state_readback" => attrs.state_ref,
+      "state" => %{
+        "id" => attrs.state["id"],
+        "name" => "Done",
+        "type" => "completed",
+        "updated_at_utc" => normalize_time(attrs.issue["updatedAt"])
+      },
+      "final_worker_comment" => %{
+        "id" => attrs.comment["id"],
+        "author_id" => attrs.viewer_id,
+        "created_at_utc" => normalize_time(attrs.comment["createdAt"]),
+        "marker" => %{
+          "prefix" => "symphony:final:",
+          "identifier" => attrs.identifier,
+          "deadline_at_utc" => deadline.deadline_at_utc,
+          "deadline_sha256" => deadline.deadline_sha256,
+          "claim_session_id" => document["claim_session_id"],
+          "idempotency_key" => document["idempotency_key"],
+          "occurrences" => 1
+        },
+        "body_sha256" => sha256(attrs.marker_text)
+      },
+      "done_transition" => %{
+        "history_id" => attrs.done["id"],
+        "from_state_id" => attrs.done["fromStateId"],
+        "to_state_id" => attrs.done["toStateId"],
+        "actor_id" => attrs.done["actorId"],
+        "created_at_utc" => normalize_time(attrs.done["createdAt"])
+      },
+      "comment_pagination" => %{attrs.comment_proof | "match_count" => 1},
+      "history_pagination" => %{attrs.history_proof | "match_count" => 1},
+      "server_turn_terminal_event" => attrs.server_event.reference
+    }
+  end
+
+  @spec marker_text(map(), map()) :: String.t()
   def marker_text(%{"identifier" => identifier, "claim_session_id" => claim, "idempotency_key" => key}, deadline) do
     "symphony:final:" <>
       identifier <>
@@ -137,56 +158,66 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
     do: {:error, :producer_terminal_state_response_invalid}
 
   defp paginate(identifier, kind, query, context, deadline, graphql, broker) do
-    do_paginate(
-      identifier,
-      kind,
-      query,
-      context,
-      deadline,
-      graphql,
-      broker,
-      nil,
-      1,
-      [],
-      [],
-      MapSet.new(),
-      MapSet.new()
-    )
+    do_paginate(%{
+      identifier: identifier,
+      kind: kind,
+      query: query,
+      context: context,
+      deadline: deadline,
+      graphql: graphql,
+      broker: broker,
+      after_cursor: nil,
+      ordinal: 1,
+      rows: [],
+      pages: [],
+      seen: MapSet.new(),
+      seen_cursors: MapSet.new()
+    })
   end
 
-  defp do_paginate(_identifier, kind, _query, _context, _deadline, _graphql, _broker, _after, ordinal, _rows, _pages, _seen, _seen_cursors)
-       when ordinal > @max_pages,
-       do: {:error, {:producer_terminal_pagination_limit, kind}}
+  defp do_paginate(%{ordinal: ordinal, kind: kind}) when ordinal > @max_pages,
+    do: {:error, {:producer_terminal_pagination_limit, kind}}
 
-  defp do_paginate(identifier, kind, query, context, deadline, graphql, broker, after_cursor, ordinal, rows, pages, seen, seen_cursors) do
-    with {:ok, body} <- graphql.(query, %{id: identifier, after: after_cursor}),
-         {:ok, reference} <- publish(body, root_name(kind), context, deadline, broker),
-         {:ok, nodes, page_info} <- connection(body, kind),
-         :ok <- bounded_unique_nodes(nodes, seen),
+  defp do_paginate(state) do
+    with {:ok, body} <-
+           state.graphql.(state.query, %{id: state.identifier, after: state.after_cursor}),
+         {:ok, reference} <-
+           publish(body, root_name(state.kind), state.context, state.deadline, state.broker),
+         {:ok, nodes, page_info} <- connection(body, state.kind),
+         :ok <- bounded_unique_nodes(nodes, state.seen),
          has_next when is_boolean(has_next) <- page_info["hasNextPage"],
          end_cursor <- page_info["endCursor"],
-         :ok <- cursor_rule(has_next, end_cursor, after_cursor, seen_cursors),
-         page = %{
-           "ordinal" => ordinal,
-           "requested_after" => after_cursor,
-           "end_cursor" => end_cursor,
-           "has_next_page" => has_next,
-           "node_count" => length(nodes),
-           "raw_response" => reference
-         },
-         next_rows = rows ++ nodes,
-         next_pages = pages ++ [page],
-         next_seen = Enum.reduce(nodes, seen, &MapSet.put(&2, &1["id"])),
-         next_seen_cursors = maybe_add_cursor(seen_cursors, end_cursor) do
-      if has_next do
-        do_paginate(identifier, kind, query, context, deadline, graphql, broker, end_cursor, ordinal + 1, next_rows, next_pages, next_seen, next_seen_cursors)
-      else
-        {:ok, next_rows, pagination_proof(kind, next_pages)}
-      end
+         :ok <- cursor_rule(has_next, end_cursor, state.after_cursor, state.seen_cursors) do
+      continue_pagination(state, nodes, reference, has_next, end_cursor)
     else
       {:error, reason} -> {:error, reason}
-      _ -> {:error, {:producer_terminal_page_invalid, kind}}
+      _ -> {:error, {:producer_terminal_page_invalid, state.kind}}
     end
+  end
+
+  defp continue_pagination(state, nodes, reference, has_next, end_cursor) do
+    page = %{
+      "ordinal" => state.ordinal,
+      "requested_after" => state.after_cursor,
+      "end_cursor" => end_cursor,
+      "has_next_page" => has_next,
+      "node_count" => length(nodes),
+      "raw_response" => reference
+    }
+
+    next_state = %{
+      state
+      | after_cursor: end_cursor,
+        ordinal: state.ordinal + 1,
+        rows: state.rows ++ nodes,
+        pages: state.pages ++ [page],
+        seen: Enum.reduce(nodes, state.seen, &MapSet.put(&2, &1["id"])),
+        seen_cursors: maybe_add_cursor(state.seen_cursors, end_cursor)
+    }
+
+    if has_next,
+      do: do_paginate(next_state),
+      else: {:ok, next_state.rows, pagination_proof(state.kind, next_state.pages)}
   end
 
   defp connection(%{"data" => %{"issue" => issue}}, kind) when is_map(issue) do

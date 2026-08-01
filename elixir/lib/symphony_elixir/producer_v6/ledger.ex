@@ -24,6 +24,8 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
   end
 
   @doc false
+  @spec load_with_inspector_for_test(Path.t(), authority(), function()) ::
+          {:ok, %{blocked: map(), retrying: map(), effects: map()}} | {:error, term()}
   def load_with_inspector_for_test(workspace_root, authority, inspector)
       when is_function(inspector, 3),
       do: do_load(workspace_root, authority, inspector)
@@ -61,6 +63,14 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
     do: {:error, :producer_v6_transaction_broker_required}
 
   @doc false
+  @spec verify_unchanged_with_inspector_for_test(
+          Path.t(),
+          authority(),
+          map(),
+          map(),
+          map(),
+          function()
+        ) :: :ok | {:error, term()}
   def verify_unchanged_with_inspector_for_test(
         workspace_root,
         authority,
@@ -104,8 +114,8 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
            exact_relative_path(previous, ".symphony-state/execution.previous.json") do
       {:ok,
        %{
-         current: Path.join(workspace_root, String.replace(current, "/", "\\")),
-         previous: Path.join(workspace_root, String.replace(previous, "/", "\\"))
+         current: Path.join([workspace_root | Path.split(current)]),
+         previous: Path.join([workspace_root | Path.split(previous)])
        }}
     end
   end
@@ -149,9 +159,8 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
          :ok <- generation_id(ledger["generation_id"]),
          :ok <- producer_datetime(ledger["generated_at"]),
          :ok <- exact_value(ledger, "blocked", []),
-         :ok <- exact_value(ledger, "retrying", []),
-         {:ok, effects} <- effect_map(ledger["effects"], max_effects, contract) do
-      {:ok, effects}
+         :ok <- exact_value(ledger, "retrying", []) do
+      effect_map(ledger["effects"], max_effects, contract)
     end
   end
 
@@ -179,11 +188,9 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
   defp generation_id(_value), do: {:error, :producer_v6_generation_id_invalid}
 
   defp producer_datetime(value) when is_binary(value) do
-    with true <- Format.producer_datetime?(value) do
-      :ok
-    else
-      _ -> {:error, :producer_v6_generated_at_invalid}
-    end
+    if Format.producer_datetime?(value),
+      do: :ok,
+      else: {:error, :producer_v6_generated_at_invalid}
   end
 
   defp producer_datetime(_value), do: {:error, :producer_v6_generated_at_invalid}

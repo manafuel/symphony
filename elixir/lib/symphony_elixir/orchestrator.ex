@@ -3150,10 +3150,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp apply_producer_checkpoint(state, _issue_id, _running, key, effect, :turn_started, message) do
-    with {:ok, started} <- Lifecycle.turn_started(state.execution_ledger_context, effect, message) do
-      checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_started/4, started)
-    else
-      {:error, reason} -> {:error, reason, state}
+    case Lifecycle.turn_started(state.execution_ledger_context, effect, message) do
+      {:ok, started} ->
+        checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_started/4, started)
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
@@ -3166,11 +3168,12 @@ defmodule SymphonyElixir.Orchestrator do
          :turn_terminal,
          turn_session
        ) do
-    with {:ok, terminal} <-
-           Lifecycle.turn_terminal(state.execution_ledger_context, effect, turn_session) do
-      checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_terminal/4, terminal)
-    else
-      {:error, reason} -> {:error, reason, state}
+    case Lifecycle.turn_terminal(state.execution_ledger_context, effect, turn_session) do
+      {:ok, terminal} ->
+        checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_turn_terminal/4, terminal)
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
@@ -3322,7 +3325,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_dispatch_effect(%State{} = state, running_entry) when is_map(running_entry) do
     case Map.get(running_entry, :idempotency_key) do
       idempotency_key when is_binary(idempotency_key) ->
-        case ExecutionLedgerRouter.mark_effect_completed(state.execution_ledger_context, state.effects, idempotency_key) do
+        case ExecutionLedgerRouter.mark_effect_completed(
+               state.execution_ledger_context,
+               state.effects,
+               idempotency_key
+             ) do
           {:ok, effects} ->
             state
             |> Map.put(:effects, effects)

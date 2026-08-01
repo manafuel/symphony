@@ -8,6 +8,7 @@ defmodule SymphonyElixir.ProducerV6.Execution do
   """
 
   alias SymphonyElixir.{ProducerReceipts, Rfc8785Jcs}
+  alias SymphonyElixir.ProducerV6.Broker
   alias SymphonyElixir.ProducerV6.RuntimeBinding.Live
 
   @deadline_seconds 7_200
@@ -21,11 +22,13 @@ defmodule SymphonyElixir.ProducerV6.Execution do
       issue,
       dispatch_sequence,
       retry_attempt,
-      SymphonyElixir.ProducerV6.Broker
+      Broker
     )
   end
 
   @doc false
+  @spec reserve_with_broker(map(), map(), map(), pos_integer(), non_neg_integer(), module()) ::
+          {:ok, map()} | {:error, term()}
   def reserve_with_broker(
         %{kind: :producer_v6} = context,
         effects,
@@ -305,7 +308,7 @@ defmodule SymphonyElixir.ProducerV6.Execution do
   def verify_state(workspace_root, context, effects) when is_map(effects) do
     current = Path.join(workspace_root, ".symphony-state\\execution.json")
 
-    with {:ok, identity} <- SymphonyElixir.ProducerV6.Broker.inspect(current, workspace_root, context),
+    with {:ok, identity} <- Broker.inspect(current, workspace_root, context),
          {:ok, bytes} <- File.read(current),
          true <- identity["sha256"] == sha256(bytes),
          {:ok, ledger} <- Rfc8785Jcs.validate_canonical(bytes),
@@ -426,9 +429,9 @@ defmodule SymphonyElixir.ProducerV6.Execution do
   end
 
   defp duplicate_for_issue(effects, issue_id) do
-    case Enum.find_value(effects, fn {_key, effect} -> if effect.issue_id == issue_id, do: effect end) do
+    case Enum.find(effects, fn {_key, effect} -> effect.issue_id == issue_id end) do
       nil -> {:error, :producer_v6_duplicate_resolution_failed}
-      effect -> {:duplicate, effect}
+      {_key, effect} -> {:duplicate, effect}
     end
   end
 

@@ -15,6 +15,7 @@ defmodule SymphonyElixir.ProducerV6.Management do
   def observe(context), do: observe_with_broker(context, Broker)
 
   @doc false
+  @spec observe_with_broker(map(), module()) :: {:ok, non_neg_integer()} | {:error, term()}
   def observe_with_broker(%{kind: :producer_v6} = context, broker) when is_atom(broker) do
     workspace_root = workspace_root(context)
     cycle_sequence = next_cycle_sequence()
@@ -39,20 +40,16 @@ defmodule SymphonyElixir.ProducerV6.Management do
              broker
            ) do
       Enum.reduce_while(executions, {:ok, 0}, fn execution, {:ok, published} ->
-        case reconcile(
-               execution,
-               receipts,
-               projections,
-               cycle_sequence,
-               workspace_root,
-               context,
-               broker
-             ) do
-          {:ok, :already_observed} -> {:cont, {:ok, published}}
-          {:ok, :not_later_yet} -> {:cont, {:ok, published}}
-          {:ok, :published} -> {:cont, {:ok, published + 1}}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
+        reconcile_execution(
+          execution,
+          receipts,
+          projections,
+          cycle_sequence,
+          workspace_root,
+          context,
+          broker,
+          published
+        )
       end)
     else
       false -> {:error, :producer_management_workspace_invalid}
@@ -63,6 +60,32 @@ defmodule SymphonyElixir.ProducerV6.Management do
 
   def observe_with_broker(_context, _broker),
     do: {:error, :invalid_producer_management_context}
+
+  defp reconcile_execution(
+         execution,
+         receipts,
+         projections,
+         cycle_sequence,
+         workspace_root,
+         context,
+         broker,
+         published
+       ) do
+    case reconcile(
+           execution,
+           receipts,
+           projections,
+           cycle_sequence,
+           workspace_root,
+           context,
+           broker
+         ) do
+      {:ok, :already_observed} -> {:cont, {:ok, published}}
+      {:ok, :not_later_yet} -> {:cont, {:ok, published}}
+      {:ok, :published} -> {:cont, {:ok, published + 1}}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
 
   defp reconcile(
          execution,
@@ -109,6 +132,7 @@ defmodule SymphonyElixir.ProducerV6.Management do
     reference = execution.reference
 
     observed_at_utc = now()
+
     management_process_epoch_id =
       process_epoch_id(reference, cycle_sequence, observed_at_utc)
 
@@ -153,18 +177,17 @@ defmodule SymphonyElixir.ProducerV6.Management do
            ),
          true <- before_reference["sha256"] != after_reference["sha256"],
          receipt =
-           receipt_document(
-             binding,
-             reference,
-             ceo_reference,
-             tracker,
-             tracker_sha256,
-             before_reference,
-             after_reference,
-             cycle_sequence,
-             management_process_epoch_id,
-             observed_at_utc
-           ),
+           receipt_document(binding, %{
+             execution_reference: reference,
+             ceo_reference: ceo_reference,
+             tracker: tracker,
+             tracker_sha256: tracker_sha256,
+             before_reference: before_reference,
+             after_reference: after_reference,
+             cycle_sequence: cycle_sequence,
+             management_process_epoch_id: management_process_epoch_id,
+             observed_at_utc: observed_at_utc
+           }),
          :ok <- exact_projection(context, "natural_management_receipt", receipt),
          {:ok, receipt_reference} <-
            broker.publish_cas(
@@ -175,17 +198,16 @@ defmodule SymphonyElixir.ProducerV6.Management do
              deadline
            ),
          projection =
-           projection_document(
-             binding,
-             reference,
-             ceo_reference,
-             ceo_process_epoch_id,
-             tracker,
-             tracker_sha256,
-             receipt_reference,
-             management_process_epoch_id,
-             observed_at_utc
-           ),
+           projection_document(binding, %{
+             execution_reference: reference,
+             ceo_reference: ceo_reference,
+             ceo_process_epoch_id: ceo_process_epoch_id,
+             tracker: tracker,
+             tracker_sha256: tracker_sha256,
+             receipt_reference: receipt_reference,
+             management_process_epoch_id: management_process_epoch_id,
+             observed_at_utc: observed_at_utc
+           }),
          :ok <- exact_projection(context, "management_state_projection", projection),
          {:ok, _projection_reference} <-
            broker.publish_cas(
@@ -205,27 +227,16 @@ defmodule SymphonyElixir.ProducerV6.Management do
     end
   end
 
-  defp receipt_document(
-         binding,
-         execution_reference,
-         ceo_reference,
-         tracker,
-         tracker_sha256,
-         before_reference,
-         after_reference,
-         cycle_sequence,
-         management_process_epoch_id,
-         observed_at_utc
-       ) do
+  defp receipt_document(binding, attrs) do
     %{
       "schema_version" => @receipt_schema,
       "publisher_kind" => "SYMPHONY_RECURRING",
-      "publisher_process_epoch_id" => management_process_epoch_id,
-      "publisher_cycle_sequence" => cycle_sequence,
-      "ceo_prioritization_receipt" => ceo_reference,
-      "ceo_prioritization_receipt_sha256" => ceo_reference["sha256"],
-      "execution_binding" => execution_reference,
-      "execution_binding_sha256" => execution_reference["sha256"],
+      "publisher_process_epoch_id" => attrs.management_process_epoch_id,
+      "publisher_cycle_sequence" => attrs.cycle_sequence,
+      "ceo_prioritization_receipt" => attrs.ceo_reference,
+      "ceo_prioritization_receipt_sha256" => attrs.ceo_reference["sha256"],
+      "execution_binding" => attrs.execution_reference,
+      "execution_binding_sha256" => attrs.execution_reference["sha256"],
       "source_ledger_schema_version" => "symphony.execution_ledger.v6",
       "issue" => %{
         "id" => get_in(binding, ["effect_identity", "issue_id"]),
@@ -234,35 +245,25 @@ defmodule SymphonyElixir.ProducerV6.Management do
       "claim_session_id" => get_in(binding, ["effect_identity", "claim_session_id"]),
       "idempotency_key" => get_in(binding, ["effect_identity", "idempotency_key"]),
       "completion_outcome" => binding["completion_outcome"],
-      "terminal_tracker" => tracker,
-      "terminal_tracker_sha256" => tracker_sha256,
-      "done_state_id" => get_in(tracker, ["state", "id"]),
-      "done_state_type" => get_in(tracker, ["state", "type"]),
-      "final_worker_marker" => get_in(tracker, ["final_worker_comment", "marker"]),
-      "final_worker_comment_author_id" => get_in(tracker, ["final_worker_comment", "author_id"]),
-      "done_history_id" => get_in(tracker, ["done_transition", "history_id"]),
-      "done_history_actor_id" => get_in(tracker, ["done_transition", "actor_id"]),
+      "terminal_tracker" => attrs.tracker,
+      "terminal_tracker_sha256" => attrs.tracker_sha256,
+      "done_state_id" => get_in(attrs.tracker, ["state", "id"]),
+      "done_state_type" => get_in(attrs.tracker, ["state", "type"]),
+      "final_worker_marker" => get_in(attrs.tracker, ["final_worker_comment", "marker"]),
+      "final_worker_comment_author_id" => get_in(attrs.tracker, ["final_worker_comment", "author_id"]),
+      "done_history_id" => get_in(attrs.tracker, ["done_transition", "history_id"]),
+      "done_history_actor_id" => get_in(attrs.tracker, ["done_transition", "actor_id"]),
       "completed_at_utc" => binding["completed_at_utc"],
       "task_down_observed_at_utc" => binding["task_down_observed_at_utc"],
-      "management_state_before" => before_reference,
-      "management_state_after" => after_reference,
+      "management_state_before" => attrs.before_reference,
+      "management_state_after" => attrs.after_reference,
       "management_action" => "ISSUE_TERMINAL_STATE_RECONCILED",
-      "observed_at_utc" => observed_at_utc,
+      "observed_at_utc" => attrs.observed_at_utc,
       "decision" => "PASS"
     }
   end
 
-  defp projection_document(
-         binding,
-         execution_reference,
-         ceo_reference,
-         ceo_process_epoch_id,
-         tracker,
-         tracker_sha256,
-         receipt_reference,
-         management_process_epoch_id,
-         observed_at_utc
-       ) do
+  defp projection_document(binding, attrs) do
     %{
       "schema_version" => @projection_schema,
       "issue" => %{
@@ -271,19 +272,19 @@ defmodule SymphonyElixir.ProducerV6.Management do
       },
       "claim_session_id" => get_in(binding, ["effect_identity", "claim_session_id"]),
       "idempotency_key" => get_in(binding, ["effect_identity", "idempotency_key"]),
-      "execution_binding" => execution_reference,
-      "execution_binding_sha256" => execution_reference["sha256"],
+      "execution_binding" => attrs.execution_reference,
+      "execution_binding_sha256" => attrs.execution_reference["sha256"],
       "source_ledger_schema_version" => "symphony.execution_ledger.v6",
-      "ceo_prioritization_receipt" => ceo_reference,
-      "ceo_prioritization_receipt_sha256" => ceo_reference["sha256"],
-      "ceo_originator_process_epoch_id" => ceo_process_epoch_id,
-      "terminal_tracker" => tracker,
-      "terminal_tracker_sha256" => tracker_sha256,
-      "natural_management_receipt" => receipt_reference,
-      "natural_management_receipt_sha256" => receipt_reference["sha256"],
-      "management_process_epoch_id" => management_process_epoch_id,
+      "ceo_prioritization_receipt" => attrs.ceo_reference,
+      "ceo_prioritization_receipt_sha256" => attrs.ceo_reference["sha256"],
+      "ceo_originator_process_epoch_id" => attrs.ceo_process_epoch_id,
+      "terminal_tracker" => attrs.tracker,
+      "terminal_tracker_sha256" => attrs.tracker_sha256,
+      "natural_management_receipt" => attrs.receipt_reference,
+      "natural_management_receipt_sha256" => attrs.receipt_reference["sha256"],
+      "management_process_epoch_id" => attrs.management_process_epoch_id,
       "task_down_observed_at_utc" => binding["task_down_observed_at_utc"],
-      "management_observed_at_utc" => observed_at_utc,
+      "management_observed_at_utc" => attrs.observed_at_utc,
       "causal_order" => "V6_ISSUE_TERMINAL_THEN_NATURAL_MANAGEMENT",
       "decision" => "PASS"
     }
@@ -311,27 +312,49 @@ defmodule SymphonyElixir.ProducerV6.Management do
          paths = Path.wildcard(Path.join(root, "**/*.json"), match_dot: true) |> Enum.sort(),
          true <- length(paths) <= max_effects do
       Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, rows} ->
-        with true <- File.regular?(path),
-             {:ok, bytes} <- File.read(path),
-             true <- byte_size(bytes) <= maximum_bytes,
-             digest = sha256(bytes),
-             true <- Path.basename(path, ".json") == digest,
-             {:ok, document} <- Rfc8785Jcs.validate_canonical(bytes),
-             :ok <- exact_projection(context, projection, document),
-             {:ok, identity} <- broker.inspect(path, workspace_root, context),
-             {:ok, reference} <- immutable_reference(identity, workspace_root),
-             true <- reference["sha256"] == digest and reference["length"] == byte_size(bytes) do
-          {:cont, {:ok, rows ++ [%{document: document, reference: reference}]}}
-        else
-          false -> {:halt, {:error, {:producer_management_cas_drift, root_name}}}
-          {:error, reason} -> {:halt, {:error, reason}}
-          _ -> {:halt, {:error, {:producer_management_cas_invalid, root_name}}}
-        end
+        append_cas_document(
+          path,
+          rows,
+          root_name,
+          projection,
+          maximum_bytes,
+          workspace_root,
+          context,
+          broker
+        )
       end)
     else
       false -> {:error, {:producer_management_cas_contract_invalid, root_name}}
       {:error, reason} -> {:error, reason}
       _ -> {:error, {:producer_management_cas_invalid, root_name}}
+    end
+  end
+
+  defp append_cas_document(
+         path,
+         rows,
+         root_name,
+         projection,
+         maximum_bytes,
+         workspace_root,
+         context,
+         broker
+       ) do
+    with true <- File.regular?(path),
+         {:ok, bytes} <- File.read(path),
+         true <- byte_size(bytes) <= maximum_bytes,
+         digest = sha256(bytes),
+         true <- Path.basename(path, ".json") == digest,
+         {:ok, document} <- Rfc8785Jcs.validate_canonical(bytes),
+         :ok <- exact_projection(context, projection, document),
+         {:ok, identity} <- broker.inspect(path, workspace_root, context),
+         {:ok, reference} <- immutable_reference(identity, workspace_root),
+         true <- reference["sha256"] == digest and reference["length"] == byte_size(bytes) do
+      {:cont, {:ok, rows ++ [%{document: document, reference: reference}]}}
+    else
+      false -> {:halt, {:error, {:producer_management_cas_drift, root_name}}}
+      {:error, reason} -> {:halt, {:error, reason}}
+      _ -> {:halt, {:error, {:producer_management_cas_invalid, root_name}}}
     end
   end
 
