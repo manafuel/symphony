@@ -501,10 +501,10 @@ defmodule SymphonyElixir.ProducerReceipts do
       "lock" => absolute_reference(lock, workspace_root),
       "target_ledger_path" => absolute_path(target, workspace_root),
       "maximum_bytes" => 20_000,
-      "expected_previous" => broker_expected(before.identities["previous"]),
-      "expected_current" => broker_expected(before.identities["current"]),
-      "previous_path" => Path.join(workspace_root, ".symphony-state\\execution.previous.json"),
-      "current_path" => Path.join(workspace_root, ".symphony-state\\execution.json")
+      "expected_previous" => broker_expected(before.identities["previous"], workspace_root),
+      "expected_current" => broker_expected(before.identities["current"], workspace_root),
+      "previous_path" => Broker.reference_wire_path(workspace_root, ".symphony-state/execution.previous.json"),
+      "current_path" => Broker.reference_wire_path(workspace_root, ".symphony-state/execution.json")
     }
 
     broker.invoke_receipt(
@@ -703,10 +703,12 @@ defmodule SymphonyElixir.ProducerReceipts do
 
   defp turn_number(evidence), do: Map.get(evidence, "turn_number") || Map.get(evidence, :turn_number)
 
-  defp broker_expected(nil), do: nil
+  defp broker_expected(nil, _workspace_root), do: nil
 
-  defp broker_expected(identity) do
-    Map.take(identity, ~w(path physical_path volume_id file_id file_type link_count sha256 length))
+  defp broker_expected(identity, workspace_root) do
+    identity
+    |> Map.take(~w(path physical_path volume_id file_id file_type link_count sha256 length))
+    |> Map.update!("path", &Broker.reference_wire_path(workspace_root, &1))
   end
 
   defp absolute_reference(reference, workspace_root) do
@@ -715,7 +717,7 @@ defmodule SymphonyElixir.ProducerReceipts do
   end
 
   defp absolute_path(reference, workspace_root) do
-    Path.join(workspace_root, String.replace(reference["path"], "/", "\\"))
+    Broker.reference_wire_path(workspace_root, reference["path"])
   end
 
   defp producer_datetime(value) when is_binary(value) do

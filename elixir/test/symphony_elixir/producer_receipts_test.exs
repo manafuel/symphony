@@ -2,7 +2,7 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.{ProducerReceipts, Rfc8785Jcs}
-  alias SymphonyElixir.ProducerV6.Execution
+  alias SymphonyElixir.ProducerV6.{Broker, Execution}
 
   @contract_path Path.expand("../fixtures/symphony-producer-execution-contract.json", __DIR__)
   @deadline "2027-08-01T14:00:00.000Z"
@@ -72,6 +72,25 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
       :ok
     end
 
+    def inspect(path, _workspace_root, _authority) do
+      record({:inspect, path})
+      {:ok, bytes} = File.read(path)
+
+      file_id =
+        if String.ends_with?(path, "execution.previous.json"),
+          do: "inspected-previous-file",
+          else: "inspected-current-file"
+
+      {:ok,
+       reference(
+         path,
+         path,
+         sha256(bytes),
+         byte_size(bytes),
+         file_id
+       )}
+    end
+
     def publish_cas(document, root_name, workspace_root, authority, _deadline) do
       record({:publish_cas, root_name})
       relative_root = get_in(authority, [:contract, :document, "path_roots", root_name])
@@ -91,7 +110,13 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
           deadline
         ) do
       record(:install_dual_ledger)
-      relative = Path.relative_to(parameters["target_ledger_path"], workspace_root) |> String.replace("\\", "/")
+      Process.put({__MODULE__, :install_parameters}, parameters)
+
+      relative =
+        parameters["target_ledger_path"]
+        |> String.replace_prefix(projected_wire_root(workspace_root) <> "/", "")
+        |> String.replace("\\", "/")
+
       bytes = Process.get({__MODULE__, :cas, relative})
       digest = sha256(bytes)
       length = byte_size(bytes)
@@ -118,6 +143,7 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
     end
 
     def calls, do: Process.get({__MODULE__, :calls}, []) |> Enum.reverse()
+    def install_parameters, do: Process.get({__MODULE__, :install_parameters})
 
     defp publish(document, relative_root, workspace_root) do
       {:ok, bytes} = Rfc8785Jcs.encode(document)
@@ -163,16 +189,38 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
     end
 
     defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    defp projected_wire_root(path) do
+      path
+      |> String.replace("\\", "/")
+      |> String.trim_trailing("/")
+    end
   end
 
   setup do
     Process.delete({BrokerFixture, :calls})
+    Process.delete({BrokerFixture, :install_parameters})
     root = Path.join(System.tmp_dir!(), "producer-receipts-#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf(root) end)
     {:ok, contract_bytes} = File.read(@contract_path)
     {:ok, contract} = Rfc8785Jcs.validate_canonical(contract_bytes)
     %{root: root, authority: %{contract: %{document: contract}}}
+  end
+
+  test "projects every accepted caller path shape into the strict broker wire dialect" do
+    root = "C:\\MANAfuel\\worktrees\\symphony"
+    expected = "C:/MANAfuel/worktrees/symphony/.symphony-state\\execution.json"
+
+    assert Broker.reference_wire_path(root, ".symphony-state/execution.json") == expected
+
+    assert Broker.reference_wire_path(
+             root,
+             "C:\\MANAfuel\\worktrees\\symphony/.symphony-state\\execution.json"
+           ) == expected
+
+    assert Broker.reference_wire_path(root, "C:\\MANAfuel\\worktrees\\symphony\\.symphony-state\\execution.json") ==
+             expected
   end
 
   test "production adapter reserves and commits prepared through the broker", %{
@@ -216,9 +264,27 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
              {:publish_cas, "ledger_install_result"},
              :release_lock
            ]
+
+    assert_install_wire_dialect(BrokerFixture.install_parameters(), root, false)
   end
 
   test "commits the first prepared transition in exact immutable DAG order", %{root: root, authority: authority} do
+    initial_ledger = %{
+      "schema_version" => "symphony.execution_ledger.v6",
+      "generation_id" => "previous-generation",
+      "generated_at" => "2026-08-01T14:00:00.000Z",
+      "blocked" => [],
+      "retrying" => [],
+      "effects" => []
+    }
+
+    {:ok, initial_bytes} = Rfc8785Jcs.encode(initial_ledger)
+    File.mkdir_p!(Path.join(root, ".symphony-state"))
+    current_path = Path.join(root, ".symphony-state\\execution.json")
+    previous_path = Path.join(root, ".symphony-state\\execution.previous.json")
+    File.write!(current_path, initial_bytes)
+    File.write!(previous_path, initial_bytes)
+
     allocation_document = %{
       "schema_version" => "manafuel.symphony_dispatch_allocation.v1",
       "issue" => %{"id" => "issue-1", "identifier" => "MAN-1"},
@@ -288,6 +354,9 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
 
     assert BrokerFixture.calls() == [
              :acquire_lock,
+             {:inspect, current_path},
+             {:inspect, previous_path},
+             {:publish_cas, "ledger_snapshot"},
              {:publish_cas, "milestone_evidence"},
              {:publish_cas, "transition"},
              {:publish_cas, "ledger_write_lock_receipt"},
@@ -299,6 +368,53 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
              {:publish_cas, "ledger_install_result"},
              :release_lock
            ]
+
+    assert_install_wire_dialect(BrokerFixture.install_parameters(), root, true)
+  end
+
+  defp assert_install_wire_dialect(parameters, root, non_null_expected?) do
+    wire_root = projected_wire_root(root)
+    prefix = wire_root <> "/"
+
+    assert parameters["previous_path"] == prefix <> ".symphony-state\\execution.previous.json"
+    assert parameters["current_path"] == prefix <> ".symphony-state\\execution.json"
+    assert parameters["lock"]["path"] == prefix <> ".symphony-state\\execution.lock"
+
+    assert String.starts_with?(
+             parameters["target_ledger_path"],
+             prefix <> ".symphony-state\\ledger-snapshots\\sha256\\"
+           )
+
+    for path <- [
+          parameters["lock"]["path"],
+          parameters["target_ledger_path"],
+          parameters["previous_path"],
+          parameters["current_path"]
+        ] do
+      assert String.starts_with?(path, prefix)
+      refute path |> String.replace_prefix(prefix, "") |> String.contains?("/")
+    end
+
+    if non_null_expected? do
+      for {expected, tail} <- [
+            {parameters["expected_previous"], ".symphony-state\\execution.previous.json"},
+            {parameters["expected_current"], ".symphony-state\\execution.json"}
+          ] do
+        assert is_map(expected)
+        assert expected["path"] == prefix <> tail
+        assert String.starts_with?(expected["path"], prefix)
+        refute expected["path"] |> String.replace_prefix(prefix, "") |> String.contains?("/")
+      end
+    else
+      assert parameters["expected_previous"] == nil
+      assert parameters["expected_current"] == nil
+    end
+  end
+
+  defp projected_wire_root(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.trim_trailing("/")
   end
 
   defp runtime_binding(contract) do

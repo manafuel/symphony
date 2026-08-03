@@ -19,6 +19,49 @@ defmodule SymphonyElixir.ProducerV6.Broker do
 
   @type authority :: %{required(:launch) => %{required(:document) => map()}, required(:contract) => map()}
 
+  @doc false
+  @spec reference_wire_path(Path.t(), Path.t()) :: Path.t()
+  def reference_wire_path(workspace_root, path)
+      when is_binary(workspace_root) and is_binary(path) do
+    wire_root =
+      workspace_root
+      |> String.replace("\\", "/")
+      |> String.trim_trailing("/")
+
+    raw_root =
+      workspace_root
+      |> String.trim_trailing("/")
+      |> String.trim_trailing("\\")
+
+    native_root = String.replace(wire_root, "/", "\\")
+
+    relative =
+      cond do
+        String.starts_with?(path, raw_root <> "/") ->
+          String.replace_prefix(path, raw_root <> "/", "")
+
+        String.starts_with?(path, raw_root <> "\\") ->
+          String.replace_prefix(path, raw_root <> "\\", "")
+
+        String.starts_with?(path, wire_root <> "/") ->
+          String.replace_prefix(path, wire_root <> "/", "")
+
+        String.starts_with?(path, wire_root <> "\\") ->
+          String.replace_prefix(path, wire_root <> "\\", "")
+
+        String.starts_with?(path, native_root <> "\\") ->
+          String.replace_prefix(path, native_root <> "\\", "")
+
+        String.starts_with?(path, native_root <> "/") ->
+          String.replace_prefix(path, native_root <> "/", "")
+
+        true ->
+          path
+      end
+
+    wire_root <> "/" <> String.replace(relative, "/", "\\")
+  end
+
   @spec inspect(Path.t(), Path.t(), authority()) :: {:ok, map()} | {:error, term()}
   def inspect(path, workspace_root, authority) do
     invoke("Inspect", %{"path" => Path.expand(path)}, workspace_root, authority, deadline_after(30))
@@ -28,7 +71,7 @@ defmodule SymphonyElixir.ProducerV6.Broker do
   def verify_reference(reference, workspace_root, authority) when is_map(reference) do
     invoke(
       "VerifyReference",
-      %{"reference" => stringify_keys(reference)},
+      %{"reference" => absolute_reference(reference, workspace_root)},
       workspace_root,
       authority,
       deadline_after(30)
@@ -450,7 +493,7 @@ defmodule SymphonyElixir.ProducerV6.Broker do
     Map.put(
       string_reference,
       "path",
-      Path.join(workspace_root, windows_relative(string_reference["path"]))
+      reference_wire_path(workspace_root, string_reference["path"])
     )
   end
 
@@ -554,12 +597,12 @@ defmodule SymphonyElixir.ProducerV6.Broker do
                "InstallDualLedgerAndReadback",
                %{
                  "lock" => absolute_reference(lock.reference, workspace_root),
-                 "target_ledger_path" => Path.join(workspace_root, windows_relative(target["path"])),
+                 "target_ledger_path" => reference_wire_path(workspace_root, target["path"]),
                  "maximum_bytes" => 20_000,
                  "expected_previous" => nil,
                  "expected_current" => nil,
-                 "previous_path" => previous,
-                 "current_path" => current
+                 "previous_path" => reference_wire_path(workspace_root, previous),
+                 "current_path" => reference_wire_path(workspace_root, current)
                },
                workspace_root,
                authority,
