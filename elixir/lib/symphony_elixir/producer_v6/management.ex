@@ -305,12 +305,10 @@ defmodule SymphonyElixir.ProducerV6.Management do
     maximum_bytes = get_in(context, [:contract, :document, "cas_limits", root_name])
     max_effects = get_in(context, [:contract, :document, "bounds", "max_effects"])
 
-    with true <- is_binary(relative) and String.starts_with?(relative, ".symphony-state/"),
-         true <- is_integer(maximum_bytes) and maximum_bytes > 0,
-         true <- is_integer(max_effects) and max_effects > 0,
+    with :ok <- validate_cas_contract(relative, maximum_bytes, max_effects, root_name),
          root = filesystem_path(workspace_root, relative),
          paths = Path.wildcard(Path.join(root, "**/*.json"), match_dot: true) |> Enum.sort(),
-         true <- length(paths) <= max_effects do
+         :ok <- validate_cas_count(paths, max_effects, root_name) do
       Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, rows} ->
         append_cas_document(
           path,
@@ -324,10 +322,24 @@ defmodule SymphonyElixir.ProducerV6.Management do
         )
       end)
     else
-      false -> {:error, {:producer_management_cas_contract_invalid, root_name}}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, {:producer_management_cas_invalid, root_name}}
     end
+  end
+
+  defp validate_cas_contract(relative, maximum_bytes, max_effects, root_name) do
+    if is_binary(relative) and String.starts_with?(relative, ".symphony-state/") and
+         is_integer(maximum_bytes) and maximum_bytes > 0 and is_integer(max_effects) and
+         max_effects > 0 do
+      :ok
+    else
+      {:error, {:producer_management_cas_contract_invalid, root_name}}
+    end
+  end
+
+  defp validate_cas_count(paths, max_effects, root_name) do
+    if length(paths) <= max_effects,
+      do: :ok,
+      else: {:error, {:producer_management_cas_contract_invalid, root_name}}
   end
 
   defp append_cas_document(
@@ -400,7 +412,6 @@ defmodule SymphonyElixir.ProducerV6.Management do
       {:ok, reference}
     else
       false -> {:error, :producer_management_immutable_reference_invalid}
-      _ -> {:error, :producer_management_immutable_reference_invalid}
     end
   end
 
@@ -411,8 +422,6 @@ defmodule SymphonyElixir.ProducerV6.Management do
       end) and reference["file_type"] == "regular" and reference["link_count"] == 1 and
       is_integer(reference["length"]) and reference["length"] > 0
   end
-
-  defp exact_reference_shape?(_reference), do: false
 
   defp identity_matches_reference?(identity, reference, expected_path) when is_map(identity) do
     Path.expand(identity["path"]) == Path.expand(expected_path) and
@@ -454,8 +463,6 @@ defmodule SymphonyElixir.ProducerV6.Management do
       _ -> {:error, :producer_management_datetime_invalid}
     end
   end
-
-  defp parse_time(_value), do: {:error, :producer_management_datetime_invalid}
 
   defp process_epoch_id(reference, cycle_sequence, observed_at_utc) do
     material =

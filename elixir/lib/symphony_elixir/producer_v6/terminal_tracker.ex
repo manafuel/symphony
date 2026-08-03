@@ -170,8 +170,8 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
       ordinal: 1,
       rows: [],
       pages: [],
-      seen: MapSet.new(),
-      seen_cursors: MapSet.new()
+      seen: %{},
+      seen_cursors: %{}
     })
   end
 
@@ -211,7 +211,7 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
         ordinal: state.ordinal + 1,
         rows: state.rows ++ nodes,
         pages: state.pages ++ [page],
-        seen: Enum.reduce(nodes, state.seen, &MapSet.put(&2, &1["id"])),
+        seen: Enum.reduce(nodes, state.seen, &Map.put(&2, &1["id"], true)),
         seen_cursors: maybe_add_cursor(state.seen_cursors, end_cursor)
     }
 
@@ -239,7 +239,7 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
     ids = Enum.map(nodes, & &1["id"])
 
     if Enum.all?(ids, &(is_binary(&1) and &1 != "")) and
-         length(ids) == length(Enum.uniq(ids)) and Enum.all?(ids, &(not MapSet.member?(seen, &1))) do
+         length(ids) == length(Enum.uniq(ids)) and Enum.all?(ids, &(not Map.has_key?(seen, &1))) do
       :ok
     else
       {:error, :producer_terminal_stable_id_invalid}
@@ -251,7 +251,7 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
 
   defp cursor_rule(true, cursor, after_cursor, seen)
        when is_binary(cursor) and cursor != "" and cursor != after_cursor do
-    if MapSet.member?(seen, cursor),
+    if Map.has_key?(seen, cursor),
       do: {:error, :producer_terminal_cursor_repeated},
       else: :ok
   end
@@ -259,7 +259,7 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
   defp cursor_rule(_has_next, _cursor, _after, _seen),
     do: {:error, :producer_terminal_cursor_invalid}
 
-  defp maybe_add_cursor(seen, cursor) when is_binary(cursor), do: MapSet.put(seen, cursor)
+  defp maybe_add_cursor(seen, cursor) when is_binary(cursor), do: Map.put(seen, cursor, true)
   defp maybe_add_cursor(seen, _cursor), do: seen
 
   defp pagination_proof(kind, pages) do
@@ -317,7 +317,6 @@ defmodule SymphonyElixir.ProducerV6.TerminalTracker do
     else
       false -> {:error, :producer_terminal_chronology_invalid}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_terminal_chronology_invalid}
     end
   end
 

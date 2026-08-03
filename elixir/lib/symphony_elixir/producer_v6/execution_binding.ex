@@ -25,10 +25,8 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
         broker
       )
       when is_map(document) and is_binary(task_down_observed_at_utc) and is_atom(broker) do
-    workspace_root = workspace_root(context)
-
-    with :ok <- completed_effect(document),
-         true <- is_binary(workspace_root),
+    with {:ok, workspace_root} <- workspace_root(context),
+         :ok <- completed_effect(document),
          {:ok, _task_down} <- parse_time(task_down_observed_at_utc),
          {:ok, deadline_at_utc} <- authority_deadline(document, workspace_root, context, broker),
          {:ok, contract_manifest} <- contract_manifest(context, workspace_root, broker),
@@ -104,7 +102,6 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
            ) do
       {:ok, %{document: binding, reference: reference}}
     else
-      false -> {:error, :producer_execution_binding_invalid}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :producer_execution_binding_invalid}
     end
@@ -276,7 +273,7 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
     min_count = get_in(context, [:contract, :document, "bounds", "min_completed_receipts"])
     max_count = get_in(context, [:contract, :document, "bounds", "max_completed_receipts"])
 
-    with true <- is_integer(min_count) and is_integer(max_count) and count in min_count..max_count,
+    with true <- valid_transition_count?(count, min_count, max_count),
          {:ok, plans} <-
            cas_documents("ledger_install_plan", "ledger_install_plan", workspace_root, context, broker),
          {:ok, results} <-
@@ -295,6 +292,11 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
       {:error, reason} -> {:error, reason}
       _ -> {:error, :producer_transition_chain_invalid}
     end
+  end
+
+  defp valid_transition_count?(count, min_count, max_count) do
+    is_integer(min_count) and is_integer(max_count) and min_count <= max_count and
+      count >= min_count and count <= max_count
   end
 
   defp collect_chain(milestones, plans, results, effect, workspace_root, context, broker) do
@@ -346,7 +348,6 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
         else
           false -> {:halt, {:error, {:producer_transition_chain_drift, sequence}}}
           {:error, reason} -> {:halt, {:error, reason}}
-          _ -> {:halt, {:error, {:producer_transition_chain_invalid, sequence}}}
         end
       end
     )
@@ -395,12 +396,11 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
     max_effects = get_in(context, [:contract, :document, "bounds", "max_effects"])
     max_receipts = get_in(context, [:contract, :document, "bounds", "max_completed_receipts"])
 
-    with true <- is_binary(relative) and String.starts_with?(relative, ".symphony-state/"),
-         true <- is_integer(maximum_bytes) and maximum_bytes > 0,
-         true <- is_integer(max_effects) and is_integer(max_receipts),
+    with :ok <-
+           validate_cas_contract(relative, maximum_bytes, max_effects, max_receipts, root_name),
          root = filesystem_path(workspace_root, relative),
          paths = Path.wildcard(Path.join(root, "**/*.json"), match_dot: true) |> Enum.sort(),
-         true <- length(paths) <= max_effects * max_receipts do
+         :ok <- validate_cas_count(paths, max_effects, max_receipts, root_name) do
       Enum.reduce_while(paths, {:ok, []}, fn path, {:ok, rows} ->
         append_cas_document(
           path,
@@ -414,10 +414,24 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
         )
       end)
     else
-      false -> {:error, {:producer_cas_enumeration_contract_invalid, root_name}}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, {:producer_cas_enumeration_invalid, root_name}}
     end
+  end
+
+  defp validate_cas_contract(relative, maximum_bytes, max_effects, max_receipts, root_name) do
+    if is_binary(relative) and String.starts_with?(relative, ".symphony-state/") and
+         is_integer(maximum_bytes) and maximum_bytes > 0 and is_integer(max_effects) and
+         is_integer(max_receipts) do
+      :ok
+    else
+      {:error, {:producer_cas_enumeration_contract_invalid, root_name}}
+    end
+  end
+
+  defp validate_cas_count(paths, max_effects, max_receipts, root_name) do
+    if length(paths) <= max_effects * max_receipts,
+      do: :ok,
+      else: {:error, {:producer_cas_enumeration_contract_invalid, root_name}}
   end
 
   defp append_cas_document(
@@ -582,7 +596,6 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
       {:ok, reference}
     else
       false -> {:error, :producer_immutable_reference_invalid}
-      _ -> {:error, :producer_immutable_reference_invalid}
     end
   end
 
@@ -593,8 +606,6 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
       end) and reference["file_type"] == "regular" and reference["link_count"] == 1 and
       is_integer(reference["length"]) and reference["length"] > 0
   end
-
-  defp exact_reference_shape?(_reference), do: false
 
   defp identity_matches_reference?(identity, reference, expected_path) when is_map(identity) do
     Path.expand(identity["path"]) == Path.expand(expected_path) and
@@ -614,12 +625,11 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
   defp chronology(completed_at_utc, task_down_observed_at_utc) do
     with {:ok, completed} <- parse_time(completed_at_utc),
          {:ok, task_down} <- parse_time(task_down_observed_at_utc),
-         true <- DateTime.compare(completed, task_down) in [:lt, :eq] do
+         true <- DateTime.compare(completed, task_down) != :gt do
       :ok
     else
       false -> {:error, :producer_task_down_chronology_invalid}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_task_down_chronology_invalid}
     end
   end
 
@@ -651,8 +661,15 @@ defmodule SymphonyElixir.ProducerV6.ExecutionBinding do
   defp exact_projection(_context, name, _document),
     do: {:error, {:producer_execution_binding_projection_mismatch, name}}
 
-  defp workspace_root(%{contract: %{document: contract}}),
-    do: get_in(contract, ["constants", "workspace_root_windows"])
+  defp workspace_root(%{contract: %{document: contract}}) do
+    case get_in(contract, ["constants", "workspace_root_windows"]) do
+      root when is_binary(root) -> {:ok, root}
+      _ -> {:error, :producer_execution_binding_workspace_invalid}
+    end
+  end
+
+  defp workspace_root(_context),
+    do: {:error, :producer_execution_binding_workspace_invalid}
 
   defp filesystem_path(root, relative),
     do: Path.join(String.replace(root, "\\", "/"), String.replace(relative, "\\", "/"))

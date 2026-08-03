@@ -56,7 +56,6 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
     else
       false -> {:error, :producer_claim_workspace_missing}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_claim_invalid}
     end
   end
 
@@ -112,7 +111,6 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
       {:ok, reference}
     else
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_admission_invalid}
     end
   end
 
@@ -222,7 +220,6 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
     else
       false -> {:error, :producer_turn_start_history_invalid}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_turn_start_history_invalid}
     end
   end
 
@@ -512,7 +509,6 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
       [] -> {:error, :producer_ceo_prioritization_receipt_missing}
       [_ | _] -> {:error, :producer_ceo_prioritization_receipt_ambiguous}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :producer_ceo_prioritization_receipt_invalid}
     end
   end
 

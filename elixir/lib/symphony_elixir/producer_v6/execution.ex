@@ -27,8 +27,8 @@ defmodule SymphonyElixir.ProducerV6.Execution do
   end
 
   @doc false
-  @spec reserve_with_broker(map(), map(), map(), pos_integer(), non_neg_integer(), module()) ::
-          {:ok, map()} | {:error, term()}
+  @spec reserve_with_broker(map(), map(), map(), pos_integer(), pos_integer(), module()) ::
+          {:ok, map(), map()} | {:duplicate, map()} | {:error, term()}
   def reserve_with_broker(
         %{kind: :producer_v6} = context,
         effects,

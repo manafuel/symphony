@@ -38,7 +38,15 @@ defmodule SymphonyElixir.ProducerReceipts do
   end
 
   @doc false
-  @spec reserve_dispatch_with_broker(map(), pos_integer(), non_neg_integer(), Path.t(), map(), map(), module()) ::
+  @spec reserve_dispatch_with_broker(
+          map(),
+          pos_integer(),
+          pos_integer(),
+          Path.t(),
+          map(),
+          String.t(),
+          module()
+        ) ::
           {:ok, map()} | {:error, term()}
   def reserve_dispatch_with_broker(
         issue,

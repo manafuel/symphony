@@ -437,9 +437,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     send_message(port, payload)
 
-    with {:ok, _} <- await_response(port, @initialize_id) do
-      send_message(port, %{"method" => "initialized", "params" => %{}})
-      :ok
+    case await_response(port, @initialize_id) do
+      {:ok, _} -> send_message(port, %{"method" => "initialized", "params" => %{}})
+      other -> other
     end
   end
 
@@ -459,7 +459,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @doc false
-  @spec thread_start_payload(String.t(), %{approval_policy: term(), thread_sandbox: term()}) :: map()
+  @spec thread_start_payload(String.t(), Config.codex_runtime_settings()) :: map()
   def thread_start_payload(workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
     %{
       "method" => "thread/start",
@@ -478,11 +478,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     send_message(port, thread_start_payload(workspace, session_policies))
 
     case await_response(port, @thread_start_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}}} ->
+        {:ok, thread_id}
+
       {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+        {:error, {:invalid_thread_payload, thread_payload}}
 
       other ->
         other
@@ -504,9 +504,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         do: Map.put(params, "clientUserMessageId", context.client_user_message_id),
         else: params
 
-    send_message(port, %{"method" => "turn/start", "id" => @turn_start_id, "params" => params})
-
-    with {:ok, %{"turn" => %{"id" => turn_id} = turn}} when is_binary(turn_id) <-
+    with :ok <- send_message(port, %{"method" => "turn/start", "id" => @turn_start_id, "params" => params}),
+         {:ok, %{"turn" => %{"id" => turn_id} = turn}} when is_binary(turn_id) <-
            await_response(port, @turn_start_id),
          {:ok, history} <-
            maybe_read_thread_history(port, context.thread_id, context.capture_history) do
@@ -517,13 +516,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp maybe_read_thread_history(_port, _thread_id, false), do: {:ok, nil}
 
   defp maybe_read_thread_history(port, thread_id, true) do
-    send_message(port, %{
-      "method" => "thread/read",
-      "id" => @thread_read_id,
-      "params" => %{"threadId" => thread_id, "includeTurns" => true}
-    })
-
-    await_response_deferred(port, @thread_read_id)
+    with :ok <-
+           send_message(port, %{
+             "method" => "thread/read",
+             "id" => @thread_read_id,
+             "params" => %{"threadId" => thread_id, "includeTurns" => true}
+           }) do
+      await_response_deferred(port, @thread_read_id)
+    end
   end
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
@@ -1136,8 +1136,6 @@ defmodule SymphonyElixir.Codex.AppServer do
     end)
   end
 
-  defp single_quoted_powershell_cmdlet?(_normalized), do: false
-
   defp unsafe_hosted_shell_generation_reason(command) when is_binary(command) do
     normalized =
       command
@@ -1237,7 +1235,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp shell_command_candidates(command) when is_binary(command) do
     [command]
-    |> expand_shell_command_candidates(MapSet.new(), [])
+    |> expand_shell_command_candidates(%{}, [])
     |> Enum.map(fn candidate ->
       raw = trim_shell_command_edges(candidate)
       %{raw: raw, argv: split_shell_argv(raw), compound?: compound_shell_command?(raw)}
@@ -1245,12 +1243,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.uniq()
   end
 
+  @spec expand_shell_command_candidates([String.t()], %{String.t() => true}, [String.t()]) :: [String.t()]
   defp expand_shell_command_candidates([], _seen, candidates), do: Enum.reverse(candidates)
 
   defp expand_shell_command_candidates([candidate | rest], seen, candidates) do
     normalized = trim_shell_command_edges(candidate)
 
-    if normalized == "" or MapSet.member?(seen, normalized) do
+    if normalized == "" or Map.has_key?(seen, normalized) do
       expand_shell_command_candidates(rest, seen, candidates)
     else
       expansions =
@@ -1259,7 +1258,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       expand_shell_command_candidates(
         rest ++ expansions,
-        MapSet.put(seen, normalized),
+        Map.put(seen, normalized, true),
         [normalized | candidates]
       )
     end
@@ -1882,8 +1881,6 @@ defmodule SymphonyElixir.Codex.AppServer do
         Regex.match?(~r/(^|[\s;&|{(\r\n])(?:\d+)?>{1,2}(?!&)\s*\S/, script)
     end)
   end
-
-  defp single_quoted_powershell_generation?(_normalized), do: false
 
   defp unsafe_relative_command_reason(command, cwd) when is_binary(command) and is_binary(cwd) do
     normalized_command = String.downcase(String.replace(command, "\\", "/"))
@@ -2524,9 +2521,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp tool_call_arguments(_params), do: %{}
 
+  @spec send_message(port(), map()) :: :ok
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+    :ok
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true

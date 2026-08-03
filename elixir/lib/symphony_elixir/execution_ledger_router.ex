@@ -23,9 +23,22 @@ defmodule SymphonyElixir.ExecutionLedgerRouter do
   def persist(:preview, workspace_root, blocked, retrying, effects),
     do: ExecutionLedger.persist(workspace_root, blocked, retrying, effects)
 
-  def persist(%{kind: :producer_v6} = context, workspace_root, blocked, retrying, effects)
-      when blocked == %{} and retrying == %{},
-      do: Execution.verify_state(workspace_root, context, effects)
+  def persist(
+        %{
+          kind: :producer_v6,
+          contract: %{document: contract},
+          launch: %{document: launch}
+        },
+        workspace_root,
+        blocked,
+        retrying,
+        effects
+      )
+      when is_binary(workspace_root) and is_map(contract) and is_map(launch) and blocked == %{} and
+             retrying == %{} do
+    authority = %{contract: %{document: contract}, launch: %{document: launch}}
+    Execution.verify_state(workspace_root, authority, effects)
+  end
 
   def persist(_context, _workspace_root, _blocked, _retrying, _effects),
     do: {:error, :invalid_execution_ledger_context}
@@ -187,9 +200,16 @@ defmodule SymphonyElixir.ExecutionLedgerRouter do
 
   defp load_context(:preview, workspace_root), do: ExecutionLedger.load(workspace_root)
 
-  defp load_context(%{kind: :producer_v6} = context, workspace_root),
-    do: ProducerV6.Ledger.load(workspace_root, context)
-
-  defp load_context(_context, _workspace_root),
-    do: {:error, :invalid_execution_ledger_context}
+  defp load_context(
+         %{
+           kind: :producer_v6,
+           contract: %{document: contract},
+           launch: %{document: launch}
+         },
+         workspace_root
+       )
+       when is_binary(workspace_root) and is_map(contract) and is_map(launch) do
+    authority = %{contract: %{document: contract}, launch: %{document: launch}}
+    ProducerV6.Ledger.load(workspace_root, authority)
+  end
 end

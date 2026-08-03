@@ -13,7 +13,10 @@ defmodule SymphonyElixir.ProducerV6.Ledger do
   @schema_version "symphony.execution_ledger.v6"
   @root_keys ~w(schema_version generation_id generated_at blocked retrying effects)
 
-  @type authority :: %{required(:contract) => map()}
+  @type authority :: %{
+          required(:contract) => %{required(:document) => map()},
+          required(:launch) => %{required(:document) => map()}
+        }
 
   @spec load(Path.t(), authority()) ::
           {:ok, %{blocked: map(), retrying: map(), effects: map()}} | {:error, term()}

@@ -17,7 +17,10 @@ defmodule SymphonyElixir.ProducerV6.Broker do
   @result_schema "manafuel.symphony_file_transaction_broker_result.v1"
   @result_keys ~w(schema_version action request_sha256 deadline_at_utc completed_at_utc decision error_code result)
 
-  @type authority :: %{required(:launch) => %{required(:document) => map()}, required(:contract) => map()}
+  @type authority :: %{
+          required(:launch) => %{required(:document) => map()},
+          required(:contract) => %{required(:document) => map()}
+        }
 
   @doc false
   @spec reference_wire_path(Path.t(), Path.t()) :: Path.t()
@@ -483,9 +486,6 @@ defmodule SymphonyElixir.ProducerV6.Broker do
       _ -> {:error, :broker_identity_not_an_immutable_reference}
     end
   end
-
-  defp immutable_reference(_identity, _workspace_root, _expected_sha, _expected_length),
-    do: {:error, :broker_identity_not_an_immutable_reference}
 
   defp absolute_reference(reference, workspace_root) do
     string_reference = stringify_keys(reference)

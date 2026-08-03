@@ -2590,8 +2590,6 @@ defmodule SymphonyElixir.Orchestrator do
     max(total_tokens - cached_input_tokens, 0)
   end
 
-  defp billable_token_count(_running_entry), do: 0
-
   defp append_codex_token_ledger(_running_entry, _updated_running_entry, _update, %{
          input_tokens: input,
          output_tokens: output,
@@ -2624,8 +2622,6 @@ defmodule SymphonyElixir.Orchestrator do
 
     write_codex_token_ledger(payload)
   end
-
-  defp append_codex_token_ledger(_running_entry, _updated_running_entry, _update, _token_delta), do: :ok
 
   defp write_codex_token_ledger(payload) when is_map(payload) do
     path = codex_token_ledger_path()
@@ -3220,7 +3216,6 @@ defmodule SymphonyElixir.Orchestrator do
       false -> {:error, :producer_closeout_directive_missing, state}
       {:error, reason, failed_state} -> {:error, reason, failed_state}
       {:error, reason} -> {:error, reason, state}
-      _ -> {:error, :producer_final_terminal_checkpoint_invalid, state}
     end
   end
 

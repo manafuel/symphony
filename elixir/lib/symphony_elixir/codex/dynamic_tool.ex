@@ -861,15 +861,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     }
   end
 
-  defp local_shell_error_payload(reason) do
-    %{
-      "error" => %{
-        "message" => "`local_shell` execution failed.",
-        "reason" => inspect(reason)
-      }
-    }
-  end
-
   defp write_run_artifact_error_payload(:invalid_run_artifact_arguments) do
     %{
       "error" => %{
@@ -971,15 +962,6 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     %{
       "error" => %{
         "message" => "`write_run_artifact` failed to write the artifact.",
-        "reason" => inspect(reason)
-      }
-    }
-  end
-
-  defp write_run_artifact_error_payload(reason) do
-    %{
-      "error" => %{
-        "message" => "`write_run_artifact` execution failed.",
         "reason" => inspect(reason)
       }
     }
