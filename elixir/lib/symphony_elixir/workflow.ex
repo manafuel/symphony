@@ -33,11 +33,11 @@ defmodule SymphonyElixir.Workflow do
           prompt_template: String.t()
         }
 
-  @spec current() :: {:ok, loaded_workflow()} | {:error, term()}
-  def current do
+  @spec current(timeout()) :: {:ok, loaded_workflow()} | {:error, term()}
+  def current(timeout \\ 5_000) do
     case Process.whereis(WorkflowStore) do
       pid when is_pid(pid) ->
-        WorkflowStore.current()
+        WorkflowStore.current(timeout)
 
       _ ->
         load()

@@ -237,6 +237,52 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec run_before_run_hook_with_receipt(
+          Path.t(),
+          map() | String.t() | nil,
+          worker_host()
+        ) :: {:ok, String.t()} | {:error, term()}
+  def run_before_run_hook_with_receipt(workspace, issue_or_identifier, nil)
+      when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.before_run do
+      nil ->
+        {:error, :producer_admission_hook_missing}
+
+      command ->
+        timeout_ms = hooks.timeout_ms
+
+        task =
+          Task.async(fn ->
+            run_local_shell_command(command, workspace, issue_context)
+          end)
+
+        case Task.yield(task, timeout_ms) do
+          {:ok, {output, 0}} when is_binary(output) and byte_size(output) <= 65_536 ->
+            {:ok, output}
+
+          {:ok, {_output, 0}} ->
+            {:error, :producer_admission_hook_receipt_oversized}
+
+          {:ok, {_output, status}} ->
+            {:error, {:workspace_hook_failed, "before_run", status}}
+
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+            {:error, {:workspace_hook_timeout, "before_run", timeout_ms}}
+
+          {:exit, reason} ->
+            {:error, {:workspace_hook_execution_failed, "before_run", reason}}
+        end
+    end
+  end
+
+  def run_before_run_hook_with_receipt(_workspace, _issue_or_identifier, worker_host)
+      when is_binary(worker_host),
+      do: {:error, :producer_v6_remote_worker_forbidden}
+
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
     issue_context = issue_context(issue_or_identifier)
@@ -469,8 +515,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        {shell, args} = local_shell_command(command)
-        System.cmd(shell, args, cd: workspace, stderr_to_stdout: true, env: hook_environment(issue_context))
+        run_local_shell_command(command, workspace, issue_context)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -515,43 +560,123 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp local_shell_command(command) do
+  @doc false
+  @spec run_local_hook_for_test(
+          String.t(),
+          Path.t(),
+          map(),
+          String.t(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def run_local_hook_for_test(command, workspace, issue_context, hook_name, opts)
+      when is_binary(command) and is_binary(workspace) and is_map(issue_context) and
+             is_binary(hook_name) and is_list(opts) do
+    command
+    |> run_local_shell_command(workspace, issue_context, opts)
+    |> handle_hook_command_result(workspace, issue_context, hook_name)
+  end
+
+  @doc false
+  @spec local_hook_shell_for_test() :: :git_bash | :powershell | :posix
+  def local_hook_shell_for_test do
     case :os.type() do
-      {:win32, _name} ->
-        git_bash =
-          case System.find_executable("git.exe") do
-            nil -> nil
-            git -> git |> Path.dirname() |> Path.join("../bin/bash.exe") |> Path.expand()
-          end
-
-        if is_binary(git_bash) and File.regular?(git_bash) do
-          {git_bash, ["-lc", command]}
-        else
-          shell = System.find_executable("powershell.exe") || "powershell.exe"
-
-          wrapped_command = """
-          & {
-          #{command}
-          }
-          if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
-          if (-not $?) { exit 1 }
-          """
-
-          {shell,
-           [
-             "-NoLogo",
-             "-NoProfile",
-             "-NonInteractive",
-             "-ExecutionPolicy",
-             "Bypass",
-             "-Command",
-             wrapped_command
-           ]}
-        end
+      {:win32, _} ->
+        if git_bash_executable(git_bash_candidates()), do: :git_bash, else: :powershell
 
       _ ->
-        {"sh", ["-lc", command]}
+        :posix
     end
+  end
+
+  defp run_local_shell_command(command, workspace, issue_context, opts \\ []) do
+    hook_env = [{"SYMPHONY_WORKSPACE", workspace} | hook_environment(issue_context)]
+    os_type = Keyword.get(opts, :os_type, :os.type())
+    bash_candidates = Keyword.get_lazy(opts, :git_bash_candidates, &git_bash_candidates/0)
+    command_runner = Keyword.get(opts, :command_runner, &System.cmd/3)
+    {executable, args} = local_hook_shell_command(command, os_type, bash_candidates)
+
+    command_runner.(executable, args,
+      cd: workspace,
+      env: hook_env,
+      stderr_to_stdout: true
+    )
+  end
+
+  defp local_hook_shell_command(command, {:win32, _}, bash_candidates) do
+    case git_bash_executable(bash_candidates) do
+      nil -> {"powershell.exe", powershell_hook_args(command)}
+      bash -> {bash, ["-lc", command]}
+    end
+  end
+
+  defp local_hook_shell_command(command, _os_type, _bash_candidates) do
+    {"sh", ["-lc", command]}
+  end
+
+  defp powershell_hook_args(command) do
+    wrapped_command = """
+    & {
+    #{command}
+    }
+    if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
+    if (-not $?) { exit 1 }
+    """
+
+    [
+      "-NoLogo",
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-Command",
+      wrapped_command
+    ]
+  end
+
+  defp git_bash_candidates do
+    git_executable = System.find_executable("git.exe") || System.find_executable("git")
+    local_app_data = System.get_env("LOCALAPPDATA")
+
+    [
+      System.find_executable("bash.exe"),
+      System.find_executable("bash"),
+      git_relative_executable(git_executable, "../bin/bash.exe"),
+      git_relative_executable(git_executable, "../usr/bin/bash.exe"),
+      "C:/Program Files/Git/bin/bash.exe",
+      "C:/Program Files/Git/usr/bin/bash.exe",
+      local_git_bash(local_app_data, "bin/bash.exe"),
+      local_git_bash(local_app_data, "usr/bin/bash.exe")
+    ]
+  end
+
+  defp git_relative_executable(nil, _relative_path), do: nil
+
+  defp git_relative_executable(git_executable, relative_path) do
+    git_executable
+    |> Path.dirname()
+    |> Path.join(relative_path)
+    |> Path.expand()
+  end
+
+  defp local_git_bash(nil, _relative_path), do: nil
+
+  defp local_git_bash(local_app_data, relative_path) do
+    Path.join([local_app_data, "Programs", "Git", relative_path])
+  end
+
+  defp git_bash_executable(candidates) do
+    candidates
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.reject(&windows_system_bash?/1)
+    |> Enum.find(&File.regular?/1)
+  end
+
+  defp windows_system_bash?(path) when is_binary(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.downcase()
+    |> String.contains?("/windows/system32/bash.exe")
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
@@ -625,7 +750,7 @@ defmodule SymphonyElixir.Workspace do
 
     payload =
       Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
+        case line |> String.trim_trailing("\r") |> String.split("\t", parts: 3) do
           [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
             {created == "1", path}
 

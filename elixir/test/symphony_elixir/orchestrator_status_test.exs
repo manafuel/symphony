@@ -1,6 +1,37 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  defmodule BlockingLinearClient do
+    def fetch_candidate_issues, do: {:ok, []}
+
+    def fetch_issues_by_states(_states) do
+      case Application.get_env(:symphony_elixir, :blocking_cleanup_recipient) do
+        recipient when is_pid(recipient) ->
+          send(recipient, {:terminal_workspace_cleanup_started, self()})
+
+          receive do
+            :release_terminal_workspace_cleanup -> {:ok, []}
+          end
+
+        _ ->
+          {:ok, []}
+      end
+    end
+
+    def fetch_issue_states_by_ids(_issue_ids), do: {:ok, []}
+
+    def graphql(query, variables) do
+      recipient = Application.get_env(:symphony_elixir, :blocking_linear_recipient)
+      if is_pid(recipient), do: send(recipient, {:blocking_linear_graphql_started, self(), query, variables})
+
+      receive do
+        :release_blocking_linear -> {:error, :released_blocking_tracker}
+      after
+        5_000 -> {:error, :blocking_tracker_timeout}
+      end
+    end
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -100,6 +131,505 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+  end
+
+  test "codex telemetry updates do not synchronously read the workflow store" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_issue_tokens: 1,
+      poll_interval_ms: 60_000
+    )
+
+    issue_id = "issue-telemetry-cache"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-TELEMETRY-CACHE",
+      title: "Keep telemetry off the config hot path",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-TELEMETRY-CACHE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TelemetryCacheOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | running: %{issue_id => running_entry},
+          claimed: MapSet.put(state.claimed, issue_id)
+      }
+    end)
+
+    update_timestamp = DateTime.utc_now()
+
+    workflow_store_pid = ensure_workflow_store_pid()
+
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{"method" => "item/agentMessage/delta", "params" => %{"delta" => "x"}},
+           timestamp: update_timestamp
+         }}
+      )
+
+      state_task = Task.async(fn -> :sys.get_state(pid) end)
+      assert {:ok, updated_state} = Task.yield(state_task, 250)
+      assert updated_state.running[issue_id].last_codex_timestamp == update_timestamp
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "runtime config refresh retains the last valid settings when the workflow store times out" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_concurrent_agents: 3,
+      max_issue_tokens: 321,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :RefreshTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    state_before_timeout = :sys.get_state(pid)
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, :tick)
+
+      parent = self()
+      spawn(fn -> send(parent, {:state_after_refresh_timeout, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_refresh_timeout, state_after_timeout}, 6_500
+      assert Process.alive?(pid)
+      assert state_after_timeout.poll_interval_ms == state_before_timeout.poll_interval_ms
+      assert state_after_timeout.max_concurrent_agents == state_before_timeout.max_concurrent_agents
+      assert state_after_timeout.max_issue_tokens == state_before_timeout.max_issue_tokens
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "poll cycle skips dispatch while the workflow store remains unavailable" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_concurrent_agents: 3,
+      max_issue_tokens: 321,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :UnavailablePollCycleOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue = %Issue{
+      id: "issue-unavailable-poll-cycle",
+      identifier: "MT-UNAVAILABLE-POLL-CYCLE",
+      title: "Do not dispatch without current workflow state",
+      state: "Todo",
+      url: "https://example.org/issues/MT-UNAVAILABLE-POLL-CYCLE"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    state_before_timeout = :sys.get_state(pid)
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, :run_poll_cycle)
+
+      parent = self()
+      spawn(fn -> send(parent, {:state_after_unavailable_poll, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_unavailable_poll, state_after_timeout}, 6_500
+      assert Process.alive?(pid)
+      assert state_after_timeout.running == %{}
+      refute MapSet.member?(state_after_timeout.claimed, issue.id)
+      assert state_after_timeout.poll_interval_ms == state_before_timeout.poll_interval_ms
+      assert state_after_timeout.max_concurrent_agents == state_before_timeout.max_concurrent_agents
+      assert state_after_timeout.max_issue_tokens == state_before_timeout.max_issue_tokens
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "worker DOWN schedules one retry without disturbing another worker during workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :WorkerDownOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    parent = self()
+    dead_issue_id = "issue-worker-down-outage"
+    survivor_issue_id = "issue-worker-down-survivor"
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, dead_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:outage_worker_started, :dead, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      {:ok, survivor_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:outage_worker_started, :survivor, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      send(parent, {:outage_tasks, dead_task, survivor_task})
+
+      running = %{
+        dead_issue_id => %{
+          pid: dead_task.pid,
+          ref: dead_task.ref,
+          identifier: "MT-DOWN-OUTAGE",
+          issue: %Issue{
+            id: dead_issue_id,
+            identifier: "MT-DOWN-OUTAGE",
+            title: "Retry safely after worker failure",
+            state: "In Progress",
+            url: "https://example.org/issues/MT-DOWN-OUTAGE"
+          },
+          started_at: DateTime.utc_now()
+        },
+        survivor_issue_id => %{
+          pid: survivor_task.pid,
+          ref: survivor_task.ref,
+          identifier: "MT-DOWN-SURVIVOR",
+          issue: %Issue{
+            id: survivor_issue_id,
+            identifier: "MT-DOWN-SURVIVOR",
+            title: "Keep unrelated worker alive",
+            state: "In Progress"
+          },
+          started_at: DateTime.utc_now()
+        }
+      }
+
+      %{state | running: running, claimed: MapSet.new(Map.keys(running)), retry_attempts: %{}}
+    end)
+
+    assert_receive {:outage_tasks, %Task{pid: dead_pid}, %Task{pid: survivor_pid}}, 1_000
+    assert_receive {:outage_worker_started, :dead, ^dead_pid}, 1_000
+    assert_receive {:outage_worker_started, :survivor, ^survivor_pid}, 1_000
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      Process.exit(dead_pid, {:classified_failure, :transient_transport, :boom})
+
+      state_task =
+        Task.async(fn ->
+          wait_for_orchestrator_state(pid, fn state ->
+            not Map.has_key?(state.running, dead_issue_id)
+          end)
+        end)
+
+      assert {:ok, state} = Task.yield(state_task, 1_000)
+      assert Process.alive?(pid)
+      refute Process.alive?(dead_pid)
+      assert Process.alive?(survivor_pid)
+      refute Map.has_key?(state.running, dead_issue_id)
+      assert state.running[survivor_issue_id].pid == survivor_pid
+
+      assert %{attempt: 2, timer_ref: retry_timer_ref, retry_token: retry_token} =
+               state.retry_attempts[dead_issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(retry_token)
+      assert map_size(state.retry_attempts) == 1
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "retry timer reschedules exactly once from cached routing during workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      tracker_required_labels: ["symphony"],
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done", "Cancelled"],
+      worker_ssh_hosts: ["worker-a"],
+      worker_max_concurrent_agents_per_host: 1,
+      max_concurrent_agents: 2,
+      max_concurrent_agents_by_state: %{"In Progress" => 2},
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+
+    orchestrator_name = Module.concat(__MODULE__, :RetryTimerOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-retry-timer-outage"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-RETRY-OUTAGE",
+      title: "Retry from cached routing",
+      state: "In Progress",
+      labels: ["symphony"],
+      url: "https://example.org/issues/MT-RETRY-OUTAGE"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    parent = self()
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, survivor_task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:retry_outage_survivor_started, self()})
+          receive do: (:stop -> :ok)
+        end)
+
+      send(parent, {:retry_outage_survivor, survivor_task})
+
+      survivor_issue_id = "issue-retry-outage-survivor"
+
+      running_entry = %{
+        pid: survivor_task.pid,
+        ref: survivor_task.ref,
+        identifier: "MT-RETRY-SURVIVOR",
+        worker_host: "worker-a",
+        issue: %Issue{
+          id: survivor_issue_id,
+          identifier: "MT-RETRY-SURVIVOR",
+          title: "Keep host capacity occupied",
+          state: "In Progress"
+        },
+        started_at: DateTime.utc_now()
+      }
+
+      retry_entry = %{
+        attempt: 1,
+        timer_ref: nil,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond),
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "agent exited: :boom",
+        worker_host: "worker-a",
+        workspace_path: nil
+      }
+
+      %{
+        state
+        | running: %{survivor_issue_id => running_entry},
+          claimed: MapSet.new([survivor_issue_id, issue_id]),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    assert_receive {:retry_outage_survivor, %Task{pid: survivor_pid}}, 1_000
+    assert_receive {:retry_outage_survivor_started, ^survivor_pid}, 1_000
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+
+    try do
+      send(pid, {:retry_issue, issue_id, retry_token})
+      send(pid, {:retry_issue, issue_id, retry_token})
+
+      state_task =
+        Task.async(fn ->
+          wait_for_orchestrator_state(pid, fn state ->
+            case state.retry_attempts[issue_id] do
+              %{attempt: 1, retry_token: next_token} -> next_token != retry_token
+              _ -> false
+            end
+          end)
+        end)
+
+      assert {:ok, state} = Task.yield(state_task, 1_000)
+      assert Process.alive?(pid)
+      assert Process.alive?(survivor_pid)
+      assert map_size(state.running) == 1
+      refute Enum.any?(state.running, fn {_id, entry} -> entry.identifier == issue.identifier end)
+
+      assert %{attempt: 1, timer_ref: retry_timer_ref, retry_token: next_retry_token} =
+               state.retry_attempts[issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(next_retry_token)
+      refute next_retry_token == retry_token
+      assert map_size(state.retry_attempts) == 1
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
+  end
+
+  test "retry timer preserves one retry when guarded tracker lookup reaches workflow outage" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: "test-token",
+      max_retry_backoff_ms: 60_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :GuardedRetryLookupOutageOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    Process.unlink(pid)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+    end)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-guarded-retry-lookup-outage"
+    retry_token = make_ref()
+
+    :sys.replace_state(pid, fn state ->
+      retry_entry = %{
+        attempt: 1,
+        timer_ref: nil,
+        retry_token: retry_token,
+        due_at_ms: System.monotonic_time(:millisecond),
+        identifier: "MT-GUARDED-RETRY",
+        issue_url: "https://example.org/issues/MT-GUARDED-RETRY",
+        error: "agent exited: :boom",
+        worker_host: nil,
+        workspace_path: nil
+      }
+
+      %{
+        state
+        | claimed: MapSet.put(state.claimed, issue_id),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    workflow_store_pid = ensure_workflow_store_pid()
+    :ok = :sys.suspend(workflow_store_pid)
+    Application.delete_env(:symphony_elixir, :linear_client_module)
+    parent = self()
+
+    try do
+      send(pid, {:retry_issue, issue_id, retry_token})
+
+      spawn(fn -> send(parent, {:state_after_guarded_retry_outage, :sys.get_state(pid, 6_000)}) end)
+
+      assert_receive {:state_after_guarded_retry_outage, state}, 6_500
+      assert Process.alive?(pid)
+
+      assert %{attempt: 2, timer_ref: retry_timer_ref, retry_token: next_retry_token} =
+               state.retry_attempts[issue_id]
+
+      assert is_reference(retry_timer_ref)
+      assert is_reference(next_retry_token)
+      refute next_retry_token == retry_token
+      assert map_size(state.retry_attempts) == 1
+      assert state.running == %{}
+    after
+      :ok = :sys.resume(workflow_store_pid)
+    end
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
@@ -631,6 +1161,413 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "orchestrator appends positive codex token deltas to the durable ledger" do
+    issue_id = "issue-token-ledger"
+    ledger_root = Path.join(System.tmp_dir!(), "symphony-token-ledger-#{System.unique_integer([:positive])}")
+    ledger_path = Path.join(ledger_root, "token-usage.jsonl")
+    previous_ledger_path = System.get_env("SYMPHONY_TOKEN_LEDGER_PATH")
+    System.put_env("SYMPHONY_TOKEN_LEDGER_PATH", ledger_path)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_TOKEN_LEDGER_PATH", previous_ledger_path)
+      File.rm_rf(ledger_root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-225",
+      title: "Token ledger",
+      description: "Persist token deltas",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-225"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenLedgerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         session_id: "thread-token-ledger-turn-1",
+         timestamp: now
+       }}
+    )
+
+    for usage <- [
+          %{"input_tokens" => 8, "output_tokens" => 3, "total_tokens" => 11},
+          %{"input_tokens" => 10, "output_tokens" => 4, "total_tokens" => 14}
+        ] do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :notification,
+           payload: %{
+             "method" => "thread/tokenUsage/updated",
+             "params" => %{"tokenUsage" => %{"total" => usage}}
+           },
+           timestamp: now
+         }}
+      )
+    end
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_input_tokens == 10
+    assert snapshot_entry.codex_output_tokens == 4
+    assert snapshot_entry.codex_total_tokens == 14
+
+    rows =
+      ledger_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&Jason.decode!/1)
+
+    assert [
+             %{
+               "schema_version" => "symphony.token_delta.v1",
+               "issue_id" => ^issue_id,
+               "issue_identifier" => "MT-225",
+               "session_id" => "thread-token-ledger-turn-1",
+               "event" => "notification",
+               "input_tokens" => 8,
+               "output_tokens" => 3,
+               "total_tokens" => 11,
+               "reported_total_tokens" => 11,
+               "turn_count" => 1
+             },
+             %{
+               "issue_id" => ^issue_id,
+               "issue_identifier" => "MT-225",
+               "session_id" => "thread-token-ledger-turn-1",
+               "event" => "notification",
+               "input_tokens" => 2,
+               "output_tokens" => 1,
+               "total_tokens" => 3,
+               "reported_total_tokens" => 14,
+               "turn_count" => 1
+             }
+           ] = rows
+  end
+
+  test "orchestrator keeps a running issue active when codex tokens exceed max_issue_tokens" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-token-runaway"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-227",
+      title: "Token runaway",
+      description: "Keep productive sessions running while token telemetry is monitored",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-227"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenRunawayGuardOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-turn-1",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{"tokenUsage" => %{"total" => %{"input_tokens" => 8, "output_tokens" => 4, "total_tokens" => 12}}}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [%{issue_id: ^issue_id, codex_billable_tokens: 12}] = snapshot.running
+    assert snapshot.blocked == []
+
+    refute_receive {:memory_tracker_comment, ^issue_id, _comment_body}, 100
+    refute_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 100
+
+    if Process.alive?(worker_pid), do: send(worker_pid, :done)
+  end
+
+  test "orchestrator does not call tracker visibility writes for high token telemetry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+    Application.put_env(:symphony_elixir, :blocking_linear_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+      Application.delete_env(:symphony_elixir, :blocking_linear_recipient)
+    end)
+
+    issue_id = "issue-token-runaway-slow-tracker"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-229",
+      title: "Token runaway with slow tracker",
+      description: "High token telemetry must not enqueue tracker writes or stop work",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-229"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenRunawaySlowTrackerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-slow-tracker",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "thread/tokenUsage/updated",
+           "params" => %{"tokenUsage" => %{"total" => %{"input_tokens" => 11, "output_tokens" => 1, "total_tokens" => 12}}}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot, 250)
+    assert [%{issue_id: ^issue_id, codex_billable_tokens: 12}] = snapshot.running
+    assert snapshot.blocked == []
+
+    refute_receive {:blocking_linear_graphql_started, _publisher_pid, _query, _variables}, 250
+    assert GenServer.call(pid, :snapshot, 250).blocked == []
+
+    if Process.alive?(worker_pid), do: send(worker_pid, :done)
+  end
+
+  test "orchestrator token telemetry excludes cached input replay from billable totals" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: nil,
+      max_issue_tokens: 10
+    )
+
+    issue_id = "issue-token-runaway-cached-input"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-228",
+      title: "Cached input token guard",
+      description: "Do not block normal tool loops on cached prompt replay",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-228"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CachedInputTokenGuardOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :done -> :ok
+        end
+      end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-token-runaway-cached-turn-1",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_cached_input_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      codex_last_reported_cached_input_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "payload" => %{
+                 "info" => %{
+                   "total_token_usage" => %{
+                     "input_tokens" => 116,
+                     "cached_input_tokens" => 112,
+                     "output_tokens" => 3,
+                     "total_tokens" => 119
+                   }
+                 }
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+
+    assert [%{issue_id: ^issue_id, codex_cached_input_tokens: 112, codex_billable_tokens: 7}] =
+             snapshot.running
+
+    assert snapshot.blocked == []
+    assert Process.alive?(worker_pid)
+    send(worker_pid, :done)
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -712,6 +1649,97 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_input_tokens == 0
     assert snapshot_entry.codex_output_tokens == 0
     assert snapshot_entry.codex_total_tokens == 0
+  end
+
+  test "orchestrator does not append token ledger rows for last-only usage reports" do
+    issue_id = "issue-token-ledger-last-only"
+    ledger_root = Path.join(System.tmp_dir!(), "symphony-token-ledger-#{System.unique_integer([:positive])}")
+    ledger_path = Path.join(ledger_root, "token-usage.jsonl")
+    previous_ledger_path = System.get_env("SYMPHONY_TOKEN_LEDGER_PATH")
+    System.put_env("SYMPHONY_TOKEN_LEDGER_PATH", ledger_path)
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_TOKEN_LEDGER_PATH", previous_ledger_path)
+      File.rm_rf(ledger_root)
+    end)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-226",
+      title: "Last-only token ledger",
+      description: "Do not persist delta-only token reports",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-226"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :LastOnlyTokenLedgerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "info" => %{
+                   "last_token_usage" => %{
+                     "input_tokens" => 8,
+                     "output_tokens" => 3,
+                     "total_tokens" => 11
+                   }
+                 }
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.codex_total_tokens == 0
+    refute File.exists?(ledger_path)
   end
 
   test "orchestrator snapshot includes retry backoff entries" do
@@ -947,6 +1975,203 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms >= 0
   end
 
+  test "startup terminal workspace cleanup does not block orchestrator readiness" do
+    identifier = "MT-STARTUP-CLEANUP-#{System.unique_integer([:positive])}"
+
+    issue = %Issue{
+      id: "issue-startup-cleanup",
+      identifier: identifier,
+      title: "Slow startup cleanup",
+      state: "Done"
+    }
+
+    hook_command =
+      case :os.type() do
+        {:win32, _} ->
+          ~s(powershell.exe -NoProfile -NonInteractive -Command "Start-Sleep -Milliseconds 1500")
+
+        _ ->
+          "sleep 1.5"
+      end
+
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-startup-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      workspace_root: workspace_root,
+      hook_before_remove: hook_command,
+      hook_timeout_ms: 5_000,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+    assert File.dir?(workspace)
+
+    orchestrator_name = Module.concat(__MODULE__, :AsyncStartupCleanupOrchestrator)
+    started_at_ms = System.monotonic_time(:millisecond)
+    assert {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    startup_elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+      File.rm_rf(workspace_root)
+    end)
+
+    assert startup_elapsed_ms < 750
+    assert %{polling: %{poll_interval_ms: 60_000}} = GenServer.call(pid, :snapshot)
+    assert wait_until(fn -> not File.exists?(workspace) end, 5_000)
+    assert wait_until(fn -> is_nil(:sys.get_state(pid).terminal_workspace_cleanup) end, 1_000)
+  end
+
+  test "blocked startup cleanup cannot survive an orchestrator crash or graceful restart stop" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :linear_client_module, BlockingLinearClient)
+    Application.put_env(:symphony_elixir, :blocking_cleanup_recipient, self())
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_client_module)
+      Application.delete_env(:symphony_elixir, :blocking_cleanup_recipient)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :OwnedStartupCleanupOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert_receive {:terminal_workspace_cleanup_started, cleanup_pid}, 1_000
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+      if Process.alive?(cleanup_pid), do: Process.exit(cleanup_pid, :kill)
+    end)
+
+    assert %Task{pid: ^cleanup_pid} = :sys.get_state(pid).terminal_workspace_cleanup
+
+    owner_ref = Process.monitor(pid)
+    cleanup_ref = Process.monitor(cleanup_pid)
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:DOWN, ^cleanup_ref, :process, ^cleanup_pid, _reason}, 1_000
+
+    {:ok, restarted_pid} = Orchestrator.start_link(name: orchestrator_name)
+    assert_receive {:terminal_workspace_cleanup_started, restarted_cleanup_pid}, 1_000
+    refute restarted_cleanup_pid == cleanup_pid
+
+    on_exit(fn ->
+      if Process.alive?(restarted_pid), do: Process.exit(restarted_pid, :kill)
+      if Process.alive?(restarted_cleanup_pid), do: Process.exit(restarted_cleanup_pid, :kill)
+    end)
+
+    restarted_cleanup_ref = Process.monitor(restarted_cleanup_pid)
+    :ok = GenServer.stop(restarted_pid, :normal)
+
+    assert_receive {:DOWN, ^restarted_cleanup_ref, :process, ^restarted_cleanup_pid, _reason}, 1_000
+  end
+
+  test "owned worker task exits when its orchestrator is killed" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :KilledOwnerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    parent = self()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:owned_worker_started, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      send(parent, {:owned_task, task})
+      state
+    end)
+
+    assert_receive {:owned_task, %Task{pid: worker_pid}}, 1_000
+    assert_receive {:owned_worker_started, ^worker_pid}, 1_000
+    worker_ref = Process.monitor(worker_pid)
+    owner_ref = Process.monitor(pid)
+
+    Process.unlink(pid)
+    Process.exit(pid, :kill)
+
+    assert_receive {:DOWN, ^owner_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, _reason}, 1_000
+  end
+
+  test "graceful orchestrator termination stops every tracked worker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      poll_interval_ms: 60_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :GracefulOwnerOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    assert %{polling: %{checking?: false}} =
+             wait_for_snapshot(pid, fn
+               %{polling: %{checking?: false}} -> true
+               _ -> false
+             end)
+
+    issue_id = "issue-graceful-owner"
+    parent = self()
+
+    :sys.replace_state(pid, fn state ->
+      {:ok, task} =
+        Orchestrator.start_owned_task_for_test(fn ->
+          send(parent, {:tracked_worker_started, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      send(parent, {:tracked_task, task})
+
+      running_entry = %{
+        pid: task.pid,
+        ref: task.ref,
+        identifier: "MT-GRACEFUL-OWNER"
+      }
+
+      %{state | running: %{issue_id => running_entry}}
+    end)
+
+    assert_receive {:tracked_task, %Task{pid: worker_pid}}, 1_000
+    assert_receive {:tracked_worker_started, ^worker_pid}, 1_000
+    worker_ref = Process.monitor(worker_pid)
+
+    :ok = GenServer.stop(pid, :normal)
+
+    assert_receive {:DOWN, ^worker_ref, :process, ^worker_pid, _reason}, 1_000
+  end
+
   test "orchestrator poll cycle resets next refresh countdown after a check" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -1063,7 +2288,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              due_at_ms: due_at_ms,
              identifier: "MT-STALL",
              issue_url: "https://example.org/issues/MT-STALL",
-             error: "worker stalled without codex activity",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } = state.retry_attempts[issue_id]
 
@@ -1142,7 +2367,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-MCP",
-             error: "codex MCP elicitation requires operator input",
+             error: "execution_terminal:operator_decision_required",
              worker_host: "dm-dev2",
              workspace_path: "/workspaces/MT-MCP"
            } = state.blocked[issue_id]
@@ -1155,7 +2380,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
                %{
                  identifier: "MT-MCP",
                  issue_url: "https://example.org/issues/MT-MCP",
-                 error: "codex MCP elicitation requires operator input"
+                 error: "execution_terminal:operator_decision_required"
                }
              ]
            } =
@@ -1211,7 +2436,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT",
-             error: "codex turn requires operator input"
+             error: "execution_terminal:operator_decision_required"
            } = state.blocked[issue_id]
   end
 
@@ -1261,7 +2486,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT-NORMAL",
-             error: "codex turn requires operator input"
+             error: "execution_terminal:operator_decision_required"
            } = state.blocked[issue_id]
   end
 
@@ -1878,6 +3103,49 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp wait_for_orchestrator_state(pid, predicate) when is_function(predicate, 1) do
+    state = :sys.get_state(pid)
+
+    if predicate.(state) do
+      state
+    else
+      Process.sleep(5)
+      wait_for_orchestrator_state(pid, predicate)
+    end
+  end
+
+  defp ensure_workflow_store_pid do
+    case Process.whereis(WorkflowStore) do
+      nil ->
+        case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
+          {:ok, store_pid} -> store_pid
+          {:error, {:already_started, store_pid}} -> store_pid
+        end
+
+      store_pid ->
+        store_pid
+    end
+  end
+
+  defp wait_until(predicate, timeout_ms) when is_function(predicate, 0) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_until(predicate, deadline_ms)
+  end
+
+  defp do_wait_until(predicate, deadline_ms) do
+    cond do
+      predicate.() ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline_ms ->
+        false
+
+      true ->
+        Process.sleep(10)
+        do_wait_until(predicate, deadline_ms)
+    end
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do

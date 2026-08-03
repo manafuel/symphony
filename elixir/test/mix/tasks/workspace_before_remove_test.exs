@@ -305,12 +305,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
       File.mkdir_p!(bin_dir)
       File.write!(log_path, "")
       original_path = System.get_env("PATH") || ""
-      path_with_binaries = Enum.join([bin_dir, original_path], ":")
+      path_with_binaries = Enum.join([bin_dir, original_path], path_separator())
 
       Enum.each(scripts, fn {name, script} ->
-        path = Path.join(bin_dir, name)
-        File.write!(path, script)
-        File.chmod!(path, 0o755)
+        write_fake_binary!(bin_dir, name, script)
       end)
 
       with_env(
@@ -328,7 +326,138 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
   end
 
   defp with_path(paths, fun) do
-    with_env(%{"PATH" => Enum.join(paths, ":")}, fun)
+    with_env(%{"PATH" => Enum.join(paths, path_separator())}, fun)
+  end
+
+  defp write_fake_binary!(bin_dir, name, script) do
+    if windows?() do
+      write_windows_fake_binary!(bin_dir, name, script)
+    else
+      path = Path.join(bin_dir, name)
+      File.write!(path, script)
+      File.chmod!(path, 0o755)
+    end
+  end
+
+  defp write_windows_fake_binary!(bin_dir, name, script) do
+    python_path = Path.join(bin_dir, "#{name}.py")
+    command_path = Path.join(bin_dir, "#{name}.cmd")
+
+    File.write!(python_path, windows_fake_binary_python(name, script))
+
+    File.write!(
+      command_path,
+      """
+      @echo off
+      python "#{python_path}" %*
+      exit /b %ERRORLEVEL%
+      """
+    )
+  end
+
+  defp windows_fake_binary_python("git", script) do
+    script = normalize_newlines(script)
+
+    mode =
+      if String.contains?(script, "feature/workpad") do
+        "branch_feature"
+      else
+        "branch_blank"
+      end
+
+    """
+    import sys
+
+    mode = #{inspect(mode)}
+
+    if sys.argv[1:] == ["branch", "--show-current"]:
+        if mode == "branch_feature":
+            print("feature/workpad")
+        else:
+            print("")
+        sys.exit(0)
+
+    sys.exit(99)
+    """
+  end
+
+  defp windows_fake_binary_python("gh", script) do
+    script = normalize_newlines(script)
+
+    mode = windows_fake_gh_mode(script)
+
+    """
+    import os
+    import sys
+
+    mode = #{inspect(mode)}
+    args = sys.argv[1:]
+    log_path = os.environ.get("GH_LOG")
+
+    if log_path:
+        with open(log_path, "a", encoding="utf-8", newline="\\n") as log:
+            log.write(" ".join(args) + "\\n")
+
+    if args[:2] == ["auth", "status"]:
+        sys.exit(1 if mode == "auth_fail" else 0)
+
+    if args[:2] == ["pr", "list"]:
+        if mode == "list_fail":
+            sys.exit(1)
+        if mode == "close_no_output":
+            print("102")
+            sys.exit(0)
+        print("101")
+        print("102")
+        sys.exit(0)
+
+    if args[:2] == ["pr", "close"] and len(args) >= 3:
+        if args[2] == "101" and mode != "close_no_output":
+            sys.exit(0)
+        if args[2] == "102":
+            if mode != "close_no_output":
+                print("boom", file=sys.stderr)
+            sys.exit(17)
+
+    sys.exit(99)
+    """
+  end
+
+  defp windows_fake_gh_mode(script) do
+    cond do
+      windows_fake_gh_auth_fail?(script) -> "auth_fail"
+      windows_fake_gh_list_fail?(script) -> "list_fail"
+      windows_fake_gh_close_no_output?(script) -> "close_no_output"
+      true -> "default"
+    end
+  end
+
+  defp windows_fake_gh_auth_fail?(script) do
+    String.contains?(script, ~s([ "$1" = "auth" ])) and
+      not String.contains?(script, ~s([ "$1" = "pr" ])) and String.contains?(script, "exit 1")
+  end
+
+  defp windows_fake_gh_list_fail?(script) do
+    String.contains?(script, ~s([ "$1" = "pr" ] && [ "$2" = "list" ])) and
+      String.contains?(script, "exit 1") and not String.contains?(script, ~s([ "$2" = "close" ]))
+  end
+
+  defp windows_fake_gh_close_no_output?(script) do
+    String.contains?(script, ~s([ "$2" = "close" ])) and not String.contains?(script, "boom")
+  end
+
+  defp windows? do
+    match?({:win32, _}, :os.type())
+  end
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
+  end
+
+  defp normalize_newlines(value) do
+    value
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
   end
 
   defp with_env(overrides, fun) do

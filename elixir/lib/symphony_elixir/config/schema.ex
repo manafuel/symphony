@@ -49,6 +49,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:team_key, :string)
+      field(:poll_scope, :string, default: "project")
+      field(:auto_project_admission, :boolean, default: false)
       field(:assignee, :string)
       field(:required_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
@@ -60,9 +63,27 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :required_labels, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :team_key,
+          :poll_scope,
+          :auto_project_admission,
+          :assignee,
+          :required_labels,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> update_change(:poll_scope, fn scope ->
+        scope
+        |> to_string()
+        |> String.trim()
+        |> String.downcase()
+      end)
       |> update_change(:required_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
@@ -136,6 +157,7 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
+      field(:max_issue_tokens, :integer, default: 0)
       field(:max_retry_attempts, :integer, default: 3)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
@@ -149,6 +171,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :max_concurrent_agents,
           :max_turns,
+          :max_issue_tokens,
           :max_retry_attempts,
           :max_retry_backoff_ms,
           :max_concurrent_agents_by_state
@@ -157,6 +180,7 @@ defmodule SymphonyElixir.Config.Schema do
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
+      |> validate_number(:max_issue_tokens, greater_than_or_equal_to: 0)
       |> validate_number(:max_retry_attempts, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
@@ -391,9 +415,12 @@ defmodule SymphonyElixir.Config.Schema do
         assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
     }
 
+    workspace_root_is_remote? =
+      settings.worker.ssh_hosts != [] and remote_workspace_root?(settings.workspace.root)
+
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"), remote: workspace_root_is_remote?)
     }
 
     codex = %{
@@ -441,16 +468,20 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defp resolve_path_value(value, default) when is_binary(value) do
-    case normalize_path_token(value) do
-      :missing ->
-        default
+  defp resolve_path_value(value, default, opts) when is_binary(value) do
+    case env_reference_name(value) do
+      {:ok, env_name} ->
+        case resolve_env_token(env_name) do
+          :missing -> default
+          "" -> default
+          path -> normalize_resolved_path(path, opts)
+        end
 
-      "" ->
-        default
-
-      path ->
-        path
+      :error ->
+        case value do
+          "" -> default
+          path -> path
+        end
     end
   end
 
@@ -468,12 +499,28 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
-  defp normalize_path_token(value) when is_binary(value) do
-    case env_reference_name(value) do
-      {:ok, env_name} -> resolve_env_token(env_name)
-      :error -> value
+  defp normalize_resolved_path(path, opts) when is_binary(path) do
+    cond do
+      Keyword.get(opts, :remote, false) ->
+        path
+
+      String.starts_with?(path, "env:") ->
+        path
+
+      String.starts_with?(path, "~") ->
+        path
+
+      true ->
+        Path.expand(path)
     end
   end
+
+  defp remote_workspace_root?(path) when is_binary(path) do
+    String.starts_with?(path, "~") or
+      (String.starts_with?(path, "/") and not Regex.match?(~r{^/[A-Za-z](:|/)}, path))
+  end
+
+  defp remote_workspace_root?(_path), do: false
 
   defp env_reference_name("$" <> env_name) do
     if String.match?(env_name, ~r/^[A-Za-z_][A-Za-z0-9_]*$/) do

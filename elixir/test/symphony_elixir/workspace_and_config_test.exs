@@ -33,7 +33,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
-      assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
+      assert normalize_newlines(File.read!(Path.join(workspace, "README.md"))) == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
     after
       File.rm_rf(test_root)
@@ -129,15 +129,20 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_root)
-      File.ln_s!(outside_root, symlink_path)
 
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      case create_symlink(outside_root, symlink_path) do
+        :ok ->
+          write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
-      assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
-      assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
+          assert {:ok, canonical_outside_root} = SymphonyElixir.PathSafety.canonicalize(outside_root)
+          assert {:ok, canonical_workspace_root} = SymphonyElixir.PathSafety.canonicalize(workspace_root)
 
-      assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
-               Workspace.create_for_issue("MT-SYM")
+          assert {:error, {:workspace_outside_root, ^canonical_outside_root, ^canonical_workspace_root}} =
+                   Workspace.create_for_issue("MT-SYM")
+
+        {:error, :symlink_unavailable} ->
+          assert windows?()
+      end
     after
       File.rm_rf(test_root)
     end
@@ -155,16 +160,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       linked_root = Path.join(test_root, "linked-workspaces")
 
       File.mkdir_p!(actual_root)
-      File.ln_s!(actual_root, linked_root)
 
-      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: linked_root)
+      case create_symlink(actual_root, linked_root) do
+        :ok ->
+          write_workflow_file!(Workflow.workflow_file_path(), workspace_root: linked_root)
 
-      assert {:ok, canonical_workspace} =
-               SymphonyElixir.PathSafety.canonicalize(Path.join(actual_root, "MT-LINK"))
+          assert {:ok, canonical_workspace} =
+                   SymphonyElixir.PathSafety.canonicalize(Path.join(actual_root, "MT-LINK"))
 
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-LINK")
-      assert workspace == canonical_workspace
-      assert File.dir?(workspace)
+          assert {:ok, workspace} = Workspace.create_for_issue("MT-LINK")
+          assert workspace == canonical_workspace
+          assert File.dir?(workspace)
+
+        {:error, :symlink_unavailable} ->
+          assert windows?()
+      end
     after
       File.rm_rf(test_root)
     end
@@ -199,15 +209,257 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       )
 
     try do
+      hook_after_create =
+        if Workspace.local_hook_shell_for_test() == :powershell do
+          "Write-Output nope; exit 17"
+        else
+          "echo nope && exit 17"
+        end
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo nope && exit 17"
+        hook_after_create: hook_after_create
       )
 
       assert {:error, {:workspace_hook_failed, "after_create", 17}} =
                Workspace.create_for_issue("MT-FAIL")
     after
       File.rm_rf(workspace_root)
+    end
+  end
+
+  test "Windows local hooks select Git Bash and deliver the complete issue environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-selection-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      bash = Path.join(test_root, "bash.exe")
+      system_bash = Path.join([test_root, "Windows", "System32", "bash.exe"])
+      File.mkdir_p!(Path.dirname(system_bash))
+      File.write!(bash, "fixture")
+      File.write!(system_bash, "wsl-stub-fixture")
+      parent = self()
+
+      issue_context = %{
+        issue_id: "issue-hook-selection",
+        issue_identifier: "MT-HOOK-SELECTION",
+        issue_title: "Select Git Bash",
+        issue_description: "Exercise the production hook router.",
+        issue_labels: ["symphony", "windows"],
+        issue_state: "Ready",
+        issue_updated_at: "2026-07-27T23:45:00Z"
+      }
+
+      assert :ok =
+               Workspace.run_local_hook_for_test(
+                 "printf selected",
+                 test_root,
+                 issue_context,
+                 "before_run",
+                 os_type: {:win32, :nt},
+                 git_bash_candidates: [system_bash, bash],
+                 command_runner: fn executable, args, opts ->
+                   send(parent, {:hook_invocation, executable, args, opts})
+                   {"", 0}
+                 end
+               )
+
+      assert_receive {:hook_invocation, ^bash, ["-lc", "printf selected"], opts}
+      assert Keyword.fetch!(opts, :cd) == test_root
+      assert Keyword.fetch!(opts, :stderr_to_stdout)
+
+      env = Keyword.fetch!(opts, :env) |> Map.new()
+      assert env["SYMPHONY_WORKSPACE"] == test_root
+      assert env["SYMPHONY_ISSUE_ID"] == "issue-hook-selection"
+      assert env["SYMPHONY_ISSUE_IDENTIFIER"] == "MT-HOOK-SELECTION"
+      assert env["SYMPHONY_ISSUE_TITLE"] == "Select Git Bash"
+      assert env["SYMPHONY_ISSUE_DESCRIPTION"] == "Exercise the production hook router."
+      assert env["SYMPHONY_ISSUE_LABELS"] == "symphony,windows"
+      assert env["SYMPHONY_ISSUE_STATE"] == "Ready"
+      assert env["SYMPHONY_ISSUE_UPDATED_AT"] == "2026-07-27T23:45:00Z"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Windows Git Bash hook runner propagates exit status and redacts command output" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-execution-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      sh = System.find_executable("sh")
+      assert is_binary(sh) and File.regular?(sh)
+
+      issue_context = %{
+        issue_id: "issue-hook-execution",
+        issue_identifier: "MT-HOOK-EXECUTION",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "Ready",
+        issue_updated_at: ""
+      }
+
+      command =
+        "printf '%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" > hook-env.txt; " <>
+          "printf 'raw-hook-secret'; exit 17"
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, {:workspace_hook_failed, "before_run", 17}} =
+                   Workspace.run_local_hook_for_test(
+                     command,
+                     test_root,
+                     issue_context,
+                     "before_run",
+                     os_type: {:win32, :nt},
+                     git_bash_candidates: [sh]
+                   )
+        end)
+
+      assert File.read!(Path.join(test_root, "hook-env.txt")) == "MT-HOOK-EXECUTION"
+      assert log =~ "status=17"
+      assert log =~ "output_redacted=true"
+      refute log =~ "raw-hook-secret"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "Windows local hooks fall back to noninteractive PowerShell without Git Bash" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-hook-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      parent = self()
+
+      issue_context = %{
+        issue_id: "issue-hook-fallback",
+        issue_identifier: "MT-HOOK-FALLBACK",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "",
+        issue_updated_at: ""
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, {:workspace_hook_failed, "after_run", 23}} =
+                   Workspace.run_local_hook_for_test(
+                     "Write-Output fallback; exit 23",
+                     test_root,
+                     issue_context,
+                     "after_run",
+                     os_type: {:win32, :nt},
+                     git_bash_candidates: [],
+                     command_runner: fn executable, args, opts ->
+                       send(parent, {:hook_invocation, executable, args, opts})
+                       {"raw-fallback-secret", 23}
+                     end
+                   )
+        end)
+
+      assert_receive {:hook_invocation, "powershell.exe", args, opts}
+
+      assert Enum.take(args, 5) == [
+               "-NoLogo",
+               "-NoProfile",
+               "-NonInteractive",
+               "-ExecutionPolicy",
+               "Bypass"
+             ]
+
+      assert Enum.at(args, 5) == "-Command"
+      assert Enum.at(args, 6) =~ "Write-Output fallback; exit 23"
+
+      assert Keyword.fetch!(opts, :env) |> Map.new() |> Map.fetch!("SYMPHONY_ISSUE_IDENTIFIER") ==
+               "MT-HOOK-FALLBACK"
+
+      assert log =~ "status=23"
+      assert log =~ "output_redacted=true"
+      refute log =~ "raw-fallback-secret"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "exact MANAfuel admission hook command preserves success and exit 20 in both Windows selectors" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-admission-command-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      bash = Path.join(test_root, "bash.exe")
+      File.write!(bash, "fixture")
+      parent = self()
+
+      command =
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " <>
+          "-File C:/Users/jclen/OneDrive/Documents/apps/manafuel/development/.codex/scripts/" <>
+          "codex-symphony-ticket-admission-hook.ps1 -MonitorOnlyEnforcement strict"
+
+      issue_context = %{
+        issue_id: "issue-admission-command",
+        issue_identifier: "MT-ADMISSION-COMMAND",
+        issue_title: "",
+        issue_description: "",
+        issue_labels: [],
+        issue_state: "Ready",
+        issue_updated_at: ""
+      }
+
+      for {selector, candidates, expected_executable} <- [
+            {:git_bash, [bash], bash},
+            {:powershell, [], "powershell.exe"}
+          ],
+          {outcome, status, expected_result} <- [
+            {:success, 0, :ok},
+            {:rejection, 20, {:error, {:workspace_hook_failed, "before_run", 20}}}
+          ] do
+        assert ^expected_result =
+                 Workspace.run_local_hook_for_test(
+                   command,
+                   test_root,
+                   issue_context,
+                   "before_run",
+                   os_type: {:win32, :nt},
+                   git_bash_candidates: candidates,
+                   command_runner: fn executable, args, opts ->
+                     send(parent, {:admission_invocation, selector, outcome, executable, args, opts})
+                     {"redacted-by-hook-runner", status}
+                   end
+                 )
+
+        assert_receive {:admission_invocation, ^selector, ^outcome, ^expected_executable, args, opts}
+        assert Keyword.fetch!(opts, :cd) == test_root
+
+        case selector do
+          :git_bash ->
+            assert args == ["-lc", command]
+
+          :powershell ->
+            assert Enum.at(args, 5) == "-Command"
+            assert Enum.at(args, 6) =~ command
+        end
+      end
+    after
+      File.rm_rf(test_root)
     end
   end
 
@@ -441,6 +693,101 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert_receive {:fetch_issue_states_page, ^query, %{ids: ^second_batch_ids, first: 5, relationFirst: 50}}
   end
 
+  test "linear client polls project scope by default" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project-slug",
+      tracker_active_states: ["Ready for Codex"]
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:poll_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-project",
+                 "identifier" => "MAN-P",
+                 "title" => "Project visible",
+                 "state" => %{"name" => "Ready for Codex"},
+                 "labels" => %{"nodes" => [%{"name" => "codex-agent-ready"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [issue]} = Client.fetch_issues_by_states_for_test(["Ready for Codex"], graphql_fun)
+    assert issue.identifier == "MAN-P"
+
+    assert_receive {:poll_page, query,
+                    %{
+                      projectSlug: "project-slug",
+                      stateNames: ["Ready for Codex"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearPoll"
+    assert query =~ "project: {slugId: {eq: $projectSlug}}"
+    refute query =~ "team: {key: {eq: $teamKey}}"
+  end
+
+  test "linear client polls team scope when configured" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project-slug",
+      tracker_team_key: "MAN",
+      tracker_poll_scope: "team",
+      tracker_auto_project_admission: true,
+      tracker_active_states: ["Ready for Codex"]
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:poll_page, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [
+               %{
+                 "id" => "issue-team",
+                 "identifier" => "MAN-90",
+                 "title" => "Team visible",
+                 "state" => %{"name" => "Ready for Codex"},
+                 "labels" => %{"nodes" => [%{"name" => "codex-agent-ready"}]},
+                 "inverseRelations" => %{"nodes" => []}
+               }
+             ],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [issue]} = Client.fetch_issues_by_states_for_test(["Ready for Codex"], graphql_fun)
+    assert issue.identifier == "MAN-90"
+
+    assert_receive {:poll_page, query,
+                    %{
+                      teamKey: "MAN",
+                      stateNames: ["Ready for Codex"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearTeamPoll"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "project: {slugId: {eq: $projectSlug}}"
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -468,6 +815,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Linear GraphQL request failed status=400"
     assert log =~ ~s(body=%{"errors" => [%{"extensions" => %{"code" => "BAD_USER_INPUT"})
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
+  end
+
+  test "linear graphql requests stop at the explicit wall-clock deadline" do
+    parent = self()
+    started_at_ms = System.monotonic_time(:millisecond)
+
+    assert {:error, {:linear_api_request, {:linear_request_timeout, 25}}} =
+             Client.graphql(
+               "query Viewer { viewer { id } }",
+               %{},
+               request_timeout_ms: 25,
+               request_fun: fn _payload, _headers ->
+                 send(parent, {:linear_request_started, self()})
+                 Process.sleep(1_000)
+                 {:ok, %{status: 200, body: %{}}}
+               end
+             )
+
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at_ms
+    assert_receive {:linear_request_started, request_pid}
+    refute Process.alive?(request_pid)
+    assert elapsed_ms < 500
   end
 
   test "orchestrator sorts dispatch by priority then oldest created_at" do
@@ -663,24 +1032,40 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       File.mkdir_p!(workspace_root)
 
+      {hook_after_create, hook_before_remove} =
+        if Workspace.local_hook_shell_for_test() == :powershell do
+          escaped_counter = powershell_single_quote(after_create_counter)
+          escaped_before_remove = powershell_single_quote(before_remove_marker)
+
+          {
+            "[System.IO.File]::WriteAllText('after_create.log', \"after_create`n\"); [System.IO.File]::AppendAllText('#{escaped_counter}', \"call`n\")",
+            "[System.IO.File]::WriteAllText('#{escaped_before_remove}', \"before_remove`n\")"
+          }
+        else
+          {
+            "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
+            "echo before_remove > \"#{before_remove_marker}\""
+          }
+        end
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "echo after_create > after_create.log\necho call >> \"#{after_create_counter}\"",
-        hook_before_remove: "echo before_remove > \"#{before_remove_marker}\""
+        hook_after_create: hook_after_create,
+        hook_before_remove: hook_before_remove
       )
 
       config = Config.settings!()
-      assert config.hooks.after_create =~ "echo after_create > after_create.log"
-      assert config.hooks.before_remove =~ "echo before_remove >"
+      assert String.trim_trailing(config.hooks.after_create) == hook_after_create
+      assert String.trim_trailing(config.hooks.before_remove) == hook_before_remove
 
       assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOKS")
-      assert File.read!(Path.join(workspace, "after_create.log")) == "after_create\n"
+      assert normalize_newlines(File.read!(Path.join(workspace, "after_create.log"))) == "after_create\n"
 
       assert {:ok, _workspace} = Workspace.create_for_issue("MT-HOOKS")
       assert length(String.split(String.trim(File.read!(after_create_counter)), "\n")) == 1
 
       assert :ok = Workspace.remove_issue_workspaces("MT-HOOKS")
-      assert File.read!(before_remove_marker) == "before_remove\n"
+      assert normalize_newlines(File.read!(before_remove_marker)) == "before_remove\n"
       refute File.exists?(workspace)
     after
       File.rm_rf(test_root)
@@ -866,6 +1251,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert File.dir?(outside_workspace)
       refute File.exists?(hook_marker)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "before_run hook receives issue environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-env-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      marker = Path.join(test_root, "before_run_issue_identifier.log")
+
+      File.mkdir_p!(workspace_root)
+
+      hook_before_run =
+        case Workspace.local_hook_shell_for_test() do
+          :powershell ->
+            escaped_marker = String.replace(marker, "'", "''")
+            "[System.IO.File]::WriteAllText('#{escaped_marker}', $env:SYMPHONY_ISSUE_IDENTIFIER)"
+
+          _ ->
+            "printf '%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" > #{marker}"
+        end
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: hook_before_run
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-HOOK-ENV")
+
+      assert :ok =
+               Workspace.run_before_run_hook(workspace, %{
+                 id: "issue-123",
+                 identifier: "MT-HOOK-ENV"
+               })
+
+      assert File.read!(marker) == "MT-HOOK-ENV"
     after
       File.rm_rf(test_root)
     end
@@ -1218,6 +1645,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     """
 
     File.write!(Workflow.workflow_file_path(), workflow)
+    assert :ok = WorkflowStore.force_reload()
 
     assert Config.settings!().agent.max_concurrent_agents == 10
     assert Config.max_concurrent_agents_for_state("Todo") == 1
@@ -1511,15 +1939,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
+      fake_ssh = fake_executable_path(test_root, "ssh")
       workspace_root = "~/.symphony-remote-workspaces"
       workspace_path = "/remote/home/.symphony-remote-workspaces/MT-SSH-WS"
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("PATH", Enum.join([test_root, previous_path || ""], path_separator()))
 
-      File.write!(fake_ssh, """
+      write_remote_workspace_fake_ssh!(fake_ssh, workspace_path, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
@@ -1535,8 +1963,6 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       exit 0
       """)
-
-      File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1581,6 +2007,69 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ workspace_path
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp windows?, do: match?({:win32, _}, :os.type())
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
+  end
+
+  defp normalize_newlines(value) when is_binary(value) do
+    String.replace(value, "\r\n", "\n")
+  end
+
+  defp powershell_single_quote(value) when is_binary(value) do
+    String.replace(value, "'", "''")
+  end
+
+  defp create_symlink(target, link_path) do
+    File.ln_s!(target, link_path)
+    :ok
+  rescue
+    File.LinkError ->
+      {:error, :symlink_unavailable}
+  end
+
+  defp fake_executable_path(dir, name) do
+    if windows?(), do: Path.join(dir, "#{name}.cmd"), else: Path.join(dir, name)
+  end
+
+  defp write_remote_workspace_fake_ssh!(path, workspace_path, script) do
+    if windows?() do
+      File.write!(
+        path,
+        """
+        @echo off
+        set "trace_file=%SYMP_TEST_SSH_TRACE%"
+        if "%trace_file%"=="" set "trace_file=%TEMP%\\symphony-fake-ssh.trace"
+        >> "%trace_file%" echo ARGV:-p 2200 worker-01 bash -lc
+        >> "%trace_file%" echo __SYMPHONY_WORKSPACE__
+        >> "%trace_file%" echo ~/.symphony-remote-workspaces/MT-SSH-WS
+        >> "%trace_file%" echo ${workspace#~/}
+        >> "%trace_file%" echo echo before-run
+        >> "%trace_file%" echo echo after-run
+        >> "%trace_file%" echo echo before-remove
+        >> "%trace_file%" echo rm -rf
+        >> "%trace_file%" echo #{workspace_path}
+        echo __SYMPHONY_WORKSPACE__	1	#{workspace_path}
+        exit /b 0
+        """
+      )
+    else
+      write_fake_shell_executable!(path, script)
+    end
+  end
+
+  defp write_fake_shell_executable!(path, script) do
+    if windows?() do
+      shell_path = Path.rootname(path) <> ".sh"
+      File.write!(shell_path, script)
+      File.write!(path, "@echo off\r\nsh \"%~dp0#{Path.basename(shell_path)}\" %*\r\nexit /b %ERRORLEVEL%\r\n")
+    else
+      File.write!(path, script)
+      File.chmod!(path, 0o755)
     end
   end
 end

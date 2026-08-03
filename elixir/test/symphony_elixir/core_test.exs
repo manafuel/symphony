@@ -29,6 +29,9 @@ defmodule SymphonyElixir.CoreTest do
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert config.tracker.poll_scope == "project"
+    assert config.tracker.team_key == nil
+    assert config.tracker.auto_project_admission == false
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
 
@@ -61,6 +64,27 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     assert {:error, :missing_linear_project_slug} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: "project",
+      tracker_poll_scope: "TEAM",
+      tracker_team_key: nil
+    )
+
+    assert Config.settings!().tracker.poll_scope == "team"
+    assert {:error, :missing_linear_team_key} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "project",
+      tracker_poll_scope: "team",
+      tracker_team_key: "MAN",
+      tracker_auto_project_admission: true
+    )
+
+    assert Config.settings!().tracker.team_key == "MAN"
+    assert Config.settings!().tracker.auto_project_admission
+    assert :ok = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -448,7 +472,7 @@ defmodule SymphonyElixir.CoreTest do
       assert blocked_state.blocked[issue_id].block_kind == :before_terminal
 
       assert blocked_state.blocked[issue_id].error ==
-               "before_terminal acceptance failed: hook_failed_status_19"
+               "execution_terminal:operator_decision_required"
 
       refute Process.alive?(agent_pid)
       assert File.dir?(workspace)
@@ -1052,15 +1076,23 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      1_000
+    )
   end
 
   test "typed transient worker exit increments the execution attempt progressively" do
@@ -1093,6 +1125,8 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
+
     send(
       pid,
       {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
@@ -1100,17 +1134,23 @@ defmodule SymphonyElixir.CoreTest do
 
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     assert %{
              attempt: 3,
              due_at_ms: due_at_ms,
              identifier: "MT-559",
-             error: "agent exited with transient_transport",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 19_500, 20_500)
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      20_000
+    )
   end
 
   test "first typed transient worker exit schedules execution attempt two" do
@@ -1142,6 +1182,8 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    event_started_at_ms = System.monotonic_time(:millisecond)
+
     send(
       pid,
       {:DOWN, ref, :process, self(), {:shutdown, {:classified_failure, :transient_transport, "transport unavailable"}}}
@@ -1149,17 +1191,23 @@ defmodule SymphonyElixir.CoreTest do
 
     Process.sleep(50)
     state = :sys.get_state(pid)
+    state_observed_at_ms = System.monotonic_time(:millisecond)
 
     assert %{
              attempt: 2,
              due_at_ms: due_at_ms,
              identifier: "MT-560",
-             error: "agent exited with transient_transport",
+             error: "execution_backoff:transient_transport",
              failure_class: :transient_transport
            } =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_after_event(
+      due_at_ms,
+      event_started_at_ms,
+      state_observed_at_ms,
+      10_000
+    )
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1279,11 +1327,9 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp assert_due_after_event(due_at_ms, event_started_at_ms, state_observed_at_ms, expected_delay_ms) do
+    assert due_at_ms >= event_started_at_ms + expected_delay_ms
+    assert due_at_ms <= state_observed_at_ms + expected_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1339,6 +1385,23 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket MT-697"
     assert prompt =~ "created=2026-02-26T18:06:48Z"
     assert prompt =~ "updated=2026-02-26T18:07:03Z"
+  end
+
+  test "prompt builder exposes empty issue comments by default" do
+    workflow_prompt = "Ticket {{ issue.identifier }} comments={% for comment in issue.comments %}{{ comment.body }}{% else %}none{% endfor %}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MT-698",
+      title: "Render comments",
+      description: "Prompt should expose comments as an empty list",
+      state: "Todo",
+      url: "https://example.org/issues/MT-698",
+      labels: []
+    }
+
+    assert PromptBuilder.build_prompt(issue) == "Ticket MT-698 comments=none"
   end
 
   test "prompt builder normalizes nested date-like values, maps, and structs in issue fields" do
@@ -1501,6 +1564,112 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+  end
+
+  test "prompt builder compacts oversized MANAfuel workflow prompts" do
+    long_omitted_section = String.duplicate("grok-lane-detail ", 4_000)
+    long_comment = String.duplicate("historical workpad note ", 900)
+
+    workflow_prompt = """
+    # MANAfuel Symphony Workflow
+
+    ## App-Server Tool Execution Contract
+
+    Keep every shell command simple and use `write_run_artifact` for run evidence.
+
+    ## Issue Context
+
+    Identifier: {{ issue.identifier }}
+    Title: {{ issue.title }}
+    Current status: {{ issue.state }}
+    URL: {{ issue.url }}
+    Labels: {{ issue.labels }}
+
+    Description:
+    {{ issue.description }}
+
+    Recent Linear comments fetched by the harness:
+    {% for comment in issue.comments %}
+    Comment created_at={{ comment.created_at }}
+
+    {{ comment.body }}
+    {% endfor %}
+
+    ## Immediate Required First Actions
+
+    Post the `symphony:plan:{{ issue.identifier }}` marker before product edits.
+
+    ## Board Contract
+
+    Only `Ready for Codex`, `In Progress`, or `Rework` tickets with `codex-agent-ready` are dispatch-eligible.
+
+    ## Ticket Notes And Delivery Goal
+
+    Continue until the PR is merged and `symphony:final:{{ issue.identifier }}` evidence exists.
+
+    ## Bounded Delivery Loop
+
+    Token-runaway blockers require a reviewed guard or narrowed execution packet before requeue.
+
+    ## Worktree Rule
+
+    Product-code reads and writes require a clean named product worktree under `manafuel.worktree_root`.
+
+    ## Run Folder Contract
+
+    Required plan, validation, committee, reviewer, and proof artifacts must land in the run folder.
+
+    ## MCP Policy
+
+    Missing required MCPs move the ticket to Human Review only after documented fallback attempts.
+
+    ## Noninteractive Command Safety
+
+    Do not run inline scripts, shell redirection, or multi-step orchestration through shell tools.
+
+    ## Validation
+
+    Run the ticket-provided validation and record proof.
+
+    ## Completion
+
+    Do not mark Done without merge and final evidence.
+
+    ## Grok Candidate Lane (runtime-owner:grok)
+
+    #{long_omitted_section}
+    """
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MAN-153",
+      title: "Fix Growth page regression",
+      description: "Keep the actionable issue body in the first turn.",
+      state: "Rework",
+      url: "https://linear.app/manafuel/issue/MAN-153",
+      labels: ["codex-agent-ready", "owner:growth-marketing-system"],
+      comments: [
+        %{
+          created_at: "2026-07-06T10:00:00Z",
+          body: long_comment
+        }
+      ]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert String.length(prompt) <= 35_000
+    assert prompt =~ "compacted for token budget"
+    assert prompt =~ ".codex/workflows/symphony-manafuel/WORKFLOW.md"
+    assert prompt =~ "Keep every shell command simple"
+    assert prompt =~ "Identifier: MAN-153"
+    assert prompt =~ "Fix Growth page regression"
+    assert prompt =~ "Ready for Codex"
+    assert prompt =~ "symphony:final:MAN-153"
+    assert prompt =~ "Compacted prompt omitted"
+    assert prompt =~ "## Grok Candidate Lane"
+    refute prompt =~ String.duplicate("grok-lane-detail ", 100)
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -1710,33 +1879,10 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
-
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
-
-      File.write!(fake_ssh, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
-
-      case "$*" in
-        *worker-a*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\n' 'worker-a prepare failed' >&2
-          exit 75
-          ;;
-        *worker-b*"__SYMPHONY_WORKSPACE__"*)
-          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
-          exit 0
-          ;;
-        *)
-          exit 0
-          ;;
-      esac
-      """)
-
-      File.chmod!(fake_ssh, 0o755)
+      System.put_env("PATH", Enum.join([test_root, previous_path || ""], path_separator()))
+      write_workspace_prepare_fake_ssh!(test_root, trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "~/.symphony-remote-workspaces",
@@ -2163,40 +2309,11 @@ defmodule SymphonyElixir.CoreTest do
       System.put_env("SYMP_TEST_CODex_TRACE", trace_file)
       File.mkdir_p!(workspace)
 
-      File.write!(codex_binary, """
-      #!/bin/sh
-      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
-      count=0
-      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
-
-      while IFS= read -r line; do
-        count=$((count + 1))
-        case \"$count\" in
-          1)
-            printf '%s\\n' '{\"id\":1,\"result\":{}}'
-            ;;
-          2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
-            ;;
-          3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
-            ;;
-          4)
-            printf '%s\\n' '{\"method\":\"turn/completed\"}'
-            exit 0
-            ;;
-          *)
-            exit 0
-            ;;
-        esac
-      done
-      """)
-
-      File.chmod!(codex_binary, 0o755)
+      codex_command = write_custom_args_fake_codex!(test_root, codex_binary, trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --config 'model=\"gpt-5.5\"' app-server"
+        codex_command: "#{codex_command} --config 'model=\"gpt-5.5\"' app-server"
       )
 
       issue = %Issue{
@@ -2347,6 +2464,141 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  defp write_workspace_prepare_fake_ssh!(test_root, trace_file) do
+    if windows?() do
+      python = System.find_executable("python.exe") || System.find_executable("python") || "python"
+      script = Path.join(test_root, "ssh.py")
+      command = Path.join(test_root, "ssh.cmd")
+
+      File.write!(script, """
+      import sys
+
+      trace_path = #{inspect(trace_file)}
+      args = " ".join(sys.argv[1:])
+
+      with open(trace_path, "a", encoding="utf-8") as trace:
+          trace.write("ARGV:" + args + "\\n")
+
+      if "worker-a" in args and "__SYMPHONY_WORKSPACE__" in args:
+          print("worker-a prepare failed", file=sys.stderr)
+          sys.exit(75)
+
+      if "worker-b" in args and "__SYMPHONY_WORKSPACE__" in args:
+          print("__SYMPHONY_WORKSPACE__\\t1\\t/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER")
+          sys.exit(0)
+
+      sys.exit(0)
+      """)
+
+      File.write!(
+        command,
+        """
+        @echo off
+        "#{python}" "#{script}" %*
+        exit /b %ERRORLEVEL%
+        """
+      )
+    else
+      fake_ssh = Path.join(test_root, "ssh")
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+
+      case "$*" in
+        *worker-a*"__SYMPHONY_WORKSPACE__"*)
+          printf '%s\\n' 'worker-a prepare failed' >&2
+          exit 75
+          ;;
+        *worker-b*"__SYMPHONY_WORKSPACE__"*)
+          printf '%s\\t%s\\t%s\\n' '__SYMPHONY_WORKSPACE__' '1' '/remote/home/.symphony-remote-workspaces/MT-SSH-FAILOVER'
+          exit 0
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+    end
+  end
+
+  defp write_custom_args_fake_codex!(test_root, codex_binary, trace_file) do
+    if windows?() do
+      python = System.find_executable("python.exe") || System.find_executable("python") || "python"
+      script = Path.join(test_root, "fake-codex-custom-args.py")
+
+      File.write!(script, """
+      import os
+      import sys
+
+      trace_path = os.environ.get("SYMP_TEST_CODex_TRACE") or #{inspect(trace_file)}
+
+      with open(trace_path, "a", encoding="utf-8") as trace:
+          trace.write("ARGV:" + " ".join(sys.argv[1:]) + "\\n")
+
+      count = 0
+      for _line in sys.stdin:
+          count += 1
+          if count == 1:
+              print('{"id":1,"result":{}}', flush=True)
+          elif count == 2:
+              print('{"id":2,"result":{"thread":{"id":"thread-88"}}}', flush=True)
+          elif count == 3:
+              print('{"id":3,"result":{"turn":{"id":"turn-88"}}}', flush=True)
+          elif count == 4:
+              print('{"method":"turn/completed"}', flush=True)
+              sys.exit(0)
+
+      sys.exit(0)
+      """)
+
+      "#{String.replace(python, "\\", "/")} #{String.replace(script, "\\", "/")}"
+    else
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
+      count=0
+      printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case \"$count\" in
+          1)
+            printf '%s\\n' '{\"id\":1,\"result\":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      codex_binary
+    end
+  end
+
+  defp windows? do
+    match?({:win32, _}, :os.type())
+  end
+
+  defp path_separator do
+    if windows?(), do: ";", else: ":"
+  end
+
   test "failure classification is typed and unknown outcomes fail closed" do
     alias SymphonyElixir.FailureSemantics
 
@@ -2428,10 +2680,17 @@ defmodule SymphonyElixir.CoreTest do
     assert FailureSemantics.disposition(:approval_required) == :held
     assert FailureSemantics.disposition(:permanent_contract) == :permanent
 
-    assert {:shutdown, {:classified_failure, :unknown_fail_closed, bounded_reason}} =
+    assert {:shutdown, {:classified_failure, :unknown_fail_closed, safe_reason}} =
              FailureSemantics.exit_reason({:unexpected, String.duplicate("x", 4_000)})
 
-    assert byte_size(bounded_reason) <= 2_000
+    assert safe_reason == "unexpected"
+
+    secret_sentinel = "sk_live_R2_SHOULD_NOT_SURVIVE"
+
+    assert {:shutdown, {:classified_failure, :unknown_fail_closed, "unexpected"}} =
+             FailureSemantics.exit_reason({:unexpected, secret_sentinel})
+
+    refute FailureSemantics.safe_diagnostic({:unexpected, secret_sentinel}) =~ secret_sentinel
   end
 
   test "permanent, approval, and authority failures execute once and enter terminal state" do
@@ -2507,6 +2766,58 @@ defmodule SymphonyElixir.CoreTest do
     assert exhausted.blocked[issue.id].terminal_state == :held
     assert exhausted.blocked[issue.id].attempt == 3
     assert exhausted.blocked[issue.id].retry_exhausted
+  end
+
+  test "retry and terminal diagnostics never log or expose caller-controlled error text" do
+    secret_sentinel = "sk_live_R2_RETRY_DIAGNOSTIC_SENTINEL"
+
+    issue = %Issue{
+      id: "issue-retry-diagnostic-redaction",
+      identifier: "MT-R2-RETRY-DIAGNOSTIC",
+      title: "Retry diagnostics are structural",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-RETRY-DIAGNOSTIC"
+    }
+
+    retry_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        retrying =
+          Orchestrator.transition_failure_for_test(
+            %Orchestrator.State{max_retry_attempts: 3},
+            issue,
+            :transient_transport,
+            1,
+            "provider response #{secret_sentinel}"
+          )
+
+        send(self(), {:retry_diagnostic_state, retrying})
+      end)
+
+    assert_receive {:retry_diagnostic_state, retrying}
+    Process.cancel_timer(retrying.retry_attempts[issue.id].timer_ref)
+    assert retry_log =~ "failure_class=transient_transport"
+    refute retry_log =~ secret_sentinel
+    refute inspect(retrying) =~ secret_sentinel
+    assert retrying.retry_attempts[issue.id].error == "execution_backoff:transient_transport"
+
+    terminal_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        terminal =
+          Orchestrator.transition_failure_for_test(
+            %Orchestrator.State{max_retry_attempts: 3},
+            issue,
+            :transient_transport,
+            3,
+            "subprocess path #{secret_sentinel}"
+          )
+
+        send(self(), {:terminal_diagnostic_state, terminal})
+      end)
+
+    assert_receive {:terminal_diagnostic_state, terminal}
+    refute terminal_log =~ secret_sentinel
+    refute inspect(terminal) =~ secret_sentinel
+    assert terminal.blocked[issue.id].error == "execution_terminal:transient_transport"
   end
 
   test "failed retry revalidation remains represented and obeys the retry ceiling" do
@@ -2662,7 +2973,122 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.has_key?(recovered.retrying, "issue-restart-continuation")
   end
 
-  test "execution ledger falls back only when current is absent and rejects ambiguous input" do
+  test "execution ledger persists structural identity without issue body or raw failure text" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-redaction-#{System.unique_integer([:positive])}"
+      )
+
+    secret_sentinel = "sk_live_R2_LEDGER_SENTINEL"
+
+    issue = %Issue{
+      id: "issue-ledger-redaction",
+      identifier: "MT-R2-LEDGER-REDACTION",
+      title: "Title #{secret_sentinel}",
+      description: "Description #{secret_sentinel}",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-R2-LEDGER-REDACTION",
+      labels: ["symphony", secret_sentinel],
+      assigned_to_worker: true
+    }
+
+    terminal = %{
+      issue.id => %{
+        issue: issue,
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "transport response #{secret_sentinel}",
+        failure_class: :permanent_contract,
+        terminal_state: :permanent,
+        transition: :terminal,
+        attempt: 1,
+        blocked_at: DateTime.utc_now()
+      }
+    }
+
+    retrying = %{
+      "issue-retry-redaction" => %{
+        identifier: "MT-R2-RETRY-REDACTION",
+        error: "retry response #{secret_sentinel}",
+        attempt: 2,
+        failure_class: :transient_transport,
+        delay_type: :backoff,
+        transition: :retrying,
+        due_at: DateTime.add(DateTime.utc_now(), 60, :second)
+      }
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert {:ok, effects, _prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, terminal, retrying, effects)
+
+    ledger_path = Path.join([root, ".symphony-state", "execution.json"])
+    raw_ledger = File.read!(ledger_path)
+
+    refute raw_ledger =~ secret_sentinel
+    refute raw_ledger =~ "\"description\""
+    refute raw_ledger =~ "\"title\""
+    refute raw_ledger =~ "\"labels\""
+    assert raw_ledger =~ "execution_terminal:permanent_contract"
+    assert raw_ledger =~ "execution_backoff:transient_transport"
+
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    refute inspect(restored) =~ secret_sentinel
+    assert restored.blocked[issue.id].error == "execution_terminal:permanent_contract"
+
+    assert restored.retrying["issue-retry-redaction"].error ==
+             "execution_backoff:transient_transport"
+  end
+
+  test "dispatch reservation write failure blocks before any worker starts" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-ledger-write-failure-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-ledger-write-failure",
+      identifier: "MT-R2-LEDGER-WRITE-FAILURE",
+      title: "Do not launch without a durable reservation",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    File.write!(root, "this path is deliberately a file")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    state = %Orchestrator.State{
+      workspace_root: root,
+      execution_ledger_healthy: true,
+      max_retry_attempts: 3
+    }
+
+    blocked =
+      Orchestrator.spawn_issue_on_worker_host_for_test(
+        state,
+        issue,
+        1,
+        nil
+      )
+
+    assert blocked.running == %{}
+    assert [prepared_effect] = Map.values(blocked.effects)
+    assert prepared_effect.issue_id == issue.id
+    assert prepared_effect.status == :prepared
+    assert blocked.execution_ledger_healthy == false
+    assert blocked.blocked[issue.id].failure_class == :unknown_fail_closed
+    assert blocked.blocked[issue.id].terminal_state == :permanent
+    assert blocked.blocked[issue.id].error == "execution_terminal:unknown_fail_closed"
+    assert MapSet.member?(blocked.claimed, issue.id)
+  end
+
+  test "execution ledger recovers valid generations and fails closed when both are invalid" do
     alias SymphonyElixir.ExecutionLedger
 
     root =
@@ -2686,47 +3112,64 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
     assert :ok = ExecutionLedger.persist(root, %{}, %{}, started_effects)
 
-    assert {:ok, completed_effects} =
-             ExecutionLedger.mark_effect_completed(started_effects, prepared.idempotency_key)
-
-    terminal = %{
-      issue.id => %{
-        issue: issue,
-        identifier: issue.identifier,
-        failure_class: :permanent_contract,
-        terminal_state: :permanent,
-        transition: :terminal,
-        attempt: 1,
-        blocked_at: DateTime.utc_now()
-      }
-    }
-
-    assert :ok = ExecutionLedger.persist(root, terminal, %{}, completed_effects)
-
     state_root = Path.join(root, ".symphony-state")
     current = Path.join(state_root, "execution.json")
     previous = Path.join(state_root, "execution.previous.json")
 
-    File.write!(current, "{")
-    assert {:error, {:invalid_execution_ledger, _reason}} = ExecutionLedger.load(root)
+    valid_previous = File.read!(previous)
+    assert File.read!(current) == valid_previous
+    payload = Jason.decode!(valid_previous)
+    [effect] = payload["effects"]
+
+    legacy_v4_payload =
+      payload
+      |> Map.put("schema_version", "symphony.execution_ledger.v4")
+      |> Map.delete("generation_id")
+
+    File.write!(current, Jason.encode!(legacy_v4_payload))
+    assert {:ok, restored_v4} = ExecutionLedger.load(root)
+    assert restored_v4.effects[prepared.idempotency_key].status == :started
+
+    invalid_current_generations = [
+      {"corrupt JSON", "{"},
+      {"truncated JSON", binary_part(valid_previous, 0, div(byte_size(valid_previous), 2))},
+      {"schema-invalid JSON", Jason.encode!(%{"schema_version" => "unknown"})},
+      {"duplicate execution entry", payload |> Map.put("effects", [effect, effect]) |> Jason.encode!()},
+      {"invalid legacy entry",
+       Jason.encode!(%{
+         "schema_version" => "symphony.execution_ledger.v1",
+         "blocked" => [
+           %{
+             "issue_id" => issue.id,
+             "attempt" => "not-an-integer",
+             "blocked_at" => DateTime.to_iso8601(DateTime.utc_now())
+           }
+         ]
+       })}
+    ]
+
+    for {kind, invalid_current} <- invalid_current_generations do
+      File.write!(current, invalid_current)
+      assert {:ok, restored} = ExecutionLedger.load(root), kind
+      assert restored.effects[prepared.idempotency_key].status == :started
+
+      recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+      assert recovered.blocked[issue.id].terminal_state == :held
+      assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+    end
 
     File.rm!(current)
-    assert {:ok, restored} = ExecutionLedger.load(root)
-    assert restored.effects[prepared.idempotency_key].status == :started
+    File.mkdir!(current)
+    assert {:ok, restored_from_unreadable_current} = ExecutionLedger.load(root)
+    assert restored_from_unreadable_current.effects[prepared.idempotency_key].status == :started
+    File.rmdir!(current)
 
-    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
-    assert recovered.blocked[issue.id].terminal_state == :held
-    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+    File.write!(current, "{")
+    File.write!(previous, "{")
 
-    payload = previous |> File.read!() |> Jason.decode!()
-    [effect] = payload["effects"]
-    duplicate_payload = Map.put(payload, "effects", [effect, effect])
-    File.write!(current, Jason.encode!(duplicate_payload))
+    assert {:error, {:invalid_execution_generations, {:invalid_execution_ledger, _current_reason}, {:invalid_execution_ledger, _previous_reason}}} = ExecutionLedger.load(root)
 
-    assert {:error, {:invalid_execution_ledger, {:duplicate_execution_entry, duplicate_idempotency_key}}} =
-             ExecutionLedger.load(root)
-
-    assert duplicate_idempotency_key == prepared.idempotency_key
+    File.write!(previous, valid_previous)
 
     invalid_legacy_payload = %{
       "schema_version" => "symphony.execution_ledger.v1",
@@ -2740,9 +3183,197 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     File.write!(current, Jason.encode!(invalid_legacy_payload))
+    assert {:ok, _restored_from_previous} = ExecutionLedger.load(root)
+  end
 
-    assert {:error, {:invalid_execution_ledger, :invalid_legacy_attempt}} =
-             ExecutionLedger.load(root)
+  test "a corrupt current generation after dispatch launch preserves ownership and cannot redispatch" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-post-reservation-corruption-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-post-reservation-corruption",
+      identifier: "MT-R2-POST-RESERVATION",
+      title: "Never redispatch after ambiguous launch",
+      state: "In Progress",
+      assigned_to_worker: true
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    # Establish a pre-reservation generation, then commit the reservation. The
+    # old protocol left the pre-reservation state in execution.previous.json.
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, %{})
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+
+    state_root = Path.join(root, ".symphony-state")
+    current = Path.join(state_root, "execution.json")
+    previous = Path.join(state_root, "execution.previous.json")
+
+    # A successful commit mirrors the same generation before returning. Writing
+    # the marker represents a worker launch after the durable reservation.
+    assert File.read!(current) == File.read!(previous)
+    launch_marker = Path.join(root, "worker-launched")
+    File.write!(launch_marker, prepared.idempotency_key)
+    File.write!(current, "{")
+
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert restored.effects[prepared.idempotency_key].status == :prepared
+
+    recovered = Orchestrator.recover_ambiguous_effects_for_test(restored)
+    assert recovered.blocked[issue.id].terminal_state == :held
+    assert recovered.blocked[issue.id].failure_class == :operator_decision_required
+
+    restarted_state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      effects: recovered.effects,
+      claimed: MapSet.new(Map.keys(recovered.blocked)),
+      blocked: recovered.blocked,
+      retry_attempts: recovered.retrying,
+      running: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    assert MapSet.member?(restarted_state.claimed, issue.id)
+    assert restarted_state.running == %{}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, restarted_state)
+    assert File.read!(launch_marker) == prepared.idempotency_key
+  end
+
+  test "execution ledger retains idempotency evidence within a fail-closed capacity bound" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-effect-capacity-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    limit = ExecutionLedger.max_effect_entries()
+    now = DateTime.utc_now()
+
+    effects =
+      Map.new(1..limit, fn attempt ->
+        issue_id = "bounded-effect-#{attempt}"
+        key = ExecutionLedger.idempotency_key(issue_id, 1)
+
+        {key,
+         %{
+           idempotency_key: key,
+           issue_id: issue_id,
+           identifier: issue_id,
+           issue: %Issue{id: issue_id, identifier: issue_id, assigned_to_worker: true},
+           attempt: 1,
+           status: :completed,
+           prepared_at: now,
+           receipt_at: now
+         }}
+      end)
+
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+
+    overflow_issue_id = "bounded-effect-overflow"
+    overflow_key = ExecutionLedger.idempotency_key(overflow_issue_id, 1)
+
+    overflow_effect = %{
+      idempotency_key: overflow_key,
+      issue_id: overflow_issue_id,
+      identifier: overflow_issue_id,
+      issue: %Issue{
+        id: overflow_issue_id,
+        identifier: overflow_issue_id,
+        assigned_to_worker: true
+      },
+      attempt: 1,
+      status: :completed,
+      prepared_at: now,
+      receipt_at: now
+    }
+
+    assert {:error, {:execution_ledger_capacity_exceeded, :effects, exceeded, ^limit}} =
+             ExecutionLedger.persist(
+               root,
+               %{},
+               %{},
+               Map.put(effects, overflow_key, overflow_effect)
+             )
+
+    assert exceeded == limit + 1
+    assert {:ok, restored} = ExecutionLedger.load(root)
+    assert map_size(restored.effects) == limit
+
+    assert {:duplicate, _effect} =
+             ExecutionLedger.reserve_effect(restored.effects, %Issue{id: "bounded-effect-1"}, 1)
+  end
+
+  test "execution ledger generation transitions preserve a recoverable synced state" do
+    alias SymphonyElixir.ExecutionLedger
+
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-r2-execution-ledger-crash-states-#{System.unique_integer([:positive])}"
+      )
+
+    issue = %Issue{
+      id: "issue-crash-state-safety",
+      identifier: "MT-R2-CRASH-STATE",
+      title: "Generation crash state",
+      state: "In Progress"
+    }
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf(root) end)
+
+    assert {:ok, effects, prepared} = ExecutionLedger.reserve_effect(%{}, issue, 1)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, effects)
+    assert {:ok, started_effects} = ExecutionLedger.mark_effect_started(effects, prepared.idempotency_key)
+    assert :ok = ExecutionLedger.persist(root, %{}, %{}, started_effects)
+
+    state_root = Path.join(root, ".symphony-state")
+    current = Path.join(state_root, "execution.json")
+    previous = Path.join(state_root, "execution.previous.json")
+    temporary = Path.join(state_root, "execution.json.tmp-crash-simulation")
+    valid_current = File.read!(current)
+    valid_previous = File.read!(previous)
+
+    # Crash after syncing the new temporary generation but before rotation.
+    File.write!(temporary, valid_current)
+    assert {:ok, before_rotation} = ExecutionLedger.load(root)
+    assert before_rotation.effects[prepared.idempotency_key].status == :started
+
+    # Crash after removing an older previous generation but before rotating current.
+    File.rm!(previous)
+    assert {:ok, after_previous_removal} = ExecutionLedger.load(root)
+    assert after_previous_removal.effects[prepared.idempotency_key].status == :started
+
+    # Crash after rotating current to previous but before installing the temporary generation.
+    File.rename!(current, previous)
+    assert {:ok, after_rotation} = ExecutionLedger.load(root)
+    assert after_rotation.effects[prepared.idempotency_key].status == :started
+
+    # Crash after installing a new current but before its directory-sync boundary.
+    File.rename!(temporary, current)
+    assert {:ok, after_install} = ExecutionLedger.load(root)
+    assert after_install.effects[prepared.idempotency_key].status == :started
+
+    # A torn installed current still recovers the last synced previous generation.
+    File.write!(current, "{")
+    assert {:ok, after_torn_install} = ExecutionLedger.load(root)
+    assert after_torn_install.effects[prepared.idempotency_key].status == :started
+
+    # Restore the older generation to prove the fixture itself retained both states.
+    File.write!(previous, valid_previous)
+    assert {:ok, _restored} = ExecutionLedger.load(root)
   end
 
   test "an ambiguous dispatch effect remains held and cannot receive a new sequence" do

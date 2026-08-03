@@ -105,7 +105,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     ensure_workflow_store_running()
     assert {:ok, %{prompt: "You are an agent for this repository."}} = Workflow.current()
 
-    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Second prompt")
+    workflow_path = Workflow.workflow_file_path()
+
+    workflow_path
+    |> File.read!()
+    |> String.replace("You are an agent for this repository.", "Second prompt")
+    |> then(&File.write!(workflow_path, &1))
+
+    cached_state = :sys.get_state(WorkflowStore)
+
+    assert {:reply, {:ok, %{prompt: "You are an agent for this repository."}}, ^cached_state} =
+             WorkflowStore.handle_call(:current, {self(), make_ref()}, cached_state)
+
     send(WorkflowStore, :poll)
 
     assert_eventually(fn ->
@@ -320,6 +331,18 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
+    source_sha = String.duplicate("a", 40)
+    previous_source_sha = System.get_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+    System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", source_sha)
+
+    on_exit(fn ->
+      if is_nil(previous_source_sha) do
+        System.delete_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+      else
+        System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", previous_source_sha)
+      end
+    end)
+
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
 
@@ -342,6 +365,8 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
+             "source_sha" => source_sha,
+             "max_concurrent_agents" => 10,
              "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
              "running" => [
                %{
@@ -357,7 +382,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+                 "tokens" => %{
+                   "input_tokens" => 4,
+                   "output_tokens" => 8,
+                   "total_tokens" => 12,
+                   "cached_input_tokens" => 0,
+                   "billable_tokens" => 12
+                 }
                }
              ],
              "retrying" => [
@@ -419,7 +450,13 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+               "tokens" => %{
+                 "input_tokens" => 4,
+                 "output_tokens" => 8,
+                 "total_tokens" => 12,
+                 "cached_input_tokens" => 0,
+                 "billable_tokens" => 12
+               }
              },
              "retry" => nil,
              "blocked" => nil,
@@ -456,6 +493,34 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability state fails closed on invalid runtime source provenance" do
+    previous_source_sha = System.get_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+    System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", "not-a-source-sha")
+
+    on_exit(fn ->
+      if is_nil(previous_source_sha) do
+        System.delete_env("MANAFUEL_RUNTIME_SOURCE_SHA")
+      else
+        System.put_env("MANAFUEL_RUNTIME_SOURCE_SHA", previous_source_sha)
+      end
+    end)
+
+    snapshot = static_snapshot()
+    orchestrator_name = Module.concat(__MODULE__, :InvalidSourceShaObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert %{"source_sha" => nil, "max_concurrent_agents" => 10} =
+             json_response(get(build_conn(), "/api/v1/state"), 200)
   end
 
   test "presenter distinguishes held and permanent terminal outcomes" do

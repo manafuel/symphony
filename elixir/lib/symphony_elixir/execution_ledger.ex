@@ -2,16 +2,25 @@ defmodule SymphonyElixir.ExecutionLedger do
   @moduledoc """
   Durable retry, terminal-state, and dispatch-effect ownership.
 
-  One current and one previous generation are kept under the configured
+  One current and one mirrored recovery generation are kept under the configured
   workspace root. A prepared dispatch effect is written before a worker starts;
   after restart, an unreceipted effect is ambiguous and must be held rather than
-  executed again.
+  executed again. A successful persistence call does not return until both
+  generations contain the same new state. Therefore a corrupt current generation
+  cannot fall back to a pre-reservation state after a worker launch.
+
+  Persistence uses a synced temporary file followed by crash-safe generation
+  rotation. POSIX hosts sync the parent directory after every directory-entry
+  transition. On Windows, Erlang/OTP implements `:file.rename/2` with
+  `MOVEFILE_WRITE_THROUGH`; the synced file plus write-through rename is the
+  supported metadata durability boundary.
   """
 
   alias SymphonyElixir.{FailureSemantics, PathSafety}
   alias SymphonyElixir.Linear.Issue
 
-  @schema_version "symphony.execution_ledger.v4"
+  @schema_version "symphony.execution_ledger.v5"
+  @effect_schema_versions ["symphony.execution_ledger.v4"]
   @legacy_schema_versions [
     "symphony.execution_ledger.v3",
     "symphony.execution_ledger.v2",
@@ -20,6 +29,7 @@ defmodule SymphonyElixir.ExecutionLedger do
   @ledger_file "execution.json"
   @previous_ledger_file "execution.previous.json"
   @max_text_bytes 2_000
+  @max_effect_entries 10_000
 
   @type state :: %{blocked: map(), retrying: map(), effects: map()}
 
@@ -35,11 +45,22 @@ defmodule SymphonyElixir.ExecutionLedger do
       when is_binary(workspace_root) and is_map(blocked) and is_map(retrying) and
              is_map(effects) do
     with {:ok, paths} <- ledger_paths(workspace_root),
+         :ok <- validate_effect_capacity(effects),
          :ok <- File.mkdir_p(Path.dirname(paths.current)),
          {:ok, content} <- encode(blocked, retrying, effects) do
       atomic_write(paths, content)
     end
   end
+
+  @doc """
+  Maximum number of durable dispatch tombstones and in-flight effects.
+
+  Completed effects are retained because removing one could permit the same
+  idempotency key to execute again. Persistence fails closed at this bound
+  instead of evicting ownership evidence.
+  """
+  @spec max_effect_entries() :: pos_integer()
+  def max_effect_entries, do: @max_effect_entries
 
   @spec reserve_effect(map(), Issue.t(), pos_integer()) ::
           {:ok, map(), map()} | {:duplicate, map()}
@@ -140,13 +161,37 @@ defmodule SymphonyElixir.ExecutionLedger do
   defp load_current_or_previous(paths) do
     cond do
       File.exists?(paths.current) ->
-        load_file(paths.current)
+        load_current_with_previous_fallback(paths)
 
       File.exists?(paths.previous) ->
         load_file(paths.previous)
 
       true ->
         {:ok, %{blocked: %{}, retrying: %{}, effects: %{}}}
+    end
+  end
+
+  defp load_current_with_previous_fallback(paths) do
+    case load_file(paths.current) do
+      {:ok, _state} = current ->
+        current
+
+      {:error, current_reason} = current_error ->
+        load_previous_after_current_failure(paths, current_reason, current_error)
+    end
+  end
+
+  defp load_previous_after_current_failure(paths, current_reason, current_error) do
+    if File.exists?(paths.previous) do
+      case load_file(paths.previous) do
+        {:ok, _state} = previous ->
+          previous
+
+        {:error, previous_reason} ->
+          {:error, {:invalid_execution_generations, current_reason, previous_reason}}
+      end
+    else
+      current_error
     end
   end
 
@@ -163,11 +208,34 @@ defmodule SymphonyElixir.ExecutionLedger do
 
   defp decode_payload(%{
          "schema_version" => @schema_version,
+         "generation_id" => generation_id,
          "blocked" => blocked,
          "retrying" => retrying,
          "effects" => effects
        })
-       when is_list(blocked) and is_list(retrying) and is_list(effects) do
+       when is_binary(generation_id) and is_list(blocked) and is_list(retrying) and
+              is_list(effects) do
+    with :ok <- validate_generation_id(generation_id),
+         {:ok, decoded_blocked} <- decode_entries(blocked, &decode_blocked/1),
+         {:ok, decoded_retrying} <- decode_entries(retrying, &decode_retry/1),
+         {:ok, decoded_effects} <- decode_entries(effects, &decode_effect/1) do
+      {:ok,
+       %{
+         blocked: decoded_blocked,
+         retrying: decoded_retrying,
+         effects: decoded_effects
+       }}
+    end
+  end
+
+  defp decode_payload(%{
+         "schema_version" => version,
+         "blocked" => blocked,
+         "retrying" => retrying,
+         "effects" => effects
+       })
+       when version in @effect_schema_versions and is_list(blocked) and is_list(retrying) and
+              is_list(effects) do
     with {:ok, decoded_blocked} <- decode_entries(blocked, &decode_blocked/1),
          {:ok, decoded_retrying} <- decode_entries(retrying, &decode_retry/1),
          {:ok, decoded_effects} <- decode_entries(effects, &decode_effect/1) do
@@ -263,7 +331,7 @@ defmodule SymphonyElixir.ExecutionLedger do
       issue: issue,
       identifier: Map.get(entry, "identifier") || issue.identifier || issue_id,
       issue_url: Map.get(entry, "issue_url") || issue.url,
-      error: Map.get(entry, "error") || "terminal failure",
+      error: safe_failure_diagnostic(decoded_class, :terminal),
       worker_host: Map.get(entry, "worker_host"),
       workspace_path: Map.get(entry, "workspace_path"),
       session_id: Map.get(entry, "session_id"),
@@ -290,7 +358,7 @@ defmodule SymphonyElixir.ExecutionLedger do
           issue: issue,
           identifier: Map.get(entry, "identifier") || issue.identifier || issue_id,
           issue_url: Map.get(entry, "issue_url") || issue.url,
-          error: Map.get(entry, "error") || "legacy terminal state",
+          error: safe_failure_diagnostic(:unknown_fail_closed, :legacy_terminal),
           worker_host: Map.get(entry, "worker_host"),
           workspace_path: Map.get(entry, "workspace_path"),
           session_id: Map.get(entry, "session_id"),
@@ -334,7 +402,7 @@ defmodule SymphonyElixir.ExecutionLedger do
           attempt: attempt,
           identifier: Map.get(entry, "identifier") || issue_id,
           issue_url: Map.get(entry, "issue_url"),
-          error: Map.get(entry, "error"),
+          error: safe_failure_diagnostic(decoded_class, decode_delay_type(delay_type)),
           worker_host: Map.get(entry, "worker_host"),
           workspace_path: Map.get(entry, "workspace_path"),
           failure_class: decoded_class,
@@ -402,6 +470,7 @@ defmodule SymphonyElixir.ExecutionLedger do
   defp encode(blocked, retrying, effects) do
     Jason.encode(%{
       schema_version: @schema_version,
+      generation_id: new_generation_id(),
       generated_at: DateTime.utc_now() |> DateTime.truncate(:millisecond) |> DateTime.to_iso8601(),
       blocked: encode_sorted(blocked, &encode_blocked/2),
       retrying: encode_sorted(retrying, &encode_retry/2),
@@ -421,7 +490,11 @@ defmodule SymphonyElixir.ExecutionLedger do
       identifier: bounded_text(Map.get(entry, :identifier)),
       issue_url: bounded_text(Map.get(entry, :issue_url)),
       issue: encode_issue(Map.get(entry, :issue), issue_id),
-      error: bounded_text(Map.get(entry, :error) || "terminal failure"),
+      error:
+        safe_failure_diagnostic(
+          Map.get(entry, :failure_class),
+          Map.get(entry, :block_kind) || :terminal
+        ),
       worker_host: bounded_text(Map.get(entry, :worker_host)),
       workspace_path: bounded_text(Map.get(entry, :workspace_path)),
       session_id: bounded_text(Map.get(entry, :session_id)),
@@ -445,7 +518,11 @@ defmodule SymphonyElixir.ExecutionLedger do
       issue_id: bounded_text(issue_id),
       identifier: bounded_text(Map.get(entry, :identifier)),
       issue_url: bounded_text(Map.get(entry, :issue_url)),
-      error: bounded_text(Map.get(entry, :error)),
+      error:
+        safe_failure_diagnostic(
+          Map.get(entry, :failure_class),
+          Map.get(entry, :delay_type) || :backoff
+        ),
       worker_host: bounded_text(Map.get(entry, :worker_host)),
       workspace_path: bounded_text(Map.get(entry, :workspace_path)),
       attempt: positive_integer(Map.get(entry, :attempt)),
@@ -475,14 +552,8 @@ defmodule SymphonyElixir.ExecutionLedger do
     %{
       id: bounded_text(issue.id || issue_id),
       identifier: bounded_text(issue.identifier),
-      title: bounded_text(issue.title),
-      description: bounded_text(issue.description),
-      priority: issue.priority,
       state: bounded_text(issue.state),
       url: bounded_text(issue.url),
-      assignee_id: bounded_text(issue.assignee_id),
-      labels: sanitize_json(issue.labels),
-      blocked_by: sanitize_json(issue.blocked_by),
       assigned_to_worker: issue.assigned_to_worker
     }
   end
@@ -494,14 +565,8 @@ defmodule SymphonyElixir.ExecutionLedger do
      %Issue{
        id: Map.get(issue, "id") || issue_id,
        identifier: Map.get(issue, "identifier"),
-       title: Map.get(issue, "title"),
-       description: Map.get(issue, "description"),
-       priority: Map.get(issue, "priority"),
        state: Map.get(issue, "state"),
        url: Map.get(issue, "url"),
-       assignee_id: Map.get(issue, "assignee_id"),
-       labels: Map.get(issue, "labels") || [],
-       blocked_by: Map.get(issue, "blocked_by") || [],
        assigned_to_worker: Map.get(issue, "assigned_to_worker") != false
      }}
   end
@@ -556,6 +621,34 @@ defmodule SymphonyElixir.ExecutionLedger do
   defp decode_effect_status("completed"), do: {:ok, :completed}
   defp decode_effect_status(_status), do: {:error, :invalid_effect_status}
 
+  defp validate_generation_id(generation_id) do
+    case Base.decode16(generation_id, case: :lower) do
+      {:ok, decoded} when byte_size(decoded) == 16 -> :ok
+      _ -> {:error, :invalid_generation_id}
+    end
+  end
+
+  defp new_generation_id do
+    16
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :lower)
+  end
+
+  defp validate_effect_capacity(effects) when map_size(effects) <= @max_effect_entries, do: :ok
+
+  defp validate_effect_capacity(effects) do
+    {:error, {:execution_ledger_capacity_exceeded, :effects, map_size(effects), @max_effect_entries}}
+  end
+
+  defp safe_failure_diagnostic(class, context) when is_atom(context) do
+    class_label =
+      if FailureSemantics.valid_class?(class),
+        do: Atom.to_string(class),
+        else: "continuation"
+
+    "execution_#{context}:#{class_label}"
+  end
+
   defp decode_known_atom("before_terminal"), do: :before_terminal
   defp decode_known_atom(_value), do: nil
 
@@ -605,26 +698,63 @@ defmodule SymphonyElixir.ExecutionLedger do
       else: {:halt, acc <> "...[truncated]"}
   end
 
-  defp sanitize_json(value) when is_binary(value), do: bounded_text(value)
-  defp sanitize_json(value) when is_list(value), do: Enum.map(value, &sanitize_json/1)
-
-  defp sanitize_json(value) when is_map(value) do
-    Map.new(value, fn {key, nested} -> {key, sanitize_json(nested)} end)
-  end
-
-  defp sanitize_json(value), do: value
-
   defp atomic_write(paths, content) do
     temporary = "#{paths.current}.tmp-#{System.unique_integer([:positive, :monotonic])}"
 
     with :ok <- durable_write(temporary, content),
+         :ok <- sync_parent_directory(paths.current),
          :ok <- rotate_current_generation(paths),
-         :ok <- File.rename(temporary, paths.current) do
+         :ok <- sync_parent_directory(paths.current),
+         :ok <- File.rename(temporary, paths.current),
+         :ok <- sync_parent_directory(paths.current),
+         :ok <- mirror_recovery_generation(paths, content) do
       :ok
     else
       {:error, reason} ->
         File.rm(temporary)
         {:error, {:execution_ledger_write_failed, reason}}
+    end
+  end
+
+  defp mirror_recovery_generation(paths, content) do
+    temporary =
+      "#{paths.previous}.tmp-#{System.unique_integer([:positive, :monotonic])}"
+
+    with :ok <- durable_write(temporary, content),
+         :ok <- sync_parent_directory(paths.previous),
+         :ok <- remove_if_present(paths.previous),
+         :ok <- sync_parent_directory(paths.previous),
+         :ok <- File.rename(temporary, paths.previous),
+         :ok <- sync_parent_directory(paths.previous) do
+      :ok
+    else
+      {:error, reason} ->
+        File.rm(temporary)
+        {:error, reason}
+    end
+  end
+
+  defp sync_parent_directory(path) do
+    case :os.type() do
+      {:win32, _name} ->
+        # OTP's Windows efile_rename uses MOVEFILE_WRITE_THROUGH. File content
+        # and metadata are synced before the rename by durable_write/2.
+        :ok
+
+      _other ->
+        sync_directory(Path.dirname(path))
+    end
+  end
+
+  defp sync_directory(path) do
+    case :file.open(String.to_charlist(path), [:read, :directory, :raw]) do
+      {:ok, device} ->
+        sync_result = :file.sync(device)
+        close_result = :file.close(device)
+        if sync_result == :ok, do: close_result, else: sync_result
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

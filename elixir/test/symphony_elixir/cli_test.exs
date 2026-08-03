@@ -136,4 +136,79 @@ defmodule SymphonyElixir.CLITest do
 
     assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
   end
+
+  test "production mode accepts only the exact bound CLI sequence" do
+    parent = self()
+    launch_path = Path.expand("launch.json")
+    contract_path = Path.expand("contract.json")
+    workflow_path = Path.expand("runtime-workflow.md")
+    launch_sha = String.duplicate("a", 64)
+    contract_sha = String.duplicate("b", 64)
+    launch = %{document: %{}}
+    contract = %{document: %{}}
+
+    deps = %{
+      file_regular?: fn path -> path == workflow_path end,
+      set_workflow_file_path: fn path ->
+        send(parent, {:workflow_set, path})
+        :ok
+      end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn ->
+        send(parent, :started)
+        {:ok, [:symphony_elixir]}
+      end,
+      load_launch_receipt: fn path, digest ->
+        send(parent, {:launch_reopened, path, digest})
+        {:ok, launch}
+      end,
+      load_producer_contract: fn path, digest ->
+        send(parent, {:contract_reopened, path, digest})
+        {:ok, contract}
+      end,
+      validate_production_authority: fn actual_launch, actual_contract, path ->
+        send(parent, {:authority_validated, actual_launch, actual_contract, path})
+        :ok
+      end,
+      validate_runtime_binding: fn actual_launch, actual_contract, path ->
+        send(parent, {:runtime_binding_validated, actual_launch, actual_contract, path})
+        :ok
+      end,
+      install_production_authority: fn actual_launch, actual_contract, path ->
+        send(parent, {:authority_installed, actual_launch, actual_contract, path})
+        :ok
+      end
+    }
+
+    args = [
+      "--production-mode",
+      "--production-launch-receipt",
+      launch_path,
+      "--expected-launch-receipt-sha256",
+      launch_sha,
+      "--producer-contract-manifest",
+      contract_path,
+      "--expected-producer-contract-sha256",
+      contract_sha,
+      workflow_path
+    ]
+
+    assert :ok = CLI.evaluate(args, deps)
+    assert_received {:launch_reopened, ^launch_path, ^launch_sha}
+    assert_received {:contract_reopened, ^contract_path, ^contract_sha}
+    assert_received {:authority_validated, ^launch, ^contract, ^workflow_path}
+    assert_received {:runtime_binding_validated, ^launch, ^contract, ^workflow_path}
+    assert_received {:authority_installed, ^launch, ^contract, ^workflow_path}
+    assert_received {:workflow_set, ^workflow_path}
+    assert_received :started
+
+    refute match?(
+             :ok,
+             CLI.evaluate(
+               List.replace_at(args, 1, "--expected-launch-receipt-sha256"),
+               deps
+             )
+           )
+  end
 end

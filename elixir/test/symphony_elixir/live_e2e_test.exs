@@ -5,14 +5,14 @@ defmodule SymphonyElixir.LiveE2ETest do
   alias SymphonyElixir.SSH
 
   @moduletag :live_e2e
-  @moduletag timeout: 300_000
+  @moduletag timeout: 120_000
 
   @default_team_key "SYME2E"
   @default_docker_auth_json Path.join(System.user_home!(), ".codex/auth.json")
   @docker_worker_count 2
   @docker_support_dir Path.expand("../support/live_e2e_docker", __DIR__)
   @docker_compose_file Path.join(@docker_support_dir, "docker-compose.yml")
-  @result_file "LIVE_E2E_RESULT.txt"
+  @result_file "runs/LIVE_E2E_RESULT.txt"
   @live_e2e_skip_reason if(System.get_env("SYMPHONY_RUN_LIVE_E2E") != "1",
                           do: "set SYMPHONY_RUN_LIVE_E2E=1 to enable the real Linear/Codex end-to-end test"
                         )
@@ -303,24 +303,19 @@ defmodule SymphonyElixir.LiveE2ETest do
     The current working directory is the workspace root.
 
     Step 1:
-    Create a file named #{@result_file} in the current working directory by running exactly:
+    Call the `write_run_artifact` tool exactly once with:
+    - `path`: `#{@result_file}`
+    - `overwrite`: `true`
+    - `content` exactly as shown below, including the final newline:
 
-    ```sh
-    cat > #{@result_file} <<'EOF'
+    ```text
     identifier={{ issue.identifier }}
     project_slug=#{project_slug}
-    EOF
+
     ```
 
-    Then verify it by running:
-
-    ```sh
-    cat #{@result_file}
-    ```
-
-    The file content must be exactly:
-    identifier={{ issue.identifier }}
-    project_slug=#{project_slug}
+    Do not use shell commands to create or read the artifact. A successful
+    `write_run_artifact` response is the required artifact evidence.
 
     Step 2:
     You must use the `linear_graphql` tool to query the current issue by `{{ issue.id }}` and read:
@@ -461,6 +456,7 @@ defmodule SymphonyElixir.LiveE2ETest do
         worker_ssh_hosts: worker_setup.ssh_worker_hosts,
         codex_command: worker_setup.codex_command,
         codex_approval_policy: "never",
+        codex_read_timeout_ms: 30_000,
         observability_enabled: false
       )
 
@@ -492,13 +488,14 @@ defmodule SymphonyElixir.LiveE2ETest do
         worker_ssh_hosts: worker_setup.ssh_worker_hosts,
         codex_command: worker_setup.codex_command,
         codex_approval_policy: "never",
-        codex_turn_timeout_ms: 600_000,
-        codex_stall_timeout_ms: 600_000,
+        codex_read_timeout_ms: 30_000,
+        codex_turn_timeout_ms: 90_000,
+        codex_stall_timeout_ms: 90_000,
         observability_enabled: false,
         prompt: live_prompt(project["slugId"])
       )
 
-      assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
+      assert :ok = AgentRunner.run(issue, self(), max_turns: 1)
 
       runtime_info = receive_runtime_info!(issue.id)
 
@@ -521,7 +518,7 @@ defmodule SymphonyElixir.LiveE2ETest do
   defp live_worker_setup!(:local, _run_id, test_root) when is_binary(test_root) do
     %{
       cleanup: fn -> :ok end,
-      codex_command: "codex app-server",
+      codex_command: System.get_env("SYMPHONY_LIVE_CODEX_COMMAND") || "codex app-server",
       ssh_worker_hosts: [],
       workspace_root: Path.join(test_root, "workspaces")
     }

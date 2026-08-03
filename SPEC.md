@@ -747,7 +747,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 
 ### 8.1 Poll Loop
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
+At startup, the service validates config, starts the configured HTTP control surface before the
+orchestrator, schedules terminal workspace cleanup asynchronously, schedules an immediate tick, and
 then repeats every `polling.interval_ms`.
 
 The effective poll interval SHOULD be updated when workflow config changes are re-applied.
@@ -853,11 +854,15 @@ Part B: Tracker state refresh
 
 When the service starts:
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+1. Start the configured HTTP control surface before the orchestrator so cleanup cannot block its
+   listener.
+2. Start terminal cleanup as a supervised asynchronous task.
+3. Query tracker for issues in terminal states using a bounded request.
+4. For each returned issue identifier, remove the corresponding workspace directory.
+5. If the task cannot start or the terminal-issues fetch fails, log a warning and continue startup.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+This prevents stale terminal workspaces from accumulating after restarts without making tracker
+latency a prerequisite for application, orchestrator, or control-plane readiness.
 
 ## 9. Workspace Management and Safety
 
