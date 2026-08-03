@@ -384,22 +384,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
   defp windows_fake_binary_python("gh", script) do
     script = normalize_newlines(script)
 
-    mode =
-      cond do
-        String.contains?(script, ~s([ "$1" = "auth" ])) and
-          not String.contains?(script, ~s([ "$1" = "pr" ])) and String.contains?(script, "exit 1") ->
-          "auth_fail"
-
-        String.contains?(script, ~s([ "$1" = "pr" ] && [ "$2" = "list" ])) and
-          String.contains?(script, "exit 1") and not String.contains?(script, ~s([ "$2" = "close" ])) ->
-          "list_fail"
-
-        String.contains?(script, ~s([ "$2" = "close" ])) and not String.contains?(script, "boom") ->
-          "close_no_output"
-
-        true ->
-          "default"
-      end
+    mode = windows_fake_gh_mode(script)
 
     """
     import os
@@ -436,6 +421,29 @@ defmodule Mix.Tasks.Workspace.BeforeRemoveTest do
 
     sys.exit(99)
     """
+  end
+
+  defp windows_fake_gh_mode(script) do
+    cond do
+      windows_fake_gh_auth_fail?(script) -> "auth_fail"
+      windows_fake_gh_list_fail?(script) -> "list_fail"
+      windows_fake_gh_close_no_output?(script) -> "close_no_output"
+      true -> "default"
+    end
+  end
+
+  defp windows_fake_gh_auth_fail?(script) do
+    String.contains?(script, ~s([ "$1" = "auth" ])) and
+      not String.contains?(script, ~s([ "$1" = "pr" ])) and String.contains?(script, "exit 1")
+  end
+
+  defp windows_fake_gh_list_fail?(script) do
+    String.contains?(script, ~s([ "$1" = "pr" ] && [ "$2" = "list" ])) and
+      String.contains?(script, "exit 1") and not String.contains?(script, ~s([ "$2" = "close" ]))
+  end
+
+  defp windows_fake_gh_close_no_output?(script) do
+    String.contains?(script, ~s([ "$2" = "close" ])) and not String.contains?(script, "boom")
   end
 
   defp windows? do

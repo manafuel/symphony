@@ -115,27 +115,36 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
+    with :ok <- validate_tracker_kind(settings.tracker.kind) do
+      validate_linear_tracker(settings.tracker)
+    end
+  end
+
+  defp validate_tracker_kind(nil), do: {:error, :missing_tracker_kind}
+
+  defp validate_tracker_kind(kind) when kind not in ["linear", "memory"] do
+    {:error, {:unsupported_tracker_kind, kind}}
+  end
+
+  defp validate_tracker_kind(_kind), do: :ok
+
+  defp validate_linear_tracker(%{kind: "linear"} = tracker) do
     cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
+      not is_binary(tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
+      not is_binary(tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
 
-      settings.tracker.kind == "linear" and settings.tracker.poll_scope == "team" and
-          not is_binary(settings.tracker.team_key) ->
+      tracker.poll_scope == "team" and not is_binary(tracker.team_key) ->
         {:error, :missing_linear_team_key}
 
       true ->
         :ok
     end
   end
+
+  defp validate_linear_tracker(_tracker), do: :ok
 
   defp format_config_error(reason) do
     case reason do
