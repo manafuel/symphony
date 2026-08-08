@@ -2,7 +2,7 @@ defmodule SymphonyElixir.ProducerV6LedgerTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.{ExecutionLedgerRouter, Rfc8785Jcs}
-  alias SymphonyElixir.ProducerV6.{Authority, Ledger}
+  alias SymphonyElixir.ProducerV6.{Authority, Execution, Ledger}
 
   setup do
     prior = Authority.current_for_test()
@@ -23,6 +23,25 @@ defmodule SymphonyElixir.ProducerV6LedgerTest do
 
     assert {:error, :invalid_production_authority_property_set} =
              ExecutionLedgerRouter.load(tmp_root("invalid-authority"))
+  end
+
+  test "a durable terminal turn is complete without a closeout seal" do
+    idempotency_key = String.duplicate("a", 64)
+
+    effect =
+      Execution.entry_from_document(%{
+        "idempotency_key" => idempotency_key,
+        "last_milestone" => "turn_terminal"
+      })
+
+    assert effect.status == :turn_terminal
+
+    assert {:ok, %{^idempotency_key => ^effect}} =
+             ExecutionLedgerRouter.mark_effect_completed(
+               %{kind: :producer_v6},
+               %{idempotency_key => effect},
+               idempotency_key
+             )
   end
 
   test "quiescent canonical v6 pair loads and mutation is refused" do
