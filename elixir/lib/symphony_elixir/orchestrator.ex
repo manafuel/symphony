@@ -3117,19 +3117,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_producer_checkpoint(state, issue_id, running, key, _effect, :thread_ready, payload) do
     thread = Lifecycle.thread(payload)
 
-    with {:ok, next_state} <-
-           checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_thread_ready/4, thread),
-         claim when is_map(claim) <- running[:producer_claim],
-         current_effect when is_map(current_effect) <- Map.get(next_state.effects, key),
-         {:ok, closeout} <-
-           Lifecycle.closeout_directive(next_state.execution_ledger_context, current_effect, claim) do
-      next_running = Map.put(running, :producer_closeout, closeout)
+    case checkpoint_transition(state, key, &ExecutionLedgerRouter.mark_thread_ready/4, thread) do
+      {:ok, next_state} ->
+        next_running = Map.put(running, :producer_closeout, nil)
 
-      {:ok, %{next_state | running: Map.put(next_state.running, issue_id, next_running)}, {:ok, closeout}}
-    else
-      {:error, reason, failed_state} -> {:error, reason, failed_state}
-      {:error, reason} -> {:error, reason, state}
-      _ -> {:error, :producer_closeout_directive_invalid, state}
+        {:ok, %{next_state | running: Map.put(next_state.running, issue_id, next_running)}, {:ok, nil}}
+
+      {:error, reason, failed_state} ->
+        {:error, reason, failed_state}
     end
   end
 
