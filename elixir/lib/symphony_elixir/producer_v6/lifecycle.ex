@@ -19,6 +19,12 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
     end
   end
 
+  @doc false
+  @spec reference_for_test(map(), Path.t()) :: map()
+  def reference_for_test(identity, workspace_root)
+      when is_map(identity) and is_binary(workspace_root),
+      do: reference(identity, workspace_root)
+
   @spec claim(map(), map(), Path.t()) :: {:ok, map()} | {:error, term()}
   def claim(context, effect, workspace_path)
       when is_map(context) and is_map(effect) and is_binary(workspace_path) do
@@ -603,10 +609,16 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
   end
 
   defp reference(identity, workspace_root) do
+    wire_root =
+      workspace_root
+      |> String.replace("\\", "/")
+      |> String.trim_trailing("/")
+
     %{
       "path" =>
-        identity["path"]
-        |> Path.relative_to(Path.expand(workspace_root))
+        workspace_root
+        |> Broker.reference_wire_path(identity["path"])
+        |> String.replace_prefix(wire_root <> "/", "")
         |> String.replace("\\", "/"),
       "physical_path" => identity["physical_path"],
       "volume_id" => identity["volume_id"],
