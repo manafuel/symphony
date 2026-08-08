@@ -31,35 +31,14 @@ defmodule SymphonyElixir.ProducerV6.Broker do
       |> String.replace("\\", "/")
       |> String.trim_trailing("/")
 
-    raw_root =
-      workspace_root
-      |> String.trim_trailing("/")
-      |> String.trim_trailing("\\")
-
-    native_root = String.replace(wire_root, "/", "\\")
+    wire_path = String.replace(path, "\\", "/")
+    wire_prefix = wire_root <> "/"
 
     relative =
-      cond do
-        String.starts_with?(path, raw_root <> "/") ->
-          String.replace_prefix(path, raw_root <> "/", "")
-
-        String.starts_with?(path, raw_root <> "\\") ->
-          String.replace_prefix(path, raw_root <> "\\", "")
-
-        String.starts_with?(path, wire_root <> "/") ->
-          String.replace_prefix(path, wire_root <> "/", "")
-
-        String.starts_with?(path, wire_root <> "\\") ->
-          String.replace_prefix(path, wire_root <> "\\", "")
-
-        String.starts_with?(path, native_root <> "\\") ->
-          String.replace_prefix(path, native_root <> "\\", "")
-
-        String.starts_with?(path, native_root <> "/") ->
-          String.replace_prefix(path, native_root <> "/", "")
-
-        true ->
-          path
+      if String.starts_with?(String.downcase(wire_path), String.downcase(wire_prefix)) do
+        binary_part(wire_path, byte_size(wire_prefix), byte_size(wire_path) - byte_size(wire_prefix))
+      else
+        path
       end
 
     wire_root <> "/" <> String.replace(relative, "/", "\\")
@@ -458,11 +437,16 @@ defmodule SymphonyElixir.ProducerV6.Broker do
 
   defp immutable_reference(identity, workspace_root, expected_sha, expected_length)
        when is_map(identity) do
-    absolute_path = identity["path"]
+    wire_root =
+      workspace_root
+      |> String.replace("\\", "/")
+      |> String.trim_trailing("/")
+
+    wire_path = reference_wire_path(workspace_root, identity["path"])
 
     relative =
-      absolute_path
-      |> Path.relative_to(Path.expand(workspace_root))
+      wire_path
+      |> String.replace_prefix(wire_root <> "/", "")
       |> String.replace("\\", "/")
 
     with true <- Path.type(relative) == :relative,

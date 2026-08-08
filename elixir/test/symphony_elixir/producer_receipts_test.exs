@@ -221,6 +221,11 @@ defmodule SymphonyElixir.ProducerReceiptsTest do
 
     assert Broker.reference_wire_path(root, "C:\\MANAfuel\\worktrees\\symphony\\.symphony-state\\execution.json") ==
              expected
+
+    assert Broker.reference_wire_path(
+             "c:/MANAfuel/worktrees/symphony",
+             "C:\\MANAfuel\\worktrees\\symphony\\.symphony-state\\execution.json"
+           ) == "c:/MANAfuel/worktrees/symphony/.symphony-state\\execution.json"
   end
 
   test "production adapter reserves and commits prepared through the broker", %{
