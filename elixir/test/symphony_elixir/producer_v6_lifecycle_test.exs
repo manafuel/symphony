@@ -50,6 +50,26 @@ defmodule SymphonyElixir.ProducerV6LifecycleTest do
     end
   end
 
+  test "ledger references stay workspace-relative across Windows path case and separators" do
+    workspace_root = "c:/Users/example/worktrees/symphony"
+
+    identity = %{
+      "path" => "C:\\Users\\example\\worktrees\\symphony\\.symphony-state\\execution.json",
+      "physical_path" => "physical-path",
+      "volume_id" => "volume-id",
+      "file_id" => "file-id",
+      "file_type" => "regular",
+      "link_count" => 1,
+      "sha256" => String.duplicate("c", 64),
+      "length" => 185
+    }
+
+    reference = Lifecycle.reference_for_test(identity, workspace_root)
+
+    assert reference["path"] == ".symphony-state/execution.json"
+    refute String.contains?(reference["path"], ":")
+  end
+
   test "turn intent derives a content-bound unique client message id" do
     first = Lifecycle.turn_intent(1, "do the exact work")
     second = Lifecycle.turn_intent(2, "do the exact work")
