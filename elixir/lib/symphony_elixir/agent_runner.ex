@@ -292,7 +292,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp producer_thread_checkpoint(recipient, issue, payload, true) do
     case producer_checkpoint(recipient, issue, :thread_ready, payload, true) do
-      {:ok, closeout} when is_map(closeout) -> {:ok, closeout}
+      {:ok, closeout} when is_map(closeout) or is_nil(closeout) -> {:ok, closeout}
       {:error, reason} -> {:error, reason}
       _ -> {:error, :producer_closeout_directive_missing}
     end
@@ -302,6 +302,10 @@ defmodule SymphonyElixir.AgentRunner do
     with :ok <- producer_checkpoint(recipient, issue, :thread_ready, payload, false) do
       {:ok, nil}
     end
+  end
+
+  defp commit_turn_terminal(recipient, issue, turn_session, nil, _final, true) do
+    producer_checkpoint(recipient, issue, :turn_terminal, turn_session, true)
   end
 
   defp commit_turn_terminal(recipient, issue, turn_session, closeout, final, true) do
