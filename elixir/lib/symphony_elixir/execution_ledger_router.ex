@@ -166,6 +166,7 @@ defmodule SymphonyElixir.ExecutionLedgerRouter do
       when is_map(effects) and is_binary(idempotency_key) do
     case Map.get(effects, idempotency_key) do
       %{status: :completed} -> {:ok, effects}
+      %{status: :turn_terminal} -> {:ok, effects}
       nil -> {:error, :missing_effect}
       _active -> {:error, :producer_v6_terminal_completion_evidence_required}
     end

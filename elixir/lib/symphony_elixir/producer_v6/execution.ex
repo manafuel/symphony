@@ -530,6 +530,7 @@ defmodule SymphonyElixir.ProducerV6.Execution do
   defp stringify(value), do: value
 
   defp status(%{"last_milestone" => "completed"}), do: :completed
+  defp status(%{"last_milestone" => "turn_terminal"}), do: :turn_terminal
   defp status(%{"last_milestone" => "prepared"}), do: :prepared
   defp status(_document), do: :started
 
