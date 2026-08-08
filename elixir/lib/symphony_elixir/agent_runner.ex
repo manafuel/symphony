@@ -207,7 +207,7 @@ defmodule SymphonyElixir.AgentRunner do
              issue,
              on_message: codex_message_handler(context.codex_update_recipient, issue, producer_v6),
              client_user_message_id: if(producer_v6, do: intent["client_user_message_id"]),
-             capture_history: producer_v6
+             capture_history: false
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{context.workspace} turn=#{turn_number}/#{context.max_turns}")
 

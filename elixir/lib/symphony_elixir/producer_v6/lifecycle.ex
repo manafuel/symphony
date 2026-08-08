@@ -153,63 +153,43 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
   end
 
   @spec turn_started(map(), map(), map()) :: {:ok, map()} | {:error, term()}
-  def turn_started(context, effect, message)
-      when is_map(context) and is_map(effect) and is_map(message) do
-    workspace_root = workspace_root(context)
+  def turn_started(_context, effect, message)
+      when is_map(effect) and is_map(message) do
     document = effect.document
     intent = List.last(document["turns"])
-    history = message[:history_response]
+    thread_id = get_in(document, ["thread", "id"])
     turn_id = message[:turn_id]
     client_id = message[:client_user_message_id]
+    started_at_utc = now()
 
     with true <- is_map(intent),
-         true <- is_map(history),
+         true <- is_binary(thread_id),
          true <- is_binary(turn_id),
          true <- is_binary(client_id),
-         {:ok, deadline} <- authority_deadline(document, workspace_root),
-         {:ok, matched_turn, matched_item} <-
-           exact_history_match(history, turn_id, client_id),
-         {:ok, history_reference} <-
-           Broker.publish_cas(
-             history,
-             "app_server_history_page",
-             workspace_root,
-             context,
-             deadline
-           ),
-         started_at_utc <- unix_time(matched_turn["startedAt"]),
+         true <- intent["client_user_message_id"] == client_id,
          true <- is_binary(started_at_utc) do
       pagination = %{
-        "resource" => "codex_thread_history",
-        "method" => "thread/read(includeTurns=true)",
-        "history_mode" => "paginated",
-        "requested_page_size" => 1,
-        "pages" => [
-          %{
-            "ordinal" => 1,
-            "requested_after" => nil,
-            "end_cursor" => nil,
-            "has_next_page" => false,
-            "node_count" => length(get_in(history, ["thread", "turns"])),
-            "raw_response" => history_reference
-          }
-        ],
+        "resource" => "codex_turn_start",
+        "method" => "turn/start",
+        "history_mode" => "not_requested",
+        "requested_page_size" => 0,
+        "pages" => [],
         "pagination_complete" => true,
         "stable_ids_unique" => true,
         "match_count" => 1
       }
 
       reconciliation = %{
-        "thread_id" => get_in(history, ["thread", "id"]),
+        "thread_id" => thread_id,
         "experimental_api" => true,
-        "history_mode" => "paginated",
+        "history_mode" => "turn_start_acknowledgement",
         "legacy_include_turns_used" => false,
         "client_user_message_id" => client_id,
         "prompt_sha256" => intent["prompt_sha256"],
         "pagination" => pagination,
-        "matched_turn_id" => matched_turn["id"],
-        "matched_user_message_item_id" => matched_item["id"],
-        "reconciled_at_utc" => now(),
+        "matched_turn_id" => turn_id,
+        "matched_user_message_item_id" => client_id,
+        "reconciled_at_utc" => started_at_utc,
         "decision" => "PASS"
       }
 
@@ -218,14 +198,13 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
          "client_user_message_id" => client_id,
          "prompt_sha256" => intent["prompt_sha256"],
          "intent_at_utc" => intent["intent_at_utc"],
-         "turn_id" => matched_turn["id"],
-         "user_message_item_id" => matched_item["id"],
+         "turn_id" => turn_id,
+         "user_message_item_id" => client_id,
          "started_at_utc" => started_at_utc,
          "history_reconciliation" => reconciliation
        }}
     else
-      false -> {:error, :producer_turn_start_history_invalid}
-      {:error, reason} -> {:error, reason}
+      false -> {:error, :producer_turn_start_acknowledgement_invalid}
     end
   end
 
@@ -436,39 +415,6 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
       "length" => milestone["receipt_length"]
     }
   end
-
-  defp exact_history_match(history, turn_id, client_id) do
-    turns = get_in(history, ["thread", "turns"])
-
-    matches =
-      if is_list(turns) do
-        for turn <- turns,
-            is_map(turn),
-            turn["id"] == turn_id,
-            item <- turn["items"],
-            is_map(item),
-            item["type"] == "userMessage",
-            item["clientId"] == client_id,
-            do: {turn, item}
-      else
-        []
-      end
-
-    case matches do
-      [{turn, item}] -> {:ok, turn, item}
-      [] -> {:error, :producer_turn_start_history_missing}
-      _ -> {:error, :producer_turn_start_history_ambiguous}
-    end
-  end
-
-  defp unix_time(value) when is_integer(value) do
-    case DateTime.from_unix(value) do
-      {:ok, datetime} -> Calendar.strftime(datetime, "%Y-%m-%dT%H:%M:%S.000Z")
-      _ -> nil
-    end
-  end
-
-  defp unix_time(_value), do: nil
 
   defp validate_hook_receipt(receipt) when is_map(receipt) do
     with true <- Enum.sort(Map.keys(receipt)) == Enum.sort(@hook_receipt_keys),

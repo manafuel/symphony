@@ -81,6 +81,26 @@ defmodule SymphonyElixir.ProducerV6LifecycleTest do
     refute first["intent_at_utc"] == nil
   end
 
+  test "turn start uses the app-server acknowledgement without a history read" do
+    intent = Lifecycle.turn_intent(1, "do the exact work")
+    effect = %{document: %{"thread" => %{"id" => "thread-1"}, "turns" => [intent]}}
+
+    assert {:ok, started} =
+             Lifecycle.turn_started(%{}, effect, %{
+               turn_id: "turn-1",
+               client_user_message_id: intent["client_user_message_id"],
+               history_response: nil
+             })
+
+    assert started["turn_id"] == "turn-1"
+    assert started["user_message_item_id"] == intent["client_user_message_id"]
+
+    assert started["history_reconciliation"]["history_mode"] ==
+             "turn_start_acknowledgement"
+
+    assert started["history_reconciliation"]["pagination"]["pages"] == []
+  end
+
   test "thread projection binds the actual app-server pid and forbids legacy history" do
     thread =
       Lifecycle.thread(%{
