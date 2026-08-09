@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Config.ModelRouting do
           model: String.t(),
           reasoning_effort: String.t(),
           thread_sandbox: String.t(),
-          turn_sandbox_policy: map() | nil
+          turn_sandbox_policy: map()
         }
 
   @routes %{
@@ -14,13 +14,13 @@ defmodule SymphonyElixir.Config.ModelRouting do
       model: "gpt-5.6-terra",
       reasoning_effort: "medium",
       thread_sandbox: "workspace-write",
-      turn_sandbox_policy: nil
+      turn_sandbox_policy: %{"type" => "workspaceWrite"}
     },
     "implementation-debugger" => %{
       model: "gpt-5.6-terra",
       reasoning_effort: "high",
       thread_sandbox: "workspace-write",
-      turn_sandbox_policy: nil
+      turn_sandbox_policy: %{"type" => "workspaceWrite"}
     },
     "implementation-reviewer" => %{
       model: "gpt-5.6-sol",

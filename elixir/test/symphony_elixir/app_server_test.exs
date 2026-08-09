@@ -90,7 +90,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server passes explicit turn sandbox policies through unchanged" do
+  test "writer routes ignore conflicting configured turn sandbox policies" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -151,7 +151,7 @@ defmodule SymphonyElixir.AppServerTest do
         id: "issue-supported-turn-policies",
         identifier: "MT-1001",
         title: "Validate explicit turn sandbox policy passthrough",
-        description: "Ensure runtime startup forwards configured turn sandbox policies unchanged",
+        description: "Ensure runtime startup uses the fixed writer route sandbox policy",
         state: "In Progress",
         url: "https://example.org/issues/MT-1001",
         labels: ["backend"]
@@ -178,6 +178,15 @@ defmodule SymphonyElixir.AppServerTest do
         trace = File.read!(trace_file)
         lines = String.split(trace, "\n", trim: true)
 
+        expected_policy = %{
+          "type" => "workspaceWrite",
+          "writableRoots" => [Path.expand(workspace)],
+          "readOnlyAccess" => %{"type" => "fullAccess"},
+          "networkAccess" => false,
+          "excludeTmpdirEnvVar" => false,
+          "excludeSlashTmp" => false
+        }
+
         assert Enum.any?(lines, fn line ->
                  if String.starts_with?(line, "JSON:") do
                    line
@@ -185,7 +194,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
                    end)
                  else
                    false

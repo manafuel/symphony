@@ -107,7 +107,7 @@ defmodule SymphonyElixir.Config do
     with {:ok, settings} <- settings(),
          {:ok, route} <- ModelRouting.resolve(Keyword.get(opts, :issue)),
          {:ok, turn_sandbox_policy} <-
-           Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+           resolve_route_turn_sandbox_policy(route, settings, workspace, opts) do
       {:ok,
        %{
          approval_policy: settings.codex.approval_policy,
@@ -115,10 +115,22 @@ defmodule SymphonyElixir.Config do
          model_role: route.role,
          reasoning_effort: route.reasoning_effort,
          thread_sandbox: route.thread_sandbox,
-         turn_sandbox_policy: route.turn_sandbox_policy || turn_sandbox_policy
+         turn_sandbox_policy: turn_sandbox_policy
        }}
     end
   end
+
+  defp resolve_route_turn_sandbox_policy(
+         %{turn_sandbox_policy: %{"type" => "workspaceWrite"}},
+         settings,
+         workspace,
+         opts
+       ) do
+    Schema.resolve_workspace_write_turn_sandbox_policy(settings, workspace, opts)
+  end
+
+  defp resolve_route_turn_sandbox_policy(%{turn_sandbox_policy: %{} = policy}, _settings, _workspace, _opts),
+    do: {:ok, policy}
 
   defp validate_semantics(settings) do
     with :ok <- validate_tracker_kind(settings.tracker.kind) do

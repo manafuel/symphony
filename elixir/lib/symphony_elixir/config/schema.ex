@@ -360,6 +360,14 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  @spec resolve_workspace_write_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def resolve_workspace_write_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
+    workspace
+    |> default_workspace_root(settings.workspace.root)
+    |> default_runtime_turn_sandbox_policy(opts)
+  end
+
   @spec normalize_issue_state(String.t()) :: String.t()
   def normalize_issue_state(state_name) when is_binary(state_name) do
     String.downcase(state_name)

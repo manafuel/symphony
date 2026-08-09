@@ -28,9 +28,10 @@ defmodule SymphonyElixir.ModelRoutingTest do
       assert {:ok, route} = ModelRouting.resolve(%Issue{labels: ["runtime-role:" <> role, "owner:any"]})
       assert %{role: ^role, model: ^model, reasoning_effort: ^effort, thread_sandbox: ^sandbox} = route
 
-      if sandbox == "read-only" do
-        assert route.turn_sandbox_policy == %{"type" => "readOnly"}
-      end
+      expected_policy =
+        if sandbox == "read-only", do: %{"type" => "readOnly"}, else: %{"type" => "workspaceWrite"}
+
+      assert route.turn_sandbox_policy == expected_policy
     end
   end
 
@@ -122,6 +123,99 @@ defmodule SymphonyElixir.ModelRoutingTest do
       assert get_in(turn_request, ["params", "model"]) == "gpt-5.6-sol"
       assert get_in(turn_request, ["params", "effort"]) == "xhigh"
       assert get_in(turn_request, ["params", "sandboxPolicy"]) == %{"type" => "readOnly"}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "writer routes seal native sandbox policies and host tools against conflicting configuration" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-writer-routing-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn -> restore_env("SYMP_TEST_CODEX_TRACE", previous_trace) end)
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf '%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          2) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-writer"}}}' ;;
+          3) printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-writer"}}}' ;;
+          4) printf '%s\\n' '{"method":"turn/completed"}'; exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      for {role, labels, effort, configured_policy} <- [
+            {"implementation-worker", ["owner:engineering"], "medium", %{"type" => "dangerFullAccess"}},
+            {"implementation-debugger", ["owner:engineering", "runtime-role:implementation-debugger"], "high", %{"type" => "readOnly"}}
+          ] do
+        workspace = Path.join(workspace_root, "MANA-#{role}")
+        trace_file = Path.join(test_root, "#{role}.trace")
+        File.mkdir_p!(workspace)
+        System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          codex_turn_sandbox_policy: configured_policy
+        )
+
+        issue = %Issue{
+          id: "issue-#{role}",
+          identifier: "MANA-#{role}",
+          title: "Route writer request",
+          labels: labels
+        }
+
+        assert {:ok, result} = AppServer.run(workspace, "Implement the change", issue)
+        assert result.model_role == role
+        assert result.model == "gpt-5.6-terra"
+        assert result.reasoning_effort == effort
+
+        requests = trace_file |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+        thread_request = Enum.find(requests, &(&1["method"] == "thread/start"))
+        turn_request = Enum.find(requests, &(&1["method"] == "turn/start"))
+
+        expected_policy = %{
+          "type" => "workspaceWrite",
+          "writableRoots" => [Path.expand(workspace)],
+          "readOnlyAccess" => %{"type" => "fullAccess"},
+          "networkAccess" => false,
+          "excludeTmpdirEnvVar" => false,
+          "excludeSlashTmp" => false
+        }
+
+        assert get_in(thread_request, ["params", "model"]) == "gpt-5.6-terra"
+        assert get_in(thread_request, ["params", "config", "model_reasoning_effort"]) == effort
+        assert get_in(thread_request, ["params", "sandbox"]) == "workspace-write"
+
+        assert Enum.map(get_in(thread_request, ["params", "dynamicTools"]), & &1["name"]) == [
+                 "linear_graphql",
+                 "write_run_artifact"
+               ]
+
+        assert get_in(turn_request, ["params", "model"]) == "gpt-5.6-terra"
+        assert get_in(turn_request, ["params", "effort"]) == effort
+        assert get_in(turn_request, ["params", "sandboxPolicy"]) == expected_policy
+      end
     after
       File.rm_rf(test_root)
     end
