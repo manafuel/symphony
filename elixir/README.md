@@ -31,6 +31,26 @@ issue claimed and exposes it as blocked in the runtime state, JSON API, and dash
 entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
 Linear issue can become a dispatch candidate again after restart.
 
+## MANAfuel production ticket routing
+
+Exactly one `runtime-role:*` label selects a ticket route; `owner:*` labels describe responsibility
+only and never select a model. No runtime role defaults to `implementation-worker`; duplicate,
+multiple, or unknown runtime roles fail closed. A ticket invokes only its selected route.
+
+| Runtime role | Model / effort | Sandbox |
+| --- | --- | --- |
+| `implementation-worker` | `gpt-5.6-terra` / `medium` | `workspace-write` |
+| `implementation-debugger` | `gpt-5.6-terra` / `high` | `workspace-write` |
+| `implementation-reviewer` | `gpt-5.6-sol` / `xhigh` | `read-only` |
+| `ceo` | `gpt-5.6-sol` / `xhigh` | `read-only` |
+| `financial-controller`, `marketing-manager`, `department-head` | `gpt-5.6-sol` / `high` | `read-only` |
+| `research-worker` | `gpt-5.6-luna` / `medium` | `read-only` |
+| `grunt-worker` | `gpt-5.6-luna` / `low` | `read-only` |
+
+The selected model and effort are passed to native Codex `thread/start` and `turn/start` calls.
+The existing Producer v6 thread record retains the selected role, model, effort, and sanitized
+runtime identity, including the app-server OS PID and worker host when present.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see

@@ -157,12 +157,12 @@ defmodule SymphonyElixir.AgentRunner do
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
     producer_v6 = Keyword.get(opts, :producer_v6, false)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host),
+    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, issue: issue),
          {:ok, closeout} <-
            producer_thread_checkpoint(
              codex_update_recipient,
              issue,
-             %{thread_id: session.thread_id, metadata: session.metadata},
+             thread_ready_payload(session),
              producer_v6
            ) do
       run_context = %{
@@ -302,6 +302,21 @@ defmodule SymphonyElixir.AgentRunner do
     with :ok <- producer_checkpoint(recipient, issue, :thread_ready, payload, false) do
       {:ok, nil}
     end
+  end
+
+  @doc false
+  @spec thread_ready_payload_for_test(map()) :: map()
+  def thread_ready_payload_for_test(session) when is_map(session), do: thread_ready_payload(session)
+
+  defp thread_ready_payload(session) do
+    %{
+      thread_id: session.thread_id,
+      metadata: session.metadata,
+      runtime_identity: session.runtime_identity,
+      model: session.model,
+      model_role: session.model_role,
+      reasoning_effort: session.reasoning_effort
+    }
   end
 
   defp commit_turn_terminal(recipient, issue, turn_session, nil, _final, true) do

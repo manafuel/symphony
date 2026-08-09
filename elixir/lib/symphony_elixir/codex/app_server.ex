@@ -28,6 +28,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
+          model: String.t(),
+          model_role: String.t(),
+          reasoning_effort: String.t(),
+          runtime_identity: map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -37,7 +41,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put(opts, :issue, issue)) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -49,12 +53,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    issue = Keyword.get(opts, :issue)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, issue),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -64,6 +69,10 @@ defmodule SymphonyElixir.Codex.AppServer do
            # `never` suppresses prompts; it is not authorization to cross a
            # sandbox or human-in-the-loop boundary.
            auto_approve_requests: false,
+           model: session_policies.model,
+           model_role: session_policies.model_role,
+           reasoning_effort: session_policies.reasoning_effort,
+           runtime_identity: metadata,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -85,6 +94,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
+          model: model,
+          model_role: model_role,
+          reasoning_effort: reasoning_effort,
+          runtime_identity: runtime_identity,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace
@@ -109,6 +122,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       workspace: workspace,
       approval_policy: approval_policy,
       turn_sandbox_policy: turn_sandbox_policy,
+      reasoning_effort: reasoning_effort,
       client_user_message_id: client_user_message_id,
       capture_history: capture_history
     }
@@ -126,6 +140,10 @@ defmodule SymphonyElixir.Codex.AppServer do
             session_id: session_id,
             thread_id: thread_id,
             turn_id: turn_id,
+            model: model,
+            model_role: model_role,
+            reasoning_effort: reasoning_effort,
+            runtime_identity: runtime_identity,
             client_user_message_id: client_user_message_id,
             turn_start_response: turn_payload,
             history_response: start_evidence[:history]
@@ -143,6 +161,10 @@ defmodule SymphonyElixir.Codex.AppServer do
                session_id: session_id,
                thread_id: thread_id,
                turn_id: turn_id,
+               model: model,
+               model_role: model_role,
+               reasoning_effort: reasoning_effort,
+               runtime_identity: runtime_identity,
                client_user_message_id: client_user_message_id,
                turn_start_response: turn_payload,
                history_response: start_evidence[:history]
@@ -443,12 +465,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, issue) do
+    Config.codex_runtime_settings(workspace, issue: issue)
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, issue) when is_binary(worker_host) do
+    Config.codex_runtime_settings(workspace, remote: true, issue: issue)
   end
 
   defp do_start_session(port, workspace, session_policies) do
@@ -460,17 +482,24 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @doc false
   @spec thread_start_payload(String.t(), Config.codex_runtime_settings()) :: map()
-  def thread_start_payload(workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
-    %{
-      "method" => "thread/start",
-      "id" => @thread_start_id,
-      "params" => %{
+  def thread_start_payload(workspace, session_policies) do
+    %{approval_policy: approval_policy, thread_sandbox: thread_sandbox} = session_policies
+
+    params =
+      %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
         "developerInstructions" => @manafuel_developer_instructions,
         "dynamicTools" => DynamicTool.tool_specs()
       }
+      |> maybe_put("model", Map.get(session_policies, :model))
+      |> maybe_put("config", thread_config(session_policies))
+
+    %{
+      "method" => "thread/start",
+      "id" => @thread_start_id,
+      "params" => params
     }
   end
 
@@ -490,14 +519,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_turn(port, context) do
-    params = %{
-      "threadId" => context.thread_id,
-      "input" => [%{"type" => "text", "text" => context.prompt}],
-      "cwd" => context.workspace,
-      "title" => "#{context.issue.identifier}: #{context.issue.title}",
-      "approvalPolicy" => context.approval_policy,
-      "sandboxPolicy" => context.turn_sandbox_policy
-    }
+    params =
+      %{
+        "threadId" => context.thread_id,
+        "input" => [%{"type" => "text", "text" => context.prompt}],
+        "cwd" => context.workspace,
+        "title" => "#{context.issue.identifier}: #{context.issue.title}",
+        "approvalPolicy" => context.approval_policy,
+        "sandboxPolicy" => context.turn_sandbox_policy
+      }
+      |> maybe_put("effort", context.reasoning_effort)
 
     params =
       if is_binary(context.client_user_message_id) and context.client_user_message_id != "",
@@ -512,6 +543,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, %{turn: turn, history: history}}
     end
   end
+
+  defp thread_config(session_policies) do
+    case Map.get(session_policies, :reasoning_effort) do
+      effort when is_binary(effort) -> %{"model_reasoning_effort" => effort}
+      _ -> nil
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_read_thread_history(_port, _thread_id, false), do: {:ok, nil}
 

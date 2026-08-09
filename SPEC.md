@@ -143,6 +143,29 @@ Symphony is easiest to port when kept in these layers:
 - Coding-agent executable that supports the targeted Codex app-server mode.
 - Host environment authentication for the issue tracker and coding agent.
 
+### 3.4 MANAfuel Production Ticket Routing
+
+The MANAfuel production runtime selects exactly one route from a ticket's
+`runtime-role:*` labels. `owner:*` labels express responsibility only and MUST NOT select a
+model. A ticket with no runtime role defaults to `implementation-worker`; duplicate, multiple, or
+unknown runtime roles MUST fail closed. One ticket invokes only its selected route, never a
+per-ticket multi-model subagent set.
+
+| Runtime role | Model | Effort | Sandbox |
+| --- | --- | --- | --- |
+| `implementation-worker` | `gpt-5.6-terra` | `medium` | `workspace-write` |
+| `implementation-debugger` | `gpt-5.6-terra` | `high` | `workspace-write` |
+| `implementation-reviewer` | `gpt-5.6-sol` | `xhigh` | `read-only` |
+| `ceo` | `gpt-5.6-sol` | `xhigh` | `read-only` |
+| `financial-controller`, `marketing-manager`, `department-head` | `gpt-5.6-sol` | `high` | `read-only` |
+| `research-worker` | `gpt-5.6-luna` | `medium` | `read-only` |
+| `grunt-worker` | `gpt-5.6-luna` | `low` | `read-only` |
+
+The selected `model` and reasoning effort are sent to native Codex `thread/start` and
+`turn/start` requests. The existing Producer v6 thread record retains the selected role, model,
+effort, and sanitized runtime identity, including the app-server OS PID and worker host when
+present.
+
 ## 4. Core Domain Model
 
 ### 4.1 Entities
