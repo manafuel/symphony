@@ -3,12 +3,23 @@ defmodule SymphonyElixir.ModelRoutingTest do
 
   alias SymphonyElixir.Config.ModelRouting
 
-  test "owner labels never select a route and unlabeled issues default to implementation worker" do
-    assert {:ok, route} = ModelRouting.resolve(%Issue{labels: ["owner:ceo", "owner:financial-controller"]})
+  test "admitted zero-role issues default to implementation worker independently of owner labels" do
+    assert {:ok, route} =
+             ModelRouting.resolve(%Issue{
+               labels: [" codex-agent-ready ", "owner:ceo", "owner:financial-controller"]
+             })
+
     assert route.role == "implementation-worker"
     assert route.model == "gpt-5.6-terra"
     assert route.reasoning_effort == "medium"
     assert route.thread_sandbox == "workspace-write"
+  end
+
+  test "zero-role issues fail closed unless they carry the implementation admission marker" do
+    for labels <- [["owner:ceo"], ["owner:financial-controller"], []] do
+      assert {:error, {:missing_runtime_role_admission, "codex-agent-ready"}} =
+               ModelRouting.resolve(%Issue{labels: labels})
+    end
   end
 
   test "routes every supported runtime role to its fixed model, effort, and sandbox" do
@@ -41,6 +52,9 @@ defmodule SymphonyElixir.ModelRoutingTest do
 
     assert {:error, {:conflicting_runtime_roles, ["ceo", "research-worker"]}} =
              ModelRouting.resolve(%Issue{labels: ["runtime-role:research-worker", "runtime-role:ceo"]})
+
+    assert {:error, {:conflicting_runtime_roles, ["ceo", "ceo"]}} =
+             ModelRouting.resolve(%Issue{labels: ["runtime-role:ceo", "runtime-role:ceo"]})
   end
 
   test "native thread and turn payloads receive the selected model and effort" do
@@ -164,7 +178,7 @@ defmodule SymphonyElixir.ModelRoutingTest do
       File.chmod!(codex_binary, 0o755)
 
       for {role, labels, effort, configured_policy} <- [
-            {"implementation-worker", ["owner:engineering"], "medium", %{"type" => "dangerFullAccess"}},
+            {"implementation-worker", ["codex-agent-ready", "owner:ceo"], "medium", %{"type" => "dangerFullAccess"}},
             {"implementation-debugger", ["owner:engineering", "runtime-role:implementation-debugger"], "high", %{"type" => "readOnly"}}
           ] do
         workspace = Path.join(workspace_root, "MANA-#{role}")

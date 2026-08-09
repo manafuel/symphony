@@ -147,9 +147,10 @@ Symphony is easiest to port when kept in these layers:
 
 The MANAfuel production runtime selects exactly one route from a ticket's
 `runtime-role:*` labels. `owner:*` labels express responsibility only and MUST NOT select a
-model. A ticket with no runtime role defaults to `implementation-worker`; duplicate, multiple, or
-unknown runtime roles MUST fail closed. One ticket invokes only its selected route, never a
-per-ticket multi-model subagent set.
+model. A ticket with no runtime role defaults to `implementation-worker` only when it carries the
+normalized `codex-agent-ready` admission label; otherwise it MUST fail closed. Duplicate,
+multiple, or unknown runtime roles MUST fail closed. One ticket invokes only its selected route,
+never a per-ticket multi-model subagent set.
 
 | Runtime role | Model | Effort | Sandbox |
 | --- | --- | --- | --- |

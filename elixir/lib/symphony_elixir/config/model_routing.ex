@@ -69,9 +69,17 @@ defmodule SymphonyElixir.Config.ModelRouting do
   @spec resolve(map() | struct() | nil) :: {:ok, route()} | {:error, term()}
   def resolve(issue) do
     case runtime_roles(issue) do
-      [] -> fetch_route("implementation-worker")
+      [] -> resolve_default_route(issue)
       [role] -> fetch_route(role)
       roles -> {:error, {:conflicting_runtime_roles, Enum.sort(roles)}}
+    end
+  end
+
+  defp resolve_default_route(issue) do
+    if implementation_admitted?(issue) do
+      fetch_route("implementation-worker")
+    else
+      {:error, {:missing_runtime_role_admission, "codex-agent-ready"}}
     end
   end
 
@@ -90,6 +98,12 @@ defmodule SymphonyElixir.Config.ModelRouting do
   end
 
   defp runtime_roles(_issue), do: []
+
+  defp implementation_admitted?(%{labels: labels}) when is_list(labels) do
+    Enum.any?(labels, &(normalize_label(&1) == "codex-agent-ready"))
+  end
+
+  defp implementation_admitted?(_issue), do: false
 
   defp normalize_label(label) when is_binary(label),
     do: label |> String.trim() |> String.downcase()

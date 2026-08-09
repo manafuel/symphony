@@ -1827,7 +1827,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         }
       )
 
-      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+      assert {:ok, runtime_settings} =
+               Config.codex_runtime_settings(issue_workspace,
+                 issue: %Issue{labels: ["codex-agent-ready"]}
+               )
 
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
@@ -1850,7 +1853,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         }
       )
 
-      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+      assert {:ok, runtime_settings} =
+               Config.codex_runtime_settings(issue_workspace,
+                 issue: %Issue{labels: ["codex-agent-ready"]}
+               )
 
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
