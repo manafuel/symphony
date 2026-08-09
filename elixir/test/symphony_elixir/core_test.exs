@@ -1750,7 +1750,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Run and keep workspace",
         state: "In Progress",
         url: "https://example.org/issues/S-99",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       before = MapSet.new(File.ls!(workspace_root))
@@ -1836,7 +1836,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Capture codex updates",
         state: "In Progress",
         url: "https://example.org/issues/MT-99",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       test_pid = self()
@@ -2007,7 +2007,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Still active after first turn",
         state: "In Progress",
         url: "https://example.org/issues/MT-247",
-        labels: []
+        labels: ["codex-agent-ready"]
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
@@ -2124,7 +2124,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Still active",
         state: "In Progress",
         url: "https://example.org/issues/MT-248",
-        labels: []
+        labels: ["codex-agent-ready"]
       }
 
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
@@ -2208,7 +2208,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Check startup args and cwd",
         state: "In Progress",
         url: "https://example.org/issues/MT-77",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
@@ -2323,7 +2323,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Check startup args override",
         state: "In Progress",
         url: "https://example.org/issues/MT-88",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)
@@ -2414,7 +2414,7 @@ defmodule SymphonyElixir.CoreTest do
         description: "Check startup policy payload overrides",
         state: "In Progress",
         url: "https://example.org/issues/MT-99",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Fix workspace start args", issue)

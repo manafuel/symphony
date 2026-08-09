@@ -154,7 +154,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure runtime startup uses the fixed writer route sandbox policy",
         state: "In Progress",
         url: "https://example.org/issues/MT-1001",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       policy_cases = [
@@ -375,7 +375,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Cannot satisfy codex input",
         state: "In Progress",
         url: "https://example.org/issues/MT-88",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:turn_input_required, payload}} =
@@ -440,7 +440,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Cannot satisfy MCP input",
         state: "In Progress",
         url: "https://example.org/issues/MT-188",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:turn_input_required, payload}} =
@@ -490,7 +490,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure app tool approval elicitations fail closed",
         state: "In Progress",
         url: "https://example.org/issues/MT-189",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:approval_required, payload}} =
@@ -546,7 +546,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure approval elicitations requesting form content fail closed",
         state: "In Progress",
         url: "https://example.org/issues/MT-190",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:turn_input_required, payload}} =
@@ -609,7 +609,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure safer defaults do not auto approve requests",
         state: "In Progress",
         url: "https://example.org/issues/MT-89",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:approval_required, payload}} =
@@ -693,7 +693,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure unattended app-server approval requests fail closed",
         state: "In Progress",
         url: "https://example.org/issues/MT-89",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:approval_required, payload}} =
@@ -818,7 +818,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure unattended file change approvals fail closed",
         state: "In Progress",
         url: "https://example.org/issues/MT-89",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:approval_required, payload}} =
@@ -926,7 +926,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure command execution silence fails before the turn timeout",
         state: "In Progress",
         url: "https://example.org/issues/MT-90",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:command_execution_timeout, 25}} =
@@ -1021,7 +1021,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure completed commands restore normal turn timeout",
         state: "In Progress",
         url: "https://example.org/issues/MT-91",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, :turn_timeout} =
@@ -2029,7 +2029,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure unsafe coordination-checkout cwd is never auto approved",
         state: "In Progress",
         url: "https://example.org/issues/MAN-90",
-        labels: ["harness"]
+        labels: ["codex-agent-ready", "harness"]
       }
 
       assert {:error, {:unsafe_command_blocked, reason, payload}} =
@@ -2146,7 +2146,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure unsafe command output is not delivered",
         state: "In Progress",
         url: "https://example.org/issues/MAN-90",
-        labels: ["harness"]
+        labels: ["codex-agent-ready", "harness"]
       }
 
       on_message = fn message ->
@@ -2242,7 +2242,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure app tool approval prompts fail closed",
         state: "In Progress",
         url: "https://example.org/issues/MT-717",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:error, {:approval_required, payload}} =
@@ -2330,7 +2330,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure arbitrary tool prompts receive a generic answer",
         state: "In Progress",
         url: "https://example.org/issues/MT-718",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       on_message = fn message -> send(self(), {:app_server_message, message}) end
@@ -2419,7 +2419,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure option prompts receive a generic non-interactive answer",
         state: "In Progress",
         url: "https://example.org/issues/MT-719",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} =
@@ -2519,7 +2519,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure unsupported tool calls do not stall a turn",
         state: "In Progress",
         url: "https://example.org/issues/MT-90",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Reject unsupported tool calls", issue)
@@ -2620,7 +2620,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure supported tool calls return tool output",
         state: "In Progress",
         url: "https://example.org/issues/MT-90A",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       test_pid = self()
@@ -2784,7 +2784,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure supported tool failures emit a distinct event",
         state: "In Progress",
         url: "https://example.org/issues/MT-90B",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       test_pid = self()
@@ -2874,7 +2874,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure JSON parsing waits for newline-delimited messages",
         state: "In Progress",
         url: "https://example.org/issues/MT-91",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       assert {:ok, _result} = AppServer.run(workspace, "Validate newline-delimited buffering", issue)
@@ -2938,7 +2938,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure codex stderr is captured and logged",
         state: "In Progress",
         url: "https://example.org/issues/MT-92",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       test_pid = self()
@@ -3013,7 +3013,7 @@ defmodule SymphonyElixir.AppServerTest do
         description: "Ensure malformed JSON-like frames are surfaced to the orchestrator",
         state: "In Progress",
         url: "https://example.org/issues/MT-93",
-        labels: ["backend"]
+        labels: ["codex-agent-ready", "backend"]
       }
 
       test_pid = self()
@@ -3068,7 +3068,7 @@ defmodule SymphonyElixir.AppServerTest do
           description: "Validate ssh-backed codex startup",
           state: "In Progress",
           url: "https://example.org/issues/MT-REMOTE",
-          labels: ["backend"]
+          labels: ["codex-agent-ready", "backend"]
         }
 
         assert {:ok, _result} =
