@@ -1806,7 +1806,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
-  test "runtime sandbox policy resolution passes explicit policies through unchanged" do
+  test "default worker route seals runtime sandbox policy against configured alternatives" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1831,9 +1831,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
-               "writableRoots" => ["relative/path"],
-               "networkAccess" => true
+               "writableRoots" => [Path.expand(issue_workspace)],
+               "readOnlyAccess" => %{"type" => "fullAccess"},
+               "networkAccess" => false,
+               "excludeTmpdirEnvVar" => false,
+               "excludeSlashTmp" => false
              }
+
+      assert runtime_settings.model_role == "implementation-worker"
+      assert runtime_settings.model == "gpt-5.6-terra"
+      assert runtime_settings.reasoning_effort == "medium"
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1846,9 +1853,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
 
       assert runtime_settings.turn_sandbox_policy == %{
-               "type" => "futureSandbox",
-               "nested" => %{"flag" => true}
+               "type" => "workspaceWrite",
+               "writableRoots" => [Path.expand(issue_workspace)],
+               "readOnlyAccess" => %{"type" => "fullAccess"},
+               "networkAccess" => false,
+               "excludeTmpdirEnvVar" => false,
+               "excludeSlashTmp" => false
              }
+
+      assert runtime_settings.model_role == "implementation-worker"
+      assert runtime_settings.model == "gpt-5.6-terra"
+      assert runtime_settings.reasoning_effort == "medium"
     after
       File.rm_rf(test_root)
     end

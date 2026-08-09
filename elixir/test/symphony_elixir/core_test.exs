@@ -2340,7 +2340,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "app server startup payload uses configurable approval and sandbox settings from workflow config" do
+  test "app server startup payload preserves approval and seals default writer sandbox settings" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -2397,17 +2397,13 @@ defmodule SymphonyElixir.CoreTest do
 
       File.chmod!(codex_binary, 0o755)
 
-      workspace_cache = Path.join(Path.expand(workspace), ".cache")
-      File.mkdir_p!(workspace_cache)
-
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
         codex_approval_policy: "on-request",
         codex_thread_sandbox: "workspace-write",
         codex_turn_sandbox_policy: %{
-          type: "workspaceWrite",
-          writableRoots: [Path.expand(workspace), workspace_cache]
+          type: "readOnly"
         }
       )
 
@@ -2433,7 +2429,9 @@ defmodule SymphonyElixir.CoreTest do
                  |> then(fn payload ->
                    payload["method"] == "thread/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
-                     get_in(payload, ["params", "sandbox"]) == "workspace-write"
+                     get_in(payload, ["params", "sandbox"]) == "workspace-write" &&
+                     get_in(payload, ["params", "model"]) == "gpt-5.6-terra" &&
+                     get_in(payload, ["params", "config", "model_reasoning_effort"]) == "medium"
                  end)
                else
                  false
@@ -2442,7 +2440,11 @@ defmodule SymphonyElixir.CoreTest do
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [Path.expand(workspace), workspace_cache]
+        "writableRoots" => [Path.expand(workspace)],
+        "readOnlyAccess" => %{"type" => "fullAccess"},
+        "networkAccess" => false,
+        "excludeTmpdirEnvVar" => false,
+        "excludeSlashTmp" => false
       }
 
       assert Enum.any?(lines, fn line ->
@@ -2453,6 +2455,8 @@ defmodule SymphonyElixir.CoreTest do
                  |> then(fn payload ->
                    payload["method"] == "turn/start" &&
                      get_in(payload, ["params", "approvalPolicy"]) == "on-request" &&
+                     get_in(payload, ["params", "model"]) == "gpt-5.6-terra" &&
+                     get_in(payload, ["params", "effort"]) == "medium" &&
                      get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
                  end)
                else
