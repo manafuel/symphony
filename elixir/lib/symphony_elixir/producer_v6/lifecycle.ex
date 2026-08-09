@@ -122,18 +122,52 @@ defmodule SymphonyElixir.ProducerV6.Lifecycle do
 
   @spec thread(map()) :: map()
   def thread(session) when is_map(session) do
+    runtime_identity = runtime_identity(session.metadata)
+
     %{
       "id" => session.thread_id,
+      "model_role" => session.model_role,
+      "model" => session.model,
+      "reasoning_effort" => session.reasoning_effort,
       "experimental_api" => true,
       "history_mode" => "paginated",
       "legacy_include_turns_used" => false,
       "memory_mode" => "none",
       "memory_disable_ack" => "startup_contract_memory_none",
       "memory_disabled_at_utc" => now(),
-      "app_server_os_pid" => session.metadata[:codex_app_server_pid],
+      "app_server_os_pid" => runtime_identity["app_server_os_pid"],
+      "runtime_identity" => runtime_identity,
       "ready_at_utc" => now()
     }
   end
+
+  defp runtime_identity(metadata) when is_map(metadata) do
+    %{}
+    |> maybe_put_runtime_identity("app_server_os_pid", sanitize_pid(metadata[:codex_app_server_pid]))
+    |> maybe_put_runtime_identity("worker_host", sanitize_worker_host(metadata[:worker_host]))
+  end
+
+  defp runtime_identity(_metadata), do: %{}
+
+  defp maybe_put_runtime_identity(identity, _key, nil), do: identity
+  defp maybe_put_runtime_identity(identity, key, value), do: Map.put(identity, key, value)
+
+  defp sanitize_pid(pid) when is_integer(pid) and pid > 0, do: Integer.to_string(pid)
+
+  defp sanitize_pid(pid) when is_binary(pid) do
+    pid = String.trim(pid)
+    if String.match?(pid, ~r/^[0-9]+$/), do: pid, else: nil
+  end
+
+  defp sanitize_pid(_pid), do: nil
+
+  defp sanitize_worker_host(host) when is_binary(host) do
+    host = String.trim(host)
+
+    if host != "" and not String.contains?(host, ["\n", "\r", <<0>>]), do: host, else: nil
+  end
+
+  defp sanitize_worker_host(_host), do: nil
 
   @spec turn_intent(pos_integer(), String.t()) :: map()
   def turn_intent(turn_number, prompt)

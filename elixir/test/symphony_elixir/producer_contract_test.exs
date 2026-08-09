@@ -2,10 +2,11 @@ defmodule SymphonyElixir.ProducerContractTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.{ProducerContract, Rfc8785Jcs}
+  alias SymphonyElixir.ProducerV6.Lifecycle
 
   @contract_path Path.expand("../fixtures/symphony-producer-execution-contract.json", __DIR__)
   @template_path Path.expand("../fixtures/WORKFLOW.production.template.md", __DIR__)
-  @contract_sha256 "106697e2525dce9d9c455dffb3bbd8d0fe469bf7b5b5d88985ede6fa7b66be96"
+  @contract_sha256 "afdc1382320000b8ce7fde00a774a00d9ec5f2f19f5abeaa698faa00112793ca"
   @template_sha256 "1abe469ff2a06f994d0f9b273e87b3e8ac8ee296b367f0cef1fea7745960ab38"
 
   test "loads only the exact canonical producer contract" do
@@ -23,6 +24,21 @@ defmodule SymphonyElixir.ProducerContractTest do
 
     assert {:error, {:path_not_absolute, _}} =
              ProducerContract.load("relative-contract.json", @contract_sha256)
+  end
+
+  test "thread projection exactly matches the Producer v6 lifecycle thread record" do
+    assert {:ok, loaded} = ProducerContract.load(@contract_path, @contract_sha256)
+
+    thread =
+      Lifecycle.thread(%{
+        thread_id: "thread-contract",
+        metadata: %{codex_app_server_pid: 4242, worker_host: "local-loopback"},
+        model_role: "implementation-worker",
+        model: "gpt-5.6-terra",
+        reasoning_effort: "medium"
+      })
+
+    assert MapSet.new(loaded.document["ordered_fields"]["thread"]) == MapSet.new(Map.keys(thread))
   end
 
   test "renders exactly eighteen literal production inputs without normalizing bytes" do

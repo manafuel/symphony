@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.ProducerV6LifecycleTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.{ProducerV6.Lifecycle, Rfc8785Jcs}
+  alias SymphonyElixir.{AgentRunner, ProducerV6.Lifecycle, Rfc8785Jcs}
 
   test "admission hook accepts only the exact canonical live PASS receipt" do
     receipt = %{
@@ -101,18 +101,64 @@ defmodule SymphonyElixir.ProducerV6LifecycleTest do
     assert started["history_reconciliation"]["pagination"]["pages"] == []
   end
 
-  test "thread projection binds the actual app-server pid and forbids legacy history" do
+  test "thread projection records routed identity and sanitizes runtime metadata" do
     thread =
       Lifecycle.thread(%{
         thread_id: "thread-live-1",
-        metadata: %{codex_app_server_pid: 4242}
+        metadata: %{codex_app_server_pid: 4242, worker_host: " worker-01:2200 \n"},
+        model_role: "implementation-reviewer",
+        model: "gpt-5.6-sol",
+        reasoning_effort: "xhigh"
       })
 
     assert thread["id"] == "thread-live-1"
-    assert thread["app_server_os_pid"] == 4242
+    assert thread["model_role"] == "implementation-reviewer"
+    assert thread["model"] == "gpt-5.6-sol"
+    assert thread["reasoning_effort"] == "xhigh"
+    assert thread["app_server_os_pid"] == "4242"
+
+    assert thread["runtime_identity"] == %{
+             "app_server_os_pid" => "4242",
+             "worker_host" => "worker-01:2200"
+           }
+
     assert thread["experimental_api"]
     assert thread["history_mode"] == "paginated"
     refute thread["legacy_include_turns_used"]
     assert thread["memory_mode"] == "none"
+  end
+
+  test "AgentRunner thread-ready payload preserves metadata for the Producer v6 checkpoint" do
+    session = %{
+      thread_id: "thread-live-2",
+      metadata: %{codex_app_server_pid: "5252", worker_host: "worker-02"},
+      runtime_identity: %{codex_app_server_pid: "5252", worker_host: "worker-02"},
+      model_role: "research-worker",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "medium"
+    }
+
+    payload = AgentRunner.thread_ready_payload_for_test(session)
+
+    assert payload.metadata == session.metadata
+
+    assert %{
+             "id" => "thread-live-2",
+             "model_role" => "research-worker",
+             "model" => "gpt-5.6-luna",
+             "reasoning_effort" => "medium",
+             "experimental_api" => true,
+             "history_mode" => "paginated",
+             "legacy_include_turns_used" => false,
+             "memory_mode" => "none",
+             "memory_disable_ack" => "startup_contract_memory_none",
+             "memory_disabled_at_utc" => _,
+             "app_server_os_pid" => "5252",
+             "runtime_identity" => %{
+               "app_server_os_pid" => "5252",
+               "worker_host" => "worker-02"
+             },
+             "ready_at_utc" => _
+           } = Lifecycle.thread(payload)
   end
 end

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Config.{ModelRouting, Schema}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -22,6 +22,9 @@ defmodule SymphonyElixir.Config do
 
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
+          model: String.t(),
+          model_role: String.t(),
+          reasoning_effort: String.t(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
@@ -101,18 +104,33 @@ defmodule SymphonyElixir.Config do
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
-    with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        {:ok,
-         %{
-           approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
-         }}
-      end
+    with {:ok, settings} <- settings(),
+         {:ok, route} <- ModelRouting.resolve(Keyword.get(opts, :issue)),
+         {:ok, turn_sandbox_policy} <-
+           resolve_route_turn_sandbox_policy(route, settings, workspace, opts) do
+      {:ok,
+       %{
+         approval_policy: settings.codex.approval_policy,
+         model: route.model,
+         model_role: route.role,
+         reasoning_effort: route.reasoning_effort,
+         thread_sandbox: route.thread_sandbox,
+         turn_sandbox_policy: turn_sandbox_policy
+       }}
     end
   end
+
+  defp resolve_route_turn_sandbox_policy(
+         %{turn_sandbox_policy: %{"type" => "workspaceWrite"}},
+         settings,
+         workspace,
+         opts
+       ) do
+    Schema.resolve_workspace_write_turn_sandbox_policy(settings, workspace, opts)
+  end
+
+  defp resolve_route_turn_sandbox_policy(%{turn_sandbox_policy: %{} = policy}, _settings, _workspace, _opts),
+    do: {:ok, policy}
 
   defp validate_semantics(settings) do
     with :ok <- validate_tracker_kind(settings.tracker.kind) do
