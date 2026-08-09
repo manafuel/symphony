@@ -34,8 +34,10 @@ Linear issue can become a dispatch candidate again after restart.
 ## MANAfuel production ticket routing
 
 Exactly one `runtime-role:*` label selects a ticket route; `owner:*` labels describe responsibility
-only and never select a model. No runtime role defaults to `implementation-worker`; duplicate,
-multiple, or unknown runtime roles fail closed. A ticket invokes only its selected route.
+only and never select a model. A ticket with no runtime role defaults to `implementation-worker`
+only when the normalized `codex-agent-ready` admission label is present; owner-only and unlabeled
+tickets fail closed. Duplicate, multiple, or unknown runtime roles fail closed. A ticket invokes
+only its selected route.
 
 | Runtime role | Model / effort | Sandbox |
 | --- | --- | --- |
