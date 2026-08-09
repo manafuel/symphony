@@ -74,32 +74,10 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
-    if tool in [@linear_graphql_tool, @write_run_artifact_tool] and
-         Keyword.get(opts, :allow_mutation_tools) == false do
+    if mutation_tools_disabled?(tool, opts) do
       failure_response(mutation_tools_disabled_payload(tool))
     else
-      case tool do
-        @linear_graphql_tool ->
-          execute_linear_graphql(arguments, opts)
-
-        @local_shell_tool ->
-          if Keyword.get(opts, :allow_local_shell) == true do
-            execute_local_shell(arguments, opts)
-          else
-            failure_response(local_shell_error_payload(:local_shell_disabled))
-          end
-
-        @write_run_artifact_tool ->
-          execute_write_run_artifact(arguments, opts)
-
-        other ->
-          failure_response(%{
-            "error" => %{
-              "message" => "Unsupported dynamic tool: #{inspect(other)}.",
-              "supportedTools" => supported_tool_names()
-            }
-          })
-      end
+      execute_allowed_tool(tool, arguments, opts)
     end
   end
 
@@ -125,6 +103,34 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   defp mutation_tools_disabled_payload(tool) do
     %{"error" => %{"message" => "`#{tool}` is disabled for read-only routed sessions."}}
+  end
+
+  defp mutation_tools_disabled?(tool, opts) do
+    tool in [@linear_graphql_tool, @write_run_artifact_tool] and
+      Keyword.get(opts, :allow_mutation_tools) == false
+  end
+
+  defp execute_allowed_tool(@linear_graphql_tool, arguments, opts),
+    do: execute_linear_graphql(arguments, opts)
+
+  defp execute_allowed_tool(@write_run_artifact_tool, arguments, opts),
+    do: execute_write_run_artifact(arguments, opts)
+
+  defp execute_allowed_tool(@local_shell_tool, arguments, opts) do
+    if Keyword.get(opts, :allow_local_shell) == true do
+      execute_local_shell(arguments, opts)
+    else
+      failure_response(local_shell_error_payload(:local_shell_disabled))
+    end
+  end
+
+  defp execute_allowed_tool(other, _arguments, _opts) do
+    failure_response(%{
+      "error" => %{
+        "message" => "Unsupported dynamic tool: #{inspect(other)}.",
+        "supportedTools" => supported_tool_names()
+      }
+    })
   end
 
   defp execute_linear_graphql(arguments, opts) do
