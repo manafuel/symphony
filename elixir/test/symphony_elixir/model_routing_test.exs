@@ -118,6 +118,7 @@ defmodule SymphonyElixir.ModelRoutingTest do
       assert get_in(thread_request, ["params", "model"]) == "gpt-5.6-sol"
       assert get_in(thread_request, ["params", "config", "model_reasoning_effort"]) == "xhigh"
       assert get_in(thread_request, ["params", "sandbox"]) == "read-only"
+      assert get_in(turn_request, ["params", "model"]) == "gpt-5.6-sol"
       assert get_in(turn_request, ["params", "effort"]) == "xhigh"
       assert get_in(turn_request, ["params", "sandboxPolicy"]) == %{"type" => "readOnly"}
     after

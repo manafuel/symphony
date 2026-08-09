@@ -122,6 +122,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       workspace: workspace,
       approval_policy: approval_policy,
       turn_sandbox_policy: turn_sandbox_policy,
+      model: model,
       reasoning_effort: reasoning_effort,
       client_user_message_id: client_user_message_id,
       capture_history: capture_history
@@ -528,6 +529,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => context.approval_policy,
         "sandboxPolicy" => context.turn_sandbox_policy
       }
+      |> maybe_put("model", context.model)
       |> maybe_put("effort", context.reasoning_effort)
 
     params =
