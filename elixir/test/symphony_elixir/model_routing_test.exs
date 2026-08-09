@@ -51,6 +51,7 @@ defmodule SymphonyElixir.ModelRoutingTest do
     assert get_in(thread_payload, ["params", "model"]) == "gpt-5.6-sol"
     assert get_in(thread_payload, ["params", "config", "model_reasoning_effort"]) == "xhigh"
     assert get_in(thread_payload, ["params", "sandbox"]) == "read-only"
+    assert get_in(thread_payload, ["params", "dynamicTools"]) == []
   end
 
   test "run records the authoritative thread and runtime identity with the routed native requests" do

@@ -74,44 +74,57 @@ defmodule SymphonyElixir.Codex.DynamicTool do
 
   @spec execute(String.t() | nil, term(), keyword()) :: map()
   def execute(tool, arguments, opts \\ []) do
-    case tool do
-      @linear_graphql_tool ->
-        execute_linear_graphql(arguments, opts)
+    if tool in [@linear_graphql_tool, @write_run_artifact_tool] and
+         Keyword.get(opts, :allow_mutation_tools) == false do
+      failure_response(mutation_tools_disabled_payload(tool))
+    else
+      case tool do
+        @linear_graphql_tool ->
+          execute_linear_graphql(arguments, opts)
 
-      @local_shell_tool ->
-        if Keyword.get(opts, :allow_local_shell) == true do
-          execute_local_shell(arguments, opts)
-        else
-          failure_response(local_shell_error_payload(:local_shell_disabled))
-        end
+        @local_shell_tool ->
+          if Keyword.get(opts, :allow_local_shell) == true do
+            execute_local_shell(arguments, opts)
+          else
+            failure_response(local_shell_error_payload(:local_shell_disabled))
+          end
 
-      @write_run_artifact_tool ->
-        execute_write_run_artifact(arguments, opts)
+        @write_run_artifact_tool ->
+          execute_write_run_artifact(arguments, opts)
 
-      other ->
-        failure_response(%{
-          "error" => %{
-            "message" => "Unsupported dynamic tool: #{inspect(other)}.",
-            "supportedTools" => supported_tool_names()
-          }
-        })
+        other ->
+          failure_response(%{
+            "error" => %{
+              "message" => "Unsupported dynamic tool: #{inspect(other)}.",
+              "supportedTools" => supported_tool_names()
+            }
+          })
+      end
     end
   end
 
-  @spec tool_specs() :: [map()]
-  def tool_specs do
-    [
-      %{
-        "name" => @linear_graphql_tool,
-        "description" => @linear_graphql_description,
-        "inputSchema" => @linear_graphql_input_schema
-      },
-      %{
-        "name" => @write_run_artifact_tool,
-        "description" => @write_run_artifact_description,
-        "inputSchema" => @write_run_artifact_input_schema
-      }
-    ]
+  @spec tool_specs(keyword()) :: [map()]
+  def tool_specs(opts \\ []) do
+    if Keyword.get(opts, :allow_mutation_tools) == false do
+      []
+    else
+      [
+        %{
+          "name" => @linear_graphql_tool,
+          "description" => @linear_graphql_description,
+          "inputSchema" => @linear_graphql_input_schema
+        },
+        %{
+          "name" => @write_run_artifact_tool,
+          "description" => @write_run_artifact_description,
+          "inputSchema" => @write_run_artifact_input_schema
+        }
+      ]
+    end
+  end
+
+  defp mutation_tools_disabled_payload(tool) do
+    %{"error" => %{"message" => "`#{tool}` is disabled for read-only routed sessions."}}
   end
 
   defp execute_linear_graphql(arguments, opts) do

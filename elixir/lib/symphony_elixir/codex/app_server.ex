@@ -34,6 +34,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           runtime_identity: map(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
+          allow_mutation_tools: boolean(),
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil
@@ -75,6 +76,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            runtime_identity: metadata,
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
+           allow_mutation_tools: mutation_tools_allowed?(session_policies),
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host
@@ -99,6 +101,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: reasoning_effort,
           runtime_identity: runtime_identity,
           turn_sandbox_policy: turn_sandbox_policy,
+          allow_mutation_tools: allow_mutation_tools,
           thread_id: thread_id,
           workspace: workspace
         },
@@ -112,7 +115,10 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, workspace: workspace)
+        DynamicTool.execute(tool, arguments,
+          workspace: workspace,
+          allow_mutation_tools: allow_mutation_tools
+        )
       end)
 
     turn_context = %{
@@ -492,7 +498,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
         "developerInstructions" => @manafuel_developer_instructions,
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => DynamicTool.tool_specs(allow_mutation_tools: mutation_tools_allowed?(session_policies))
       }
       |> maybe_put("model", Map.get(session_policies, :model))
       |> maybe_put("config", thread_config(session_policies))
@@ -552,6 +558,9 @@ defmodule SymphonyElixir.Codex.AppServer do
       _ -> nil
     end
   end
+
+  defp mutation_tools_allowed?(%{turn_sandbox_policy: %{"type" => "readOnly"}}), do: false
+  defp mutation_tools_allowed?(_session_policies), do: true
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

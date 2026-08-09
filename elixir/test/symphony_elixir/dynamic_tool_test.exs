@@ -38,6 +38,45 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert artifact_description =~ "issue workspace runs directory"
   end
 
+  test "read-only routed sessions advertise no mutation-capable dynamic tools" do
+    assert DynamicTool.tool_specs(allow_mutation_tools: false) == []
+
+    assert Enum.map(DynamicTool.tool_specs(allow_mutation_tools: true), & &1["name"]) ==
+             ["linear_graphql", "write_run_artifact"]
+  end
+
+  test "read-only routed sessions deny mutation tools before either backend runs" do
+    test_pid = self()
+    workspace = Path.join(System.tmp_dir!(), "symphony-read-only-tools-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+
+    try do
+      linear = fn _query, _variables, _opts ->
+        send(test_pid, :linear_backend_called)
+        {:ok, %{}}
+      end
+
+      linear_response =
+        DynamicTool.execute("linear_graphql", %{"query" => "query Viewer { viewer { id } }"},
+          allow_mutation_tools: false,
+          linear_client: linear
+        )
+
+      artifact_response =
+        DynamicTool.execute("write_run_artifact", %{"path" => "runs/proof.txt", "content" => "blocked"},
+          allow_mutation_tools: false,
+          workspace: workspace
+        )
+
+      assert linear_response["success"] == false
+      assert artifact_response["success"] == false
+      refute_received :linear_backend_called
+      refute File.exists?(Path.join([workspace, "runs", "proof.txt"]))
+    after
+      File.rm_rf(workspace)
+    end
+  end
+
   test "unsupported tools return a failure payload with the supported tool list" do
     response = DynamicTool.execute("not_a_real_tool", %{})
 
