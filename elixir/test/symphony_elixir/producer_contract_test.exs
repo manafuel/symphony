@@ -2,6 +2,7 @@ defmodule SymphonyElixir.ProducerContractTest do
   use ExUnit.Case, async: true
 
   alias SymphonyElixir.{ProducerContract, Rfc8785Jcs}
+  alias SymphonyElixir.ProducerV6.Lifecycle
 
   @contract_path Path.expand("../fixtures/symphony-producer-execution-contract.json", __DIR__)
   @template_path Path.expand("../fixtures/WORKFLOW.production.template.md", __DIR__)
@@ -29,7 +30,7 @@ defmodule SymphonyElixir.ProducerContractTest do
     assert {:ok, loaded} = ProducerContract.load(@contract_path, @contract_sha256)
 
     thread =
-      SymphonyElixir.ProducerV6.Lifecycle.thread(%{
+      Lifecycle.thread(%{
         thread_id: "thread-contract",
         metadata: %{codex_app_server_pid: 4242, worker_host: "local-loopback"},
         model_role: "implementation-worker",
