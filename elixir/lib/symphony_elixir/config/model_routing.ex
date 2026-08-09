@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Config.ModelRouting do
           model: String.t(),
           reasoning_effort: String.t(),
           thread_sandbox: String.t(),
-          turn_sandbox_policy: map()
+          turn_sandbox_policy: map() | nil
         }
 
   @routes %{
