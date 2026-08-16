@@ -1098,7 +1098,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp validate_effective_runtime(_runtime, _workspace_root), do: {:error, :invalid_validated_session}
 
   defp exact_keys?(map, keys) when is_map(map), do: map_size(map) == length(keys) and Enum.all?(Map.keys(map), &(&1 in keys))
-  defp exact_keys?(_map, _keys), do: false
 
   defp execute_dynamic_tool(_tool, _arguments, :none, _issue) do
     %{

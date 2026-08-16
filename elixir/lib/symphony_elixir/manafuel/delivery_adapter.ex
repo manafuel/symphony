@@ -123,7 +123,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       result
     else
       {:error, reason} when is_atom(reason) -> {:error, reason}
-      _other -> {:error, :delivery_prepare_failed}
     end
   end
 
@@ -153,7 +152,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       {:ok, %{pull_request: pull_request, artifact: artifact, linear_state: linear_state}}
     else
       {:error, reason} when is_atom(reason) -> {:error, reason}
-      _other -> {:error, :delivery_failed}
     end
   end
 
@@ -171,7 +169,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       :ok
     else
       {:error, _reason} = error -> error
-      _other -> {:error, :invalid_admitted_run}
     end
   end
 
@@ -313,8 +310,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
     if valid?, do: :ok, else: {:error, :invalid_delivery_run}
   end
 
-  defp validate_delivery_run(_delivery_run), do: {:error, :invalid_delivery_run}
-
   defp validate_model_head(model_head, initial_head) do
     if valid_sha?(model_head) and model_head !== initial_head,
       do: :ok,
@@ -359,7 +354,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       :ok
     else
       {:error, _reason} = error -> error
-      _other -> {:error, :invalid_pull_request}
     end
   end
 
@@ -369,7 +363,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       :ok
     else
       {:error, _reason} = error -> error
-      _other -> {:error, :invalid_pull_request}
     end
   end
 
@@ -431,7 +424,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
   defp invoke_ok(_function, _args), do: {:error, :delivery_client_failed}
 
   defp exact_keys?(map, keys) when is_map(map), do: Map.keys(map) |> Enum.sort() === Enum.sort(keys)
-  defp exact_keys?(_map, _keys), do: false
 
   defp valid_uuid?(value) when is_binary(value), do: String.match?(value, @uuid)
   defp valid_uuid?(_value), do: false
@@ -555,7 +547,6 @@ defmodule SymphonyElixir.Manafuel.DeliveryAdapter do
       {:ok, head}
     else
       {:error, reason} when is_atom(reason) -> {:error, reason}
-      _other -> {:error, :model_commit_failed}
     end
   end
 

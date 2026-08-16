@@ -429,7 +429,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp copy_runtime_skill(source, destination) do
-    case File.cp_r(source, destination, fn _source, _destination -> true end) do
+    case File.cp_r(source, destination, on_conflict: fn _source, _destination -> true end) do
       {:ok, _files} -> {:cont, :ok}
       {:error, _source, reason} -> {:halt, {:error, reason}}
     end
