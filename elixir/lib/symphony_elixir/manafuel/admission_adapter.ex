@@ -7,13 +7,15 @@ defmodule SymphonyElixir.Manafuel.AdmissionAdapter do
   """
 
   @implementation_worker_manifest %{
-    "version" => "manafuel.agent-manifest.v1",
+    "version" => "manafuel.agent-manifest.v2",
     "agent_id" => "implementation-worker",
     "model" => "gpt-5.6-terra",
     "reasoning_effort" => "medium",
     "sandbox" => %{"mode" => "workspace-write", "network_access" => false},
     "approval_policy" => "never",
-    "tools" => ["shell_command", "apply_patch"],
+    "tool_mode" => "code_mode_only",
+    "tools" => ["exec", "wait"],
+    "code_mode_nested_tools" => ["shell_command", "apply_patch"],
     "skills" => ["manafuel-control", "implementation-system", "frontend-system", "fullstack-api", "testing"],
     "capabilities" => ["repo-write", "repository.patch", "local-validation.run"],
     "credential_profile" => "none",

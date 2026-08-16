@@ -7,13 +7,15 @@ defmodule SymphonyElixir.Manafuel.AdmissionAdapterTest do
   @marker_text "<!-- manafuel-agent-binding:v1 initiative_id=growth-experiment-1 agent_id=implementation-worker -->"
   @repository_artifact %{"authority" => "github", "kind" => "repository", "native_id" => "manafuel/one"}
   @manifest %{
-    "version" => "manafuel.agent-manifest.v1",
+    "version" => "manafuel.agent-manifest.v2",
     "agent_id" => "implementation-worker",
     "model" => "gpt-5.6-terra",
     "reasoning_effort" => "medium",
     "sandbox" => %{"mode" => "workspace-write", "network_access" => false},
     "approval_policy" => "never",
-    "tools" => ["shell_command", "apply_patch"],
+    "tool_mode" => "code_mode_only",
+    "tools" => ["exec", "wait"],
+    "code_mode_nested_tools" => ["shell_command", "apply_patch"],
     "skills" => ["manafuel-control", "implementation-system", "frontend-system", "fullstack-api", "testing"],
     "capabilities" => ["repo-write", "repository.patch", "local-validation.run"],
     "credential_profile" => "none",
@@ -234,17 +236,29 @@ defmodule SymphonyElixir.Manafuel.AdmissionAdapterTest do
     end
   end
 
-  test "requires the entire closed raw Phase 3 manifest with exact nested values and array order" do
+  test "requires the entire closed raw Phase 3 manifest v2 with exact nested values and array order" do
     invalid_manifests = [
       Map.delete(@manifest, "version"),
-      Map.put(@manifest, "version", "manafuel.agent-manifest.v2"),
+      Map.put(@manifest, "version", "manafuel.agent-manifest.v1"),
       Map.put(@manifest, "agent_id", "implementation-debugger"),
       Map.put(@manifest, "model", "gpt-5.6-terra-preview"),
       Map.put(@manifest, "reasoning_effort", "high"),
       Map.put(@manifest, "sandbox", %{"mode" => "workspace-write", "network_access" => true}),
       Map.put(@manifest, "sandbox", %{"mode" => "danger-full-access", "network_access" => false}),
       Map.put(@manifest, "approval_policy", "on-request"),
-      Map.put(@manifest, "tools", ["apply_patch", "shell_command"]),
+      Map.delete(@manifest, "tool_mode"),
+      Map.put(@manifest, "tool_mode", nil),
+      Map.put(@manifest, "tool_mode", "workspace_write"),
+      Map.put(@manifest, "tool_mode", "code-mode-only"),
+      Map.put(@manifest, "tools", ["shell_command", "apply_patch"]),
+      Map.put(@manifest, "tools", ["exec"]),
+      Map.put(@manifest, "tools", ["wait", "exec"]),
+      Map.delete(@manifest, "tools"),
+      Map.put(@manifest, "tools", ["exec", "wait", "shell_command"]),
+      Map.delete(@manifest, "code_mode_nested_tools"),
+      Map.put(@manifest, "code_mode_nested_tools", ["apply_patch", "shell_command"]),
+      Map.put(@manifest, "code_mode_nested_tools", nil),
+      Map.put(@manifest, "code_mode_nested_tools", "shell_command,apply_patch"),
       Map.put(@manifest, "skills", Enum.reverse(@manifest["skills"])),
       Map.put(@manifest, "capabilities", Enum.reverse(@manifest["capabilities"])),
       Map.put(@manifest, "credential_profile", "github"),
