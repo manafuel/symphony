@@ -5,12 +5,30 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Manafuel.AppServerPortClient
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @validated_runtime_keys [:transport, :thread_id, :repository, :workspace_root, :effective_runtime]
+  @validated_effective_runtime_keys [
+    :model,
+    :provider,
+    :reasoning_effort,
+    :service_tier,
+    :cwd,
+    :runtime_roots,
+    :approval_policy,
+    :approvals_reviewer,
+    :permission_profile,
+    :sandbox,
+    :instruction_paths,
+    :multi_agent_mode,
+    :attestation,
+    :capabilities
+  ]
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -21,7 +39,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: String.t(),
           workspace: Path.t(),
           worker_host: String.t() | nil,
-          dynamic_tool_binding: map()
+          dynamic_tool_binding: map() | :none,
+          validated_runtime: boolean()
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -58,13 +77,40 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_id: thread_id,
            workspace: expanded_workspace,
            worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
+           dynamic_tool_binding: dynamic_tool_binding,
+           validated_runtime: false
          }}
       else
         {:error, reason} ->
           stop_port(port)
           {:error, reason}
       end
+    end
+  end
+
+  @doc false
+  @spec adopt_validated_session(map(), port(), map()) :: {:ok, session()} | {:error, :invalid_validated_session}
+  def adopt_validated_session(runtime_session, port, metadata) do
+    with :ok <- validate_validated_runtime_session(runtime_session),
+         true <- is_port(port),
+         :ok <- AppServerPortClient.claim_handoff(port, metadata, 5_000) do
+      {:ok,
+       %{
+         port: port,
+         metadata: Map.put(port_metadata(port, nil), :runtime_validated, true),
+         approval_policy: "never",
+         auto_approve_requests: false,
+         thread_sandbox: "workspace-write",
+         turn_sandbox_policy: %{},
+         thread_id: runtime_session.thread_id,
+         workspace: runtime_session.workspace_root,
+         worker_host: nil,
+         dynamic_tool_binding: :none,
+         validated_runtime: true
+       }}
+    else
+      _other ->
+        {:error, :invalid_validated_session}
     end
   end
 
@@ -79,19 +125,29 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: thread_id,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
-        },
+        } = session,
         prompt,
         issue,
         opts \\ []
       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    validated_runtime = Map.get(session, :validated_runtime, false)
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+        execute_dynamic_tool(tool, arguments, dynamic_tool_binding, issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           workspace,
+           approval_policy,
+           turn_sandbox_policy,
+           validated_runtime
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -340,11 +396,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
+  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, validated_runtime) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -353,16 +407,29 @@ defmodule SymphonyElixir.Codex.AppServer do
           }
         ],
         "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
+        "title" => "#{issue.identifier}: #{issue.title}"
       }
+      |> maybe_put_turn_policies(approval_policy, turn_sandbox_policy, validated_runtime)
+
+    send_message(port, %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
+  end
+
+  defp maybe_put_turn_policies(params, _approval_policy, _turn_sandbox_policy, true), do: params
+
+  defp maybe_put_turn_policies(params, approval_policy, turn_sandbox_policy, _validated_runtime) do
+    Map.merge(params, %{
+      "approvalPolicy" => approval_policy,
+      "sandboxPolicy" => turn_sandbox_policy
+    })
   end
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
@@ -977,6 +1044,72 @@ defmodule SymphonyElixir.Codex.AppServer do
             :ok
         end
     end
+  end
+
+  defp validate_validated_runtime_session(session) when is_map(session) do
+    with true <- exact_keys?(session, @validated_runtime_keys),
+         true <- not is_nil(session.transport) and is_binary(session.thread_id) and byte_size(session.thread_id) > 0,
+         true <- session.repository in ["development", "one", "replicator"],
+         {:ok, workspace_root} <- PathSafety.canonicalize(session.workspace_root),
+         true <- workspace_root === session.workspace_root and File.dir?(workspace_root),
+         :ok <- validate_effective_runtime(session.effective_runtime, workspace_root) do
+      :ok
+    else
+      _other -> {:error, :invalid_validated_session}
+    end
+  end
+
+  defp validate_validated_runtime_session(_session), do: {:error, :invalid_validated_session}
+
+  defp validate_effective_runtime(runtime, workspace_root) when is_map(runtime) do
+    with true <- exact_keys?(runtime, @validated_effective_runtime_keys),
+         true <- runtime.model === "gpt-5.6-terra" and runtime.provider === "openai",
+         true <- runtime.reasoning_effort === "medium" and is_nil(runtime.service_tier),
+         true <- runtime.cwd === workspace_root and runtime.runtime_roots === [workspace_root],
+         true <- runtime.approval_policy === "never" and runtime.approvals_reviewer === "user",
+         true <- runtime.permission_profile === %{id: ":workspace", extends: nil},
+         true <-
+           runtime.sandbox === %{
+             type: "workspaceWrite",
+             network_access: false,
+             writable_roots: [],
+             exclude_tmpdir_env_var: false,
+             exclude_slash_tmp: false
+           },
+         true <- is_list(runtime.instruction_paths) and runtime.instruction_paths != [] and Enum.all?(runtime.instruction_paths, &is_binary/1),
+         true <- runtime.multi_agent_mode === "explicitRequestOnly",
+         true <-
+           runtime.attestation === %{
+             kind: "source_derived",
+             codex_version: "0.147.0",
+             tool_mode: "code_mode_only",
+             tools: ["exec", "wait"],
+             nested_tools: ["shell_command", "apply_patch"],
+             credential_profile: "none",
+             no_auto_subagents: true
+           },
+         true <- runtime.capabilities === %{permission_profile: ":workspace", nested_tools: ["shell_command", "apply_patch"]} do
+      :ok
+    else
+      _other -> {:error, :invalid_validated_session}
+    end
+  end
+
+  defp validate_effective_runtime(_runtime, _workspace_root), do: {:error, :invalid_validated_session}
+
+  defp exact_keys?(map, keys) when is_map(map), do: map_size(map) == length(keys) and Enum.all?(Map.keys(map), &(&1 in keys))
+  defp exact_keys?(_map, _keys), do: false
+
+  defp execute_dynamic_tool(_tool, _arguments, :none, _issue) do
+    %{
+      "success" => false,
+      "output" => "Dynamic tools are disabled for this validated MANAfuel session.",
+      "contentItems" => []
+    }
+  end
+
+  defp execute_dynamic_tool(tool, arguments, dynamic_tool_binding, issue) do
+    DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
   end
 
   defp emit_message(on_message, event, details, metadata) when is_function(on_message, 1) do

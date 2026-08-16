@@ -1,6 +1,11 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "validated-session adoption rejects a non-handoff before legacy startup can occur" do
+    assert {:error, :invalid_validated_session} =
+             AppServer.adopt_validated_session(%{}, :not_a_port, %{})
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

@@ -251,7 +251,15 @@ defmodule SymphonyElixir.Manafuel.RuntimeAdapterTest do
       {:ok, %{"frames" => [%{"jsonrpc" => "2.0", "id" => 1, "result" => {:not_json, :value}}], "noise" => [], "eof" => false, "exited" => false}},
       {:ok, %{"frames" => [%{"id" => 1, "result" => {:not_json, :value}}], "noise" => [], "eof" => false, "exited" => false}},
       {:ok, %{"frames" => [%{"id" => 1, "result" => :not_json}], "noise" => [], "eof" => false, "exited" => false}},
-      {:ok, %{"frames" => [%{"jsonrpc" => "2.0", "id" => 1, "result" => String.duplicate("x", 1_048_577)}], "noise" => [], "eof" => false, "exited" => false}},
+      {:ok,
+       %{
+         "frames" => [
+           %{"jsonrpc" => "2.0", "id" => 1, "result" => String.duplicate("x", 1_048_577)}
+         ],
+         "noise" => [],
+         "eof" => false,
+         "exited" => false
+       }},
       {:ok, %{"frames" => [%{"jsonrpc" => "2.0", "id" => 1, "result" => %{}}], "noise" => List.duplicate("noise", 257), "eof" => false, "exited" => false}},
       {:ok, %{"frames" => [%{"jsonrpc" => "2.0", "id" => 1, "result" => %{}}], "noise" => [], "eof" => true, "exited" => false}},
       {:ok, %{"frames" => [%{"jsonrpc" => "2.0", "id" => 1, "result" => %{}}], "noise" => [], "eof" => false, "exited" => true}},

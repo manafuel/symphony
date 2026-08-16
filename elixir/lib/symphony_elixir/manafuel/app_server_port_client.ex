@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
   alias SymphonyElixir.Manafuel.RuntimeAdapter
 
   @call_tag :manafuel_app_server_port_call
+  @handoff_tag :manafuel_app_server_port_handoff
   @noise_sentinel "[non-json-output]"
   @open_keys [:argv, :cwd, :env, :max_frame_bytes, :max_noise_frames]
   @max_frame_bytes 1_048_576
@@ -26,6 +27,37 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
       close_runtime: &close_runtime/2
     }
   end
+
+  @doc false
+  @spec handoff(term(), pos_integer()) :: {:ok, port(), map()} | {:error, :handoff_failed}
+  def handoff(transport, timeout) do
+    with {:ok, owner, token} <- transport_parts(transport),
+         true <- valid_timeout?(timeout),
+         true <- Process.alive?(owner),
+         {:ok, port, metadata} <- owner_call(owner, token, {:handoff, self()}, timeout, :handoff),
+         true <- is_port(port),
+         true <- valid_handoff_metadata?(metadata) do
+      {:ok, port, metadata}
+    else
+      _other -> {:error, :handoff_failed}
+    end
+  end
+
+  @doc false
+  @spec claim_handoff(port(), map(), pos_integer()) :: :ok | {:error, :handoff_failed}
+  def claim_handoff(port, metadata, timeout) when is_port(port) do
+    with true <- valid_timeout?(timeout),
+         true <- valid_handoff_metadata?(metadata),
+         true <- port_connected_to?(port, self()),
+         true <- Process.alive?(metadata.handoff_owner),
+         :ok <- claim_handoff_owner(metadata.handoff_owner, metadata.handoff_token, self(), timeout) do
+      :ok
+    else
+      _other -> {:error, :handoff_failed}
+    end
+  end
+
+  def claim_handoff(_port, _metadata, _timeout), do: {:error, :handoff_failed}
 
   defp open_runtime(executable, options, timeout) do
     case validate_open(executable, options, timeout) do
@@ -222,6 +254,10 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
         send(from, {call_ref, :ok})
         stop_owner(state)
 
+      {@call_tag, token, from, call_ref, {:handoff, target}, _timeout}
+      when token == state.token and from == state.caller and target == from ->
+        handoff_port(state, from, call_ref)
+
       {port, {:data, {flag, chunk}}} when port == state.port and flag in [:eol, :noeol] ->
         case ingest(state, flag, chunk) do
           {:ok, next_state} -> owner_loop(next_state)
@@ -303,6 +339,7 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
   end
 
   defp concurrent_error(:close), do: {:error, :close_failed}
+  defp concurrent_error(:handoff), do: {:error, :handoff_failed}
   defp concurrent_error(_action), do: {:error, :transport_failed}
 
   defp terminal_flags(port, eof, exited) do
@@ -452,8 +489,10 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
 
   defp down_result(:close), do: :ok
   defp down_result(:request), do: {:error, :transport_failed}
+  defp down_result(:handoff), do: {:error, :handoff_failed}
   defp timeout_result(:close), do: {:error, :close_failed}
   defp timeout_result(:request), do: {:error, :timeout}
+  defp timeout_result(:handoff), do: {:error, :handoff_failed}
 
   defp envelope(frames, noise_count, eof, exited) do
     %{
@@ -497,4 +536,95 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClient do
     do: {:ok, owner, token}
 
   defp transport_parts(_transport), do: :error
+
+  defp handoff_port(state, caller, call_ref) do
+    if quiescent?(state) do
+      handoff_token = make_ref()
+
+      try do
+        true = Port.connect(state.port, caller)
+        _ = Process.unlink(state.port)
+
+        metadata = %{handoff_owner: self(), handoff_token: handoff_token}
+        send(caller, {call_ref, {:ok, state.port, metadata}})
+        handoff_loop(Map.put(state, :handoff_token, handoff_token))
+      rescue
+        _error ->
+          send_and_stop(state, caller, call_ref, {:error, :handoff_failed})
+      catch
+        _kind, _reason ->
+          send_and_stop(state, caller, call_ref, {:error, :handoff_failed})
+      end
+    else
+      send(caller, {call_ref, {:error, :handoff_failed}})
+      owner_loop(state)
+    end
+  end
+
+  defp handoff_loop(state) do
+    receive do
+      {:DOWN, monitor, :process, caller, _reason}
+      when monitor == state.caller_monitor and caller == state.caller ->
+        close_port(state.port)
+
+      {@handoff_tag, token, caller, call_ref}
+      when token == state.handoff_token and caller == state.caller ->
+        result = if port_connected_to?(state.port, caller), do: :ok, else: {:error, :handoff_failed}
+        send(caller, {call_ref, result})
+
+        if result == :ok do
+          :ok
+        else
+          close_port(state.port)
+        end
+
+      _other ->
+        handoff_loop(state)
+    end
+  end
+
+  defp claim_handoff_owner(owner, token, caller, timeout)
+       when is_pid(owner) and is_reference(token) and is_pid(caller) do
+    monitor = Process.monitor(owner)
+    call_ref = make_ref()
+    send(owner, {@handoff_tag, token, caller, call_ref})
+
+    receive do
+      {^call_ref, :ok} ->
+        Process.demonitor(monitor, [:flush])
+        :ok
+
+      {^call_ref, _other} ->
+        Process.demonitor(monitor, [:flush])
+        {:error, :handoff_failed}
+
+      {:DOWN, ^monitor, :process, ^owner, _reason} ->
+        {:error, :handoff_failed}
+    after
+      timeout + @reply_grace_ms ->
+        Process.demonitor(monitor, [:flush])
+        {:error, :handoff_failed}
+    end
+  end
+
+  defp claim_handoff_owner(_owner, _token, _caller, _timeout), do: {:error, :handoff_failed}
+
+  defp quiescent?(state) do
+    state.pending == <<>> and state.noise_count == 0 and state.queued_frame == :none
+  end
+
+  defp valid_handoff_metadata?(%{handoff_owner: owner, handoff_token: token} = metadata) do
+    map_size(metadata) == 2 and is_pid(owner) and is_reference(token)
+  end
+
+  defp valid_handoff_metadata?(_metadata), do: false
+
+  defp port_connected_to?(port, pid) when is_port(port) and is_pid(pid) do
+    case :erlang.port_info(port, :connected) do
+      {:connected, ^pid} -> true
+      _other -> false
+    end
+  end
+
+  defp port_connected_to?(_port, _pid), do: false
 end

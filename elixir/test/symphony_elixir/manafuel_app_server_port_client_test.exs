@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Manafuel.AppServerPortClientTest do
   use ExUnit.Case, async: false
 
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Manafuel.AppServerPortClient
   alias SymphonyElixir.Manafuel.RuntimeAdapter
 
@@ -510,6 +511,57 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClientTest do
     assert_owner_stops(down_owner)
   end
 
+  test "hands an idle validated transport to its original caller exactly once" do
+    {:ok, transport} = open_fixture(silent_script())
+    owner = owner_pid(transport)
+
+    assert {:error, :handoff_failed} =
+             Task.async(fn -> AppServerPortClient.handoff(transport, 500) end)
+             |> Task.await(1_000)
+
+    assert {:ok, port, metadata} = AppServerPortClient.handoff(transport, 500)
+    caller = self()
+    assert {:connected, ^caller} = :erlang.port_info(port, :connected)
+    assert Process.alive?(owner)
+    assert :ok = AppServerPortClient.claim_handoff(port, metadata, 500)
+    assert_owner_stops(owner)
+    assert {:error, :handoff_failed} = AppServerPortClient.handoff(transport, 500)
+    Port.close(port)
+  end
+
+  test "adopts only a token-bound handoff and leaves dynamic tools unavailable" do
+    {:ok, transport} = open_fixture(silent_script())
+    {:ok, port, metadata} = AppServerPortClient.handoff(transport, 500)
+    workspace = Path.join(System.tmp_dir!(), "manafuel-adopted-session-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf(workspace) end)
+
+    runtime_session = %{
+      transport: transport,
+      thread_id: "thread-1",
+      repository: "development",
+      workspace_root: workspace,
+      effective_runtime: effective_runtime(workspace)
+    }
+
+    assert {:ok, session} = AppServer.adopt_validated_session(runtime_session, port, metadata)
+    assert session.thread_id == "thread-1"
+    assert session.dynamic_tool_binding == :none
+    assert session.validated_runtime
+    assert :ok = AppServer.stop_session(session)
+  end
+
+  test "does not adopt a malformed runtime session or consume an unrelated port" do
+    {:ok, transport} = open_fixture(silent_script())
+    {:ok, port, metadata} = AppServerPortClient.handoff(transport, 500)
+
+    assert {:error, :invalid_validated_session} = AppServer.adopt_validated_session(%{}, port, metadata)
+    caller = self()
+    assert {:connected, ^caller} = :erlang.port_info(port, :connected)
+    assert :ok = AppServerPortClient.claim_handoff(port, metadata, 500)
+    Port.close(port)
+  end
+
   test "encoding errors and owner exits remain stable atoms and never escape" do
     for invalid_params <- [
           %{"bad" => [1 | :invalid_tail]},
@@ -659,6 +711,39 @@ defmodule SymphonyElixir.Manafuel.AppServerPortClientTest do
         "concurrency" => 1,
         "no_auto_subagents" => true
       }
+    }
+  end
+
+  defp effective_runtime(workspace) do
+    %{
+      model: "gpt-5.6-terra",
+      provider: "openai",
+      reasoning_effort: "medium",
+      service_tier: nil,
+      cwd: workspace,
+      runtime_roots: [workspace],
+      approval_policy: "never",
+      approvals_reviewer: "user",
+      permission_profile: %{id: ":workspace", extends: nil},
+      sandbox: %{
+        type: "workspaceWrite",
+        network_access: false,
+        writable_roots: [],
+        exclude_tmpdir_env_var: false,
+        exclude_slash_tmp: false
+      },
+      instruction_paths: [Path.join(workspace, "WORKFLOW.md")],
+      multi_agent_mode: "explicitRequestOnly",
+      attestation: %{
+        kind: "source_derived",
+        codex_version: "0.147.0",
+        tool_mode: "code_mode_only",
+        tools: ["exec", "wait"],
+        nested_tools: ["shell_command", "apply_patch"],
+        credential_profile: "none",
+        no_auto_subagents: true
+      },
+      capabilities: %{permission_profile: ":workspace", nested_tools: ["shell_command", "apply_patch"]}
     }
   end
 

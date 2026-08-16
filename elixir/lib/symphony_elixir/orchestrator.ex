@@ -213,7 +213,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
+      |> schedule_issue_retry(issue_id, next_retry_attempt_from_running(running_entry) || 1, %{
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
         delay_type: :continuation,
@@ -1100,13 +1100,23 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
 
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
+        if attempt >= 2 do
+          {:noreply,
+           block_issue_from_entry(
+             state,
+             issue_id,
+             metadata,
+             "retry limit reached after tracker failure: #{inspect(reason)}"
+           )}
+        else
+          {:noreply,
+           schedule_issue_retry(
+             state,
+             issue_id,
+             attempt + 1,
+             Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           )}
+        end
     end
   end
 
@@ -1176,6 +1186,12 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
+  end
+
+  defp handle_active_retry(state, issue, attempt, metadata) when attempt >= 2 do
+    error = metadata[:error] || "issue remained active after the single repair attempt"
+    entry = Map.merge(metadata, %{issue: issue, identifier: issue.identifier})
+    {:noreply, block_issue_from_entry(state, issue.id, entry, error)}
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
